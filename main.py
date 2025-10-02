@@ -19,8 +19,8 @@ ativos = [
 timeframes = ["5m", "15m"]
 
 # Telegram
-TELEGRAM_TOKEN = "SEU_TOKEN_AQUI"
-TELEGRAM_CHAT_ID = "SEU_CHAT_ID_AQUI"
+TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
+TELEGRAM_CHAT_ID = "6370166264"
 
 # Histórico de sinais para evitar duplicados e contraditórios
 historico_sinais = {}
