@@ -22,7 +22,7 @@ timeframes = ["5m", "15m"]
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 TELEGRAM_CHAT_ID = "6370166264"
 
-# Histórico de sinais para evitar duplicados e contraditórios
+# Histórico de sinais
 historico_sinais = {}
 
 # ============================
@@ -51,7 +51,7 @@ def indicadores(df):
     df["RSI"] = calcular_rsi(df["Close"], 14)
     df["Upper"] = df["Close"].rolling(window=20).mean() + 2*df["Close"].rolling(window=20).std()
     df["Lower"] = df["Close"].rolling(window=20).mean() - 2*df["Close"].rolling(window=20).std()
-    df["ATR"] = df["High"] - df["Low"]
+    df["ATR"] = (df["High"] - df["Low"]).rolling(window=14).mean()
     df["MACD"], df["MACD_SIGNAL"] = calcular_macd(df["Close"])
     return df
 
@@ -59,34 +59,40 @@ def indicadores(df):
 # FUNÇÕES DE SINAIS
 # ============================
 
-def obter_sinal(df, timeframe, ativo):
-    ultimo = df.iloc[-1]
+def obter_sinal(df, timeframe, ativo, confirmacao=None):
+    # Última vela fechada (penúltima linha do dataframe)
+    ultimo = df.iloc[-2]  
+
     close = float(ultimo["Close"])
     ema9 = float(ultimo["EMA9"])
     ema21 = float(ultimo["EMA21"])
     rsi = float(ultimo["RSI"])
     upper = float(ultimo["Upper"])
     lower = float(ultimo["Lower"])
-    atr = float(ultimo["ATR"].tail(5).mean())
+    atr = float(ultimo["ATR"])
     macd = float(ultimo["MACD"])
     macd_signal = float(ultimo["MACD_SIGNAL"])
 
     sinal = None
 
-    # Critério de volatilidade mínima (ATR)
-    if atr < (0.0005 if "USD" in ativo else 0.05):
+    # Filtro 1: ATR acima da média -> volatilidade suficiente
+    atr_medio = df["ATR"].mean()
+    if atr < atr_medio:
         return None
 
-    # Critério de confiança máxima: todos os indicadores devem concordar
-    if ema9 > ema21 and close <= lower*1.01 and rsi < 65 and macd > macd_signal:
+    # Filtro 2: RSI rigoroso
+    if ema9 > ema21 and close <= lower*1.01 and rsi < 30 and macd > macd_signal:
         sinal = "CALL"
-    elif ema9 < ema21 and close >= upper*0.99 and rsi > 35 and macd < macd_signal:
+    elif ema9 < ema21 and close >= upper*0.99 and rsi > 70 and macd < macd_signal:
         sinal = "PUT"
 
-    # Verificar duplicados e contraditórios
+    # Filtro 3: confirmação multi-timeframe
+    if sinal and confirmacao and confirmacao != sinal:
+        return None
+
+    # Filtro 4: evitar duplicados/contraditórios
     chave = f"{ativo}_{timeframe}"
     ultimo_sinal = historico_sinais.get(chave)
-
     if ultimo_sinal == sinal or (ultimo_sinal and sinal and ultimo_sinal != sinal):
         return None
 
@@ -115,24 +121,33 @@ def executar_bot():
     while True:
         os.system("cls" if os.name == "nt" else "clear")
         print("="*60)
-        print("       INDICADOR TRADING DO JOÃO (MÁXIMA ASSERTIVIDADE)")
+        print(" INDICADOR TRADING S1000 - MÁXIMA ASSERTIVIDADE ")
         print("="*60)
 
         for ativo in ativos:
-            for timeframe in timeframes:
-                try:
-                    df = yf.download(ativo, period="2d", interval=timeframe, progress=False)
-                    if df.empty:
-                        continue
-                    df = indicadores(df)
-                    sinal = obter_sinal(df, timeframe, ativo)
-                    if sinal:
-                        mensagem = f"{ativo} | {timeframe.upper()} | {sinal}"
-                        print(mensagem)
-                        enviar_telegram(mensagem)
-                except Exception as e:
-                    print(f"Erro ao processar {ativo} {timeframe}: {e}")
+            try:
+                # Baixar dados dos 2 timeframes
+                df5 = yf.download(ativo, period="2d", interval="5m", progress=False)
+                df15 = yf.download(ativo, period="5d", interval="15m", progress=False)
+
+                if df5.empty or df15.empty:
                     continue
+
+                df5 = indicadores(df5)
+                df15 = indicadores(df15)
+
+                # Sinal principal no 5m
+                sinal_15m = obter_sinal(df15, "15m", ativo)
+                sinal_5m = obter_sinal(df5, "5m", ativo, confirmacao=sinal_15m)
+
+                if sinal_5m:
+                    mensagem = f"{ativo} | 5M confirmado pelo 15M | {sinal_5m}"
+                    print(mensagem)
+                    enviar_telegram(mensagem)
+
+            except Exception as e:
+                print(f"Erro ao processar {ativo}: {e}")
+                continue
 
         print("Próxima análise em 60 segundos...")
         time.sleep(60)
@@ -145,7 +160,7 @@ app = Flask("bot")
 
 @app.route("/")
 def home():
-    return "Bot do João rodando!"
+    return "Bot do João rodando com máxima assertividade!"
 
 @app.route("/ping")
 def ping():
