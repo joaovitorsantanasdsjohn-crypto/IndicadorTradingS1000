@@ -1,6 +1,5 @@
-yfinance
-pandas
-flask
-requests
-tensorflow
-numpy
+yfinance==0.2.41
+pandas==2.1.1
+flask==2.3.6
+requests==2.31.0
+tensorflow==2.14.0
