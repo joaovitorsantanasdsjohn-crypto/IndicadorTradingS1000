@@ -5,6 +5,10 @@ import os
 from flask import Flask
 from threading import Thread
 import requests
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+import numpy as np
 
 # ============================
 # CONFIGURAÇÕES BOT TRADING
@@ -22,8 +26,22 @@ timeframes = ["5m", "15m"]
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 TELEGRAM_CHAT_ID = "6370166264"
 
-# Histórico de sinais para evitar duplicados e contraditórios
+# Histórico de sinais
 historico_sinais = {}
+
+# ============================
+# MODELO DE MACHINE LEARNING
+# ============================
+
+modelo = Sequential([
+    Dense(32, activation="relu", input_shape=(7,)),
+    Dense(16, activation="relu"),
+    Dense(2, activation="softmax")
+])
+modelo.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+
+X_treino = []
+y_treino = []
 
 # ============================
 # FUNÇÕES DE INDICADORES
@@ -32,7 +50,7 @@ historico_sinais = {}
 def calcular_rsi(series, period=14):
     delta = series.diff()
     ganho = delta.clip(lower=0)
-    perda = -1*delta.clip(upper=0)
+    perda = -delta.clip(upper=0)
     media_ganho = ganho.rolling(window=period).mean()
     media_perda = perda.rolling(window=period).mean()
     rs = media_ganho / media_perda
@@ -49,54 +67,65 @@ def indicadores(df):
     df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
     df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
     df["RSI"] = calcular_rsi(df["Close"], 14)
-    df["Upper"] = df["Close"].rolling(window=20).mean() + 2.5*df["Close"].rolling(window=20).std()  # Bollinger mais criteriosa
-    df["Lower"] = df["Close"].rolling(window=20).mean() - 2.5*df["Close"].rolling(window=20).std()
-    df["ATR"] = df["High"].rolling(5).max() - df["Low"].rolling(5).min()
+    df["Upper"] = df["Close"].rolling(window=20).mean() + 2*df["Close"].rolling(window=20).std()
+    df["Lower"] = df["Close"].rolling(window=20).mean() - 2*df["Close"].rolling(window=20).std()
+    df["ATR"] = df["High"] - df["Low"]
     df["MACD"], df["MACD_SIGNAL"] = calcular_macd(df["Close"])
     return df
 
 # ============================
-# FUNÇÕES DE SINAIS
+# SINAIS
 # ============================
 
 def obter_sinal(df, timeframe, ativo):
     ultimo = df.iloc[-1]
-    close = float(ultimo["Close"])
-    ema9 = float(ultimo["EMA9"])
-    ema21 = float(ultimo["EMA21"])
-    rsi = float(ultimo["RSI"])
-    upper = float(ultimo["Upper"])
-    lower = float(ultimo["Lower"])
-    atr = float(ultimo["ATR"].tail(5).mean())
-    macd = float(ultimo["MACD"])
-    macd_signal = float(ultimo["MACD_SIGNAL"])
+    features = [
+        float(ultimo["Close"]),
+        float(ultimo["EMA9"]),
+        float(ultimo["EMA21"]),
+        float(ultimo["RSI"]),
+        float(ultimo["Upper"]),
+        float(ultimo["Lower"]),
+        float(ultimo["MACD"] - ultimo["MACD_SIGNAL"])
+    ]
+
+    atr = float(df["ATR"].tail(5).mean())
+    if atr < (0.0005 if "USD" in ativo else 0.05):
+        return None
+
+    sinal_ml = None
+    if X_treino:
+        pred = modelo.predict(np.array([features]), verbose=0)
+        sinal_ml = "CALL" if np.argmax(pred[0]) == 1 else "PUT"
+
+    ema9, ema21, rsi, close = features[1], features[2], features[3], features[0]
+    upper, lower, macd_diff = features[4], features[5], features[6]
+
+    sinal_indicadores = None
+    if ema9 > ema21 and close <= lower*1.01 and rsi < 55 and macd_diff > 0:
+        sinal_indicadores = "CALL"
+    elif ema9 < ema21 and close >= upper*0.99 and rsi > 45 and macd_diff < 0:
+        sinal_indicadores = "PUT"
 
     sinal = None
+    if sinal_indicadores and (sinal_ml is None or sinal_ml == sinal_indicadores):
+        sinal = sinal_indicadores
 
-    # Critério de volatilidade mínima (ATR)
-    if atr < (0.0007 if "USD" in ativo else 0.05):
-        return None
-
-    # Critério de confiança máxima: todos os indicadores devem concordar
-    if ema9 > ema21 and close <= lower*1.005 and rsi < 50 and macd > macd_signal:
-        sinal = "CALL"
-    elif ema9 < ema21 and close >= upper*0.995 and rsi > 50 and macd < macd_signal:
-        sinal = "PUT"
-
-    # Verificar duplicados e contraditórios
     chave = f"{ativo}_{timeframe}"
     ultimo_sinal = historico_sinais.get(chave)
-
     if ultimo_sinal == sinal or (ultimo_sinal and sinal and ultimo_sinal != sinal):
         return None
-
     if sinal:
         historico_sinais[chave] = sinal
+        X_treino.append(features)
+        y_treino.append(1 if sinal == "CALL" else 0)
+        if len(X_treino) >= 10:
+            modelo.fit(np.array(X_treino), np.array(y_treino), epochs=5, verbose=0)
 
     return sinal
 
 # ============================
-# ENVIO DE SINAIS PARA TELEGRAM
+# TELEGRAM
 # ============================
 
 def enviar_telegram(mensagem):
@@ -108,18 +137,17 @@ def enviar_telegram(mensagem):
         pass
 
 # ============================
-# LOOP PRINCIPAL DO BOT
+# LOOP PRINCIPAL
 # ============================
 
 def executar_bot():
     while True:
         os.system("cls" if os.name == "nt" else "clear")
         print("="*60)
-        print("       INDICADOR TRADING DO JOÃO (MÁXIMA ASSERTIVIDADE)")
+        print("       BOT TRADING JOÃO (ML + Máxima Criteriosidade)")
         print("="*60)
 
         for ativo in ativos:
-            sinais_timeframes = []
             for timeframe in timeframes:
                 try:
                     df = yf.download(ativo, period="2d", interval=timeframe, progress=False)
@@ -127,16 +155,13 @@ def executar_bot():
                         continue
                     df = indicadores(df)
                     sinal = obter_sinal(df, timeframe, ativo)
-                    sinais_timeframes.append(sinal)
+                    if sinal:
+                        mensagem = f"{ativo} | {timeframe.upper()} | {sinal}"
+                        print(mensagem)
+                        enviar_telegram(mensagem)
                 except Exception as e:
-                    print(f"Erro ao processar {ativo} {timeframe}: {e}")
+                    print(f"Erro {ativo} {timeframe}: {e}")
                     continue
-
-            # Envia sinal apenas se os timeframes concordarem
-            if sinais_timeframes.count(sinais_timeframes[0]) == len(timeframes) and sinais_timeframes[0]:
-                mensagem = f"{ativo} | {timeframes[0].upper()}+{timeframes[1].upper()} | {sinais_timeframes[0]}"
-                print(mensagem)
-                enviar_telegram(mensagem)
 
         print("Próxima análise em 60 segundos...")
         time.sleep(60)
@@ -149,7 +174,7 @@ app = Flask("bot")
 
 @app.route("/")
 def home():
-    return "Bot do João rodando!"
+    return "Bot do João rodando com ML!"
 
 @app.route("/ping")
 def ping():
@@ -157,10 +182,6 @@ def ping():
 
 def run_server():
     app.run(host="0.0.0.0", port=8080)
-
-# ============================
-# RODAR BOT + FLASK
-# ============================
 
 if __name__ == "__main__":
     t = Thread(target=run_server)
