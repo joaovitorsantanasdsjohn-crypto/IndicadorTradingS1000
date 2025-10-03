@@ -5,9 +5,6 @@ import os
 from flask import Flask
 from threading import Thread
 import requests
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
 
 # ============================
 # CONFIGURAÇÕES BOT TRADING
@@ -27,9 +24,6 @@ TELEGRAM_CHAT_ID = "6370166264"
 
 # Histórico de sinais para evitar duplicados e contraditórios
 historico_sinais = {}
-
-# Histórico para ML
-ml_historico = []
 
 # ============================
 # FUNÇÕES DE INDICADORES
@@ -55,37 +49,11 @@ def indicadores(df):
     df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
     df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
     df["RSI"] = calcular_rsi(df["Close"], 14)
-    df["Upper"] = df["Close"].rolling(window=20).mean() + 2*df["Close"].rolling(window=20).std()
-    df["Lower"] = df["Close"].rolling(window=20).mean() - 2*df["Close"].rolling(window=20).std()
-    df["ATR"] = df["High"] - df["Low"]
+    df["Upper"] = df["Close"].rolling(window=20).mean() + 2.5*df["Close"].rolling(window=20).std()  # Bollinger mais criteriosa
+    df["Lower"] = df["Close"].rolling(window=20).mean() - 2.5*df["Close"].rolling(window=20).std()
+    df["ATR"] = df["High"].rolling(5).max() - df["Low"].rolling(5).min()
     df["MACD"], df["MACD_SIGNAL"] = calcular_macd(df["Close"])
     return df
-
-# ============================
-# CONFIGURAÇÃO DO MODELO ML
-# ============================
-
-ml_model = Sequential([
-    Dense(32, input_shape=(6,), activation='relu'),
-    Dense(16, activation='relu'),
-    Dense(1, activation='sigmoid')  # saída: probabilidade de sinal correto
-])
-ml_model.compile(optimizer='adam', loss='binary_crossentropy')
-
-def treinar_ml():
-    if len(ml_historico) < 10:
-        return  # mínimo de dados para treinar
-    dados = pd.DataFrame(ml_historico)
-    X = dados[["EMA9", "EMA21", "RSI", "MACD", "MACD_SIGNAL", "ATR"]].values
-    y = dados["Resultado"].values
-    ml_model.fit(X, y, epochs=5, verbose=0)
-
-def avaliar_ml(ind):
-    if not ml_historico:
-        return True  # sem histórico, aceita sinal
-    X = [[ind["EMA9"], ind["EMA21"], ind["RSI"], ind["MACD"], ind["MACD_SIGNAL"], ind["ATR"]]]
-    pred = ml_model.predict(X, verbose=0)[0][0]
-    return pred > 0.6  # só envia se probabilidade > 60%
 
 # ============================
 # FUNÇÕES DE SINAIS
@@ -106,34 +74,26 @@ def obter_sinal(df, timeframe, ativo):
     sinal = None
 
     # Critério de volatilidade mínima (ATR)
-    if atr < (0.001 if "USD" in ativo else 0.1):
+    if atr < (0.0007 if "USD" in ativo else 0.05):
         return None
 
-    # Critério de confiança máxima
-    if (ema9 > ema21 + 0.0003 and close <= lower * 1.005 and rsi < 55 and macd - macd_signal > 0.0001):
+    # Critério de confiança máxima: todos os indicadores devem concordar
+    if ema9 > ema21 and close <= lower*1.005 and rsi < 50 and macd > macd_signal:
         sinal = "CALL"
-    elif (ema9 < ema21 - 0.0003 and close >= upper * 0.995 and rsi > 45 and macd_signal - macd > 0.0001):
+    elif ema9 < ema21 and close >= upper*0.995 and rsi > 50 and macd < macd_signal:
         sinal = "PUT"
-
-    if not sinal:
-        return None
 
     # Verificar duplicados e contraditórios
     chave = f"{ativo}_{timeframe}"
     ultimo_sinal = historico_sinais.get(chave)
+
     if ultimo_sinal == sinal or (ultimo_sinal and sinal and ultimo_sinal != sinal):
         return None
 
-    # Avaliar com ML
-    indicador_ml = {
-        "EMA9": ema9, "EMA21": ema21, "RSI": rsi,
-        "MACD": macd, "MACD_SIGNAL": macd_signal, "ATR": atr
-    }
-    if not avaliar_ml(indicador_ml):
-        return None  # filtro ML
+    if sinal:
+        historico_sinais[chave] = sinal
 
-    historico_sinais[chave] = sinal
-    return sinal, indicador_ml
+    return sinal
 
 # ============================
 # ENVIO DE SINAIS PARA TELEGRAM
@@ -155,28 +115,28 @@ def executar_bot():
     while True:
         os.system("cls" if os.name == "nt" else "clear")
         print("="*60)
-        print("       INDICADOR TRADING DO JOÃO (ML ATIVO + MÁXIMA ASSERTIVIDADE)")
+        print("       INDICADOR TRADING DO JOÃO (MÁXIMA ASSERTIVIDADE)")
         print("="*60)
 
         for ativo in ativos:
+            sinais_timeframes = []
             for timeframe in timeframes:
                 try:
                     df = yf.download(ativo, period="2d", interval=timeframe, progress=False)
                     if df.empty:
                         continue
                     df = indicadores(df)
-                    resultado = obter_sinal(df, timeframe, ativo)
-                    if resultado:
-                        sinal, ind_ml = resultado
-                        mensagem = f"{ativo} | {timeframe.upper()} | {sinal}"
-                        print(mensagem)
-                        enviar_telegram(mensagem)
-                        # Adiciona ao histórico ML
-                        ml_historico.append({**ind_ml, "Resultado": 1})  # por enquanto, assume sinal correto
-                        treinar_ml()
+                    sinal = obter_sinal(df, timeframe, ativo)
+                    sinais_timeframes.append(sinal)
                 except Exception as e:
                     print(f"Erro ao processar {ativo} {timeframe}: {e}")
                     continue
+
+            # Envia sinal apenas se os timeframes concordarem
+            if sinais_timeframes.count(sinais_timeframes[0]) == len(timeframes) and sinais_timeframes[0]:
+                mensagem = f"{ativo} | {timeframes[0].upper()}+{timeframes[1].upper()} | {sinais_timeframes[0]}"
+                print(mensagem)
+                enviar_telegram(mensagem)
 
         print("Próxima análise em 60 segundos...")
         time.sleep(60)
@@ -189,7 +149,7 @@ app = Flask("bot")
 
 @app.route("/")
 def home():
-    return "Bot do João rodando com ML ativo!"
+    return "Bot do João rodando!"
 
 @app.route("/ping")
 def ping():
