@@ -1,4 +1,7 @@
+flask
 yfinance
 pandas
-flask
 requests
+numpy
+# tensorflow  # descomente apenas se quiser testar ML no Render (pode causar alto uso de memória)
+
