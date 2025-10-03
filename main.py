@@ -8,8 +8,6 @@ import requests
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense
-from tensorflow.keras.optimizers import Adam
-import numpy as np
 
 # ============================
 # CONFIGURAÇÕES BOT TRADING
@@ -27,9 +25,11 @@ timeframes = ["5m", "15m"]
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 TELEGRAM_CHAT_ID = "6370166264"
 
-# Histórico de sinais
+# Histórico de sinais para evitar duplicados e contraditórios
 historico_sinais = {}
-historico_ml_file = "signals_history.csv"
+
+# Histórico para ML
+ml_historico = []
 
 # ============================
 # FUNÇÕES DE INDICADORES
@@ -62,7 +62,33 @@ def indicadores(df):
     return df
 
 # ============================
-# FUNÇÃO PARA OBTER SINAL
+# CONFIGURAÇÃO DO MODELO ML
+# ============================
+
+ml_model = Sequential([
+    Dense(32, input_shape=(6,), activation='relu'),
+    Dense(16, activation='relu'),
+    Dense(1, activation='sigmoid')  # saída: probabilidade de sinal correto
+])
+ml_model.compile(optimizer='adam', loss='binary_crossentropy')
+
+def treinar_ml():
+    if len(ml_historico) < 10:
+        return  # mínimo de dados para treinar
+    dados = pd.DataFrame(ml_historico)
+    X = dados[["EMA9", "EMA21", "RSI", "MACD", "MACD_SIGNAL", "ATR"]].values
+    y = dados["Resultado"].values
+    ml_model.fit(X, y, epochs=5, verbose=0)
+
+def avaliar_ml(ind):
+    if not ml_historico:
+        return True  # sem histórico, aceita sinal
+    X = [[ind["EMA9"], ind["EMA21"], ind["RSI"], ind["MACD"], ind["MACD_SIGNAL"], ind["ATR"]]]
+    pred = ml_model.predict(X, verbose=0)[0][0]
+    return pred > 0.6  # só envia se probabilidade > 60%
+
+# ============================
+# FUNÇÕES DE SINAIS
 # ============================
 
 def obter_sinal(df, timeframe, ativo):
@@ -80,28 +106,37 @@ def obter_sinal(df, timeframe, ativo):
     sinal = None
 
     # Critério de volatilidade mínima (ATR)
-    if atr < (0.0005 if "USD" in ativo else 0.05):
+    if atr < (0.001 if "USD" in ativo else 0.1):
         return None
 
     # Critério de confiança máxima
-    if ema9 > ema21 and close <= lower*1.01 and rsi < 65 and macd > macd_signal:
+    if (ema9 > ema21 + 0.0003 and close <= lower * 1.005 and rsi < 55 and macd - macd_signal > 0.0001):
         sinal = "CALL"
-    elif ema9 < ema21 and close >= upper*0.99 and rsi > 35 and macd < macd_signal:
+    elif (ema9 < ema21 - 0.0003 and close >= upper * 0.995 and rsi > 45 and macd_signal - macd > 0.0001):
         sinal = "PUT"
 
-    # Evitar duplicados e contraditórios
+    if not sinal:
+        return None
+
+    # Verificar duplicados e contraditórios
     chave = f"{ativo}_{timeframe}"
     ultimo_sinal = historico_sinais.get(chave)
     if ultimo_sinal == sinal or (ultimo_sinal and sinal and ultimo_sinal != sinal):
         return None
 
-    if sinal:
-        historico_sinais[chave] = sinal
+    # Avaliar com ML
+    indicador_ml = {
+        "EMA9": ema9, "EMA21": ema21, "RSI": rsi,
+        "MACD": macd, "MACD_SIGNAL": macd_signal, "ATR": atr
+    }
+    if not avaliar_ml(indicador_ml):
+        return None  # filtro ML
 
-    return sinal
+    historico_sinais[chave] = sinal
+    return sinal, indicador_ml
 
 # ============================
-# FUNÇÃO TELEGRAM
+# ENVIO DE SINAIS PARA TELEGRAM
 # ============================
 
 def enviar_telegram(mensagem):
@@ -113,38 +148,6 @@ def enviar_telegram(mensagem):
         pass
 
 # ============================
-# FUNÇÕES DE ML
-# ============================
-
-# Carregar histórico ou criar novo
-if os.path.exists(historico_ml_file):
-    df_ml = pd.read_csv(historico_ml_file)
-else:
-    df_ml = pd.DataFrame(columns=["ativo","timeframe","EMA9","EMA21","RSI","Upper","Lower","ATR","MACD","MACD_SIGNAL","sinal","resultado"])
-
-def treinar_modelo():
-    if len(df_ml) < 10:
-        return None  # poucos dados para treinar
-    X = df_ml[["EMA9","EMA21","RSI","Upper","Lower","ATR","MACD","MACD_SIGNAL"]].values
-    y = df_ml["resultado"].apply(lambda x: 1 if x=="CORRETO" else 0).values
-    model = Sequential([
-        Dense(32, input_dim=X.shape[1], activation='relu'),
-        Dense(16, activation='relu'),
-        Dense(1, activation='sigmoid')
-    ])
-    model.compile(optimizer=Adam(0.001), loss='binary_crossentropy', metrics=['accuracy'])
-    model.fit(X, y, epochs=10, verbose=0)
-    return model
-
-def filtrar_sinal_ml(model, df, sinal):
-    ultimo = df.iloc[-1]
-    X_pred = np.array([[ultimo["EMA9"],ultimo["EMA21"],ultimo["RSI"],ultimo["Upper"],ultimo["Lower"],ultimo["ATR"],ultimo["MACD"],ultimo["MACD_SIGNAL"]]])
-    prob = model.predict(X_pred, verbose=0)[0][0]
-    if prob > 0.6:  # só envia se a probabilidade de acerto > 60%
-        return True
-    return False
-
-# ============================
 # LOOP PRINCIPAL DO BOT
 # ============================
 
@@ -152,10 +155,8 @@ def executar_bot():
     while True:
         os.system("cls" if os.name == "nt" else "clear")
         print("="*60)
-        print("       INDICADOR TRADING DO JOÃO (ML ATIVO)")
+        print("       INDICADOR TRADING DO JOÃO (ML ATIVO + MÁXIMA ASSERTIVIDADE)")
         print("="*60)
-
-        model = treinar_modelo()
 
         for ativo in ativos:
             for timeframe in timeframes:
@@ -164,31 +165,15 @@ def executar_bot():
                     if df.empty:
                         continue
                     df = indicadores(df)
-                    sinal = obter_sinal(df, timeframe, ativo)
-                    if sinal:
-                        enviar = True
-                        if model:
-                            enviar = filtrar_sinal_ml(model, df, sinal)
-                        if enviar:
-                            mensagem = f"{ativo} | {timeframe.upper()} | {sinal}"
-                            print(mensagem)
-                            enviar_telegram(mensagem)
-                            # Atualizar histórico ML
-                            novo = {
-                                "ativo": ativo, "timeframe": timeframe,
-                                "EMA9": df["EMA9"].iloc[-1],
-                                "EMA21": df["EMA21"].iloc[-1],
-                                "RSI": df["RSI"].iloc[-1],
-                                "Upper": df["Upper"].iloc[-1],
-                                "Lower": df["Lower"].iloc[-1],
-                                "ATR": df["ATR"].iloc[-1],
-                                "MACD": df["MACD"].iloc[-1],
-                                "MACD_SIGNAL": df["MACD_SIGNAL"].iloc[-1],
-                                "sinal": sinal,
-                                "resultado": "CORRETO"
-                            }
-                            df_ml.loc[len(df_ml)] = novo
-                            df_ml.to_csv(historico_ml_file, index=False)
+                    resultado = obter_sinal(df, timeframe, ativo)
+                    if resultado:
+                        sinal, ind_ml = resultado
+                        mensagem = f"{ativo} | {timeframe.upper()} | {sinal}"
+                        print(mensagem)
+                        enviar_telegram(mensagem)
+                        # Adiciona ao histórico ML
+                        ml_historico.append({**ind_ml, "Resultado": 1})  # por enquanto, assume sinal correto
+                        treinar_ml()
                 except Exception as e:
                     print(f"Erro ao processar {ativo} {timeframe}: {e}")
                     continue
@@ -204,7 +189,7 @@ app = Flask("bot")
 
 @app.route("/")
 def home():
-    return "Bot do João rodando com ML!"
+    return "Bot do João rodando com ML ativo!"
 
 @app.route("/ping")
 def ping():
