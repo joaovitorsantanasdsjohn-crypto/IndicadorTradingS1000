@@ -11,9 +11,12 @@ import tensorflow as tf
 from tensorflow.keras import Sequential
 from tensorflow.keras.layers import Dense, Dropout
 
-# Config do Telegram
-TELEGRAM_TOKEN = "SEU_TOKEN"
-TELEGRAM_CHAT_ID = "SEU_CHAT_ID"
+# ============================
+# CONFIGURAÇÕES TELEGRAM
+# ============================
+TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
+TELEGRAM_CHAT_ID = "6370166264"
+
 
 # Ativos a monitorar
 ATIVOS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X"]
@@ -96,3 +99,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
