@@ -4,14 +4,14 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import time
-import os
 import requests
+from threading import Thread
+from flask import Flask
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
-from flask import Flask
-from threading import Thread
+from tensorflow.keras.layers import Dense, Dropout
 
 # ============================
 # CONFIGURAÇÕES BOT TRADING
@@ -25,7 +25,7 @@ ativos = [
 
 timeframes = ["5m", "15m"]
 
-# Configurações do Telegram
+# Telegram
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 TELEGRAM_CHAT_ID = "6370166264"
 
@@ -39,7 +39,7 @@ historico_sinais = {}
 def calcular_rsi(series, period=14):
     delta = series.diff()
     ganho = delta.clip(lower=0)
-    perda = -delta.clip(upper=0)
+    perda = -1*delta.clip(upper=0)
     media_ganho = ganho.rolling(window=period).mean()
     media_perda = perda.rolling(window=period).mean()
     rs = media_ganho / media_perda
@@ -63,75 +63,46 @@ def indicadores(df):
     return df
 
 # ============================
-# CONFIGURAÇÃO ML / TensorFlow
-# ============================
-
-def criar_modelo():
-    modelo = Sequential()
-    modelo.add(Dense(64, input_dim=5, activation="relu"))  # EMA9, EMA21, RSI, MACD, ATR
-    modelo.add(Dense(32, activation="relu"))
-    modelo.add(Dense(2, activation="softmax"))  # CALL ou PUT
-    modelo.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
-    return modelo
-
-ml_model = criar_modelo()
-
-# ============================
-# FUNÇÃO DE SINAIS
+# FUNÇÕES DE SINAIS
 # ============================
 
 def obter_sinal(df, timeframe, ativo):
     ultimo = df.iloc[-1]
-    features = [
-        float(ultimo["EMA9"]),
-        float(ultimo["EMA21"]),
-        float(ultimo["RSI"]),
-        float(ultimo["MACD"]),
-        float(ultimo["ATR"].tail(5).mean())
-    ]
-    
-    # Previsão ML
-    import numpy as np
-    pred = ml_model.predict(np.array([features]), verbose=0)[0]
-    sinal_ml = "CALL" if np.argmax(pred) == 0 else "PUT"
-
-    # Critério de máxima assertividade
     close = float(ultimo["Close"])
-    upper = float(ultimo["Upper"])
-    lower = float(ultimo["Lower"])
     ema9 = float(ultimo["EMA9"])
     ema21 = float(ultimo["EMA21"])
     rsi = float(ultimo["RSI"])
+    upper = float(ultimo["Upper"])
+    lower = float(ultimo["Lower"])
+    atr = float(ultimo["ATR"].tail(5).mean())
     macd = float(ultimo["MACD"])
     macd_signal = float(ultimo["MACD_SIGNAL"])
-    atr = float(ultimo["ATR"].tail(5).mean())
 
-    # Todos indicadores precisam concordar
     sinal = None
-    if ema9 > ema21 and close <= lower*1.01 and rsi < 55 and macd > macd_signal and sinal_ml == "CALL":
+
+    # Critério de volatilidade mínima (ATR)
+    if atr < (0.0005 if "USD" in ativo else 0.05):
+        return None
+
+    # Critério máximo: todos os indicadores devem concordar
+    if ema9 > ema21 and close <= lower*1.01 and rsi < 55 and macd > macd_signal:
         sinal = "CALL"
-    elif ema9 < ema21 and close >= upper*0.99 and rsi > 45 and macd < macd_signal and sinal_ml == "PUT":
+    elif ema9 < ema21 and close >= upper*0.99 and rsi > 45 and macd < macd_signal:
         sinal = "PUT"
 
-    # Evitar duplicados
     chave = f"{ativo}_{timeframe}"
     ultimo_sinal = historico_sinais.get(chave)
+
     if ultimo_sinal == sinal or (ultimo_sinal and sinal and ultimo_sinal != sinal):
         return None
 
     if sinal:
         historico_sinais[chave] = sinal
-        # Treinar modelo com este sinal
-        # Label: [CALL, PUT]
-        y_label = [1,0] if sinal=="CALL" else [0,1]
-        X = np.array([features])
-        Y = np.array([y_label])
-        ml_model.fit(X, Y, epochs=1, verbose=0)
 
     return sinal
 
 # ============================
-# ENVIO DE SINAIS TELEGRAM
+# FUNÇÃO TELEGRAM
 # ============================
 
 def enviar_telegram(mensagem):
@@ -143,14 +114,36 @@ def enviar_telegram(mensagem):
         pass
 
 # ============================
+# MODELO ML (TENSORFLOW)
+# ============================
+
+# Modelo simples feed-forward para aprendizado de sinais
+ml_model = Sequential([
+    Dense(64, input_shape=(6,), activation="relu"),
+    Dropout(0.2),
+    Dense(32, activation="relu"),
+    Dense(1, activation="sigmoid")
+])
+ml_model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+
+def treinar_modelo(features, alvo):
+    X = np.array(features)
+    y = np.array(alvo)
+    ml_model.fit(X, y, epochs=5, verbose=0)
+
+def prever_sinal(features):
+    X = np.array([features])
+    pred = ml_model.predict(X, verbose=0)[0][0]
+    return "CALL" if pred > 0.5 else "PUT"
+
+# ============================
 # LOOP PRINCIPAL
 # ============================
 
 def executar_bot():
     while True:
-        os.system("cls" if os.name=="nt" else "clear")
         print("="*60)
-        print("       INDICADOR TRADING (MAX ASSERTIVIDADE + ML)")
+        print("       INDICADOR TRADING COM ML DO JOÃO")
         print("="*60)
 
         for ativo in ativos:
@@ -162,37 +155,49 @@ def executar_bot():
                     df = indicadores(df)
                     sinal = obter_sinal(df, timeframe, ativo)
                     if sinal:
-                        mensagem = f"{ativo} | {timeframe.upper()} | {sinal}"
+                        features = [
+                            float(df["EMA9"].iloc[-1]),
+                            float(df["EMA21"].iloc[-1]),
+                            float(df["RSI"].iloc[-1]),
+                            float(df["Upper"].iloc[-1]),
+                            float(df["Lower"].iloc[-1]),
+                            float(df["MACD"].iloc[-1])
+                        ]
+                        # Treina o modelo com o sinal atual
+                        treinar_modelo(features, [1 if sinal=="CALL" else 0])
+                        # Previsão via ML
+                        sinal_ml = prever_sinal(features)
+                        mensagem = f"{ativo} | {timeframe.upper()} | {sinal_ml}"
                         print(mensagem)
                         enviar_telegram(mensagem)
                 except Exception as e:
-                    print(f"Erro ao processar {ativo} {timeframe}: {e}")
+                    print(f"Erro em {ativo} {timeframe}: {e}")
                     continue
 
         print("Próxima análise em 60 segundos...")
         time.sleep(60)
 
 # ============================
-# FLASK PARA KEEP-ALIVE
+# FLASK PARA MANUTENÇÃO / KEEP-ALIVE
 # ============================
 
 app = Flask("bot")
 
 @app.route("/")
 def home():
-    return "Bot rodando!"
+    return "Bot do João rodando!"
+
+@app.route("/ping")
+def ping():
+    return "pong"
 
 def run_server():
-    # Porta padrão do Render: 10000-19999 ou PORT variável de ambiente
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=8080)
 
 # ============================
 # RODAR BOT + FLASK
 # ============================
 
-if __name__=="__main__":
-    t = Thread(target=run_server)
-    t.start()
+if __name__ == "__main__":
+    Thread(target=run_server).start()
     executar_bot()
-
