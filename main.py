@@ -23,7 +23,12 @@ def send_telegram_message(message):
         print(f"Erro ao enviar mensagem: {e}")
 
 # ===================== BOT DE TRADING =====================
-ativos = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X"]
+ativos = [
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X", "AUDUSD=X",
+    "NZDUSD=X", "USDCAD=X", "EURGBP=X", "EURJPY=X", "GBPJPY=X",
+    "AUDJPY=X", "AUDCAD=X", "AUDCHF=X", "EURAUD=X", "GBPCHF=X"
+]
+
 
 # Criar modelo simples de ML (TensorFlow)
 def criar_modelo():
@@ -100,3 +105,4 @@ if __name__ == "__main__":
     # Flask segura a porta aberta
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
