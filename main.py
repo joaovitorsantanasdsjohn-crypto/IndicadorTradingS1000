@@ -1,113 +1,102 @@
+import os
+import threading
+import time
 import yfinance as yf
 import pandas as pd
-import numpy as np
-import time
 import requests
-import tensorflow as tf
+from flask import Flask
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
-from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.layers import Dense, LSTM
+import numpy as np
 
-# Configurações do Telegram
+# ===================== CONFIGURAÇÕES DO TELEGRAM =====================
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
-TELEGRAM_CHAT_ID = "6370166264"
+CHAT_ID = "6370166264"
 
-# Ativos e timeframes
-ativos = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X"]
-timeframes = ["5m", "15m"]
-
-# Histórico de sinais
-historico_sinais = {}
-
-# Inicializa o modelo ML (rede neural simples)
-scaler = MinMaxScaler()
-model = Sequential([
-    Dense(64, activation='relu', input_dim=5),  # 5 indicadores principais
-    Dense(32, activation='relu'),
-    Dense(1, activation='sigmoid')
-])
-model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-
-# Função de envio Telegram
-def enviar_telegram(mensagem):
+# ===================== FUNÇÃO DE ENVIO TELEGRAM =====================
+def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": message}
     try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": mensagem})
-    except:
-        pass
+        requests.post(url, data=data)
+    except Exception as e:
+        print(f"Erro ao enviar mensagem: {e}")
 
-# Funções de indicadores
+# ===================== BOT DE TRADING =====================
+ativos = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X"]
+
+# Criar modelo simples de ML (TensorFlow)
+def criar_modelo():
+    model = Sequential()
+    model.add(LSTM(50, return_sequences=True, input_shape=(10, 1)))
+    model.add(LSTM(50))
+    model.add(Dense(1, activation="linear"))
+    model.compile(optimizer="adam", loss="mse")
+    return model
+
+modelo = criar_modelo()
+
 def calcular_indicadores(df):
     # EMA
-    df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
-    df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
+    df["EMA"] = df["Close"].ewm(span=20, adjust=False).mean()
     # RSI
-    delta = df['Close'].diff()
-    gain = delta.where(delta>0,0)
-    loss = -delta.where(delta<0,0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    # Bollinger Bands
-    df['BB_M'] = df['Close'].rolling(20).mean()
-    df['BB_U'] = df['BB_M'] + 2*df['Close'].rolling(20).std()
-    df['BB_L'] = df['BB_M'] - 2*df['Close'].rolling(20).std()
-    # MACD
-    df['EMA_12'] = df['Close'].ewm(span=12, adjust=False).mean()
-    df['EMA_26'] = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = df['EMA_12'] - df['EMA_26']
-    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    # ATR
-    df['H-L'] = df['High'] - df['Low']
-    df['H-PC'] = abs(df['High'] - df['Close'].shift(1))
-    df['L-PC'] = abs(df['Low'] - df['Close'].shift(1))
-    df['TR'] = df[['H-L','H-PC','L-PC']].max(axis=1)
-    df['ATR'] = df['TR'].rolling(14).mean()
+    delta = df["Close"].diff()
+    ganho = delta.where(delta > 0, 0)
+    perda = -delta.where(delta < 0, 0)
+    media_ganho = ganho.rolling(14).mean()
+    media_perda = perda.rolling(14).mean()
+    rs = media_ganho / media_perda
+    df["RSI"] = 100 - (100 / (1 + rs))
+    # Bandas de Bollinger
+    df["MA20"] = df["Close"].rolling(20).mean()
+    df["STD"] = df["Close"].rolling(20).std()
+    df["Upper"] = df["MA20"] + (df["STD"] * 2)
+    df["Lower"] = df["MA20"] - (df["STD"] * 2)
     return df
 
-# Função que decide o sinal
-def obter_sinal(df, ativo, timeframe):
-    ultimo = df.iloc[-1]
-    # Critérios máximos de assertividade
-    if (ultimo['Close'] > ultimo['EMA_9'] > ultimo['EMA_21'] and
-        ultimo['RSI'] > 55 and
-        ultimo['Close'] > ultimo['BB_U'] and
-        ultimo['MACD'] > ultimo['Signal']):
-        return "CALL"
-    elif (ultimo['Close'] < ultimo['EMA_9'] < ultimo['EMA_21'] and
-          ultimo['RSI'] < 45 and
-          ultimo['Close'] < ultimo['BB_L'] and
-          ultimo['MACD'] < ultimo['Signal']):
-        return "PUT"
-    else:
-        return None
-
-# Treinamento ML básico com cada sinal novo
-def treinar_modelo(indicadores, sinal):
-    X = scaler.fit_transform(indicadores)
-    y = np.array([1 if sinal=="CALL" else 0])
-    model.fit(X, y, epochs=1, verbose=0)
-
-# Loop principal
-def executar_bot():
+def analisar_e_enviar_sinais():
     while True:
         for ativo in ativos:
-            for timeframe in timeframes:
-                try:
-                    df = yf.download(ativo, period="2d", interval=timeframe, progress=False)
-                    if df.empty:
-                        continue
-                    df = calcular_indicadores(df)
-                    sinal = obter_sinal(df, ativo, timeframe)
-                    if sinal:
-                        enviar_telegram(f"{ativo} | {timeframe.upper()} | {sinal}")
-                        # Treina ML com indicadores do último candle
-                        ultimos_ind = df[['EMA_9','EMA_21','RSI','MACD','ATR']].iloc[-1].values.reshape(1,-1)
-                        treinar_modelo(ultimos_ind, sinal)
-                except Exception as e:
-                    print(f"Erro em {ativo}: {e}")
-        time.sleep(60)
+            try:
+                df = yf.download(ativo, period="1d", interval="5m")
+                if df.empty:
+                    continue
 
+                df = calcular_indicadores(df)
+
+                rsi = df["RSI"].iloc[-1]
+                close = df["Close"].iloc[-1]
+                ema = df["EMA"].iloc[-1]
+                upper = df["Upper"].iloc[-1]
+                lower = df["Lower"].iloc[-1]
+
+                sinal = None
+                if rsi < 40 and close < lower and close > ema:
+                    sinal = f"🔵 Possível COMPRA em {ativo} | RSI: {rsi:.2f}"
+                elif rsi > 60 and close > upper and close < ema:
+                    sinal = f"🔴 Possível VENDA em {ativo} | RSI: {rsi:.2f}"
+
+                if sinal:
+                    send_telegram_message(sinal)
+
+            except Exception as e:
+                print(f"Erro em {ativo}: {e}")
+
+        time.sleep(120)  # espera 2 minutos entre varredas
+
+# ===================== FLASK APP PARA MANTER PORTA ABERTA =====================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "🤖 Bot de Trading com ML está rodando!"
+
+# ===================== THREAD BOT + FLASK =====================
 if __name__ == "__main__":
-    executar_bot()
+    # Bot roda em thread separada
+    t = threading.Thread(target=analisar_e_enviar_sinais, daemon=True)
+    t.start()
+
+    # Flask segura a porta aberta
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
