@@ -26,7 +26,7 @@ ativos = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
     "AUDUSD=X", "USDCAD=X", "NZDUSD=X", "EURGBP=X",
     "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "AUDCAD=X",
-    "GBPCHF=X", "EURCHF=X", "USDSEK=X"
+    "GBPCHF=X", "EURCHF=X", "USDMXN=X"
 ]
 
 # ===================== MODELO ML =====================
@@ -115,3 +115,4 @@ if __name__ == "__main__":
     t.start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
