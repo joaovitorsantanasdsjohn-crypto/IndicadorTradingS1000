@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+import ssl
 import yfinance as yf
 import pandas as pd
 import requests
@@ -8,6 +9,7 @@ from flask import Flask
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, LSTM
 import numpy as np
+import requests_cache
 
 # ===================== CONFIGURAÇÕES DO TELEGRAM =====================
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
@@ -21,7 +23,11 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
-# ===================== BOT DE TRADING =====================
+# ===================== CONFIGURAÇÃO DO SSL (CORREÇÃO RENDER) =====================
+ssl._create_default_https_context = ssl._create_unverified_context
+session = requests_cache.CachedSession('yfinance.cache', expire_after=300)
+
+# ===================== LISTA DE ATIVOS =====================
 ativos = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
     "AUDUSD=X", "USDCAD=X", "NZDUSD=X", "EURGBP=X",
@@ -29,7 +35,7 @@ ativos = [
     "GBPCHF=X", "EURCHF=X", "USDMXN=X"
 ]
 
-# ===================== MODELO ML =====================
+# ===================== MODELO LSTM =====================
 def criar_modelo():
     model = Sequential()
     model.add(LSTM(50, return_sequences=True, input_shape=(10, 1)))
@@ -56,27 +62,7 @@ def calcular_indicadores(df):
     df["Lower"] = df["MA20"] - (df["STD"] * 2)
     return df
 
-# ===================== FUNÇÃO DE DOWNLOAD ROBUSTA =====================
-def baixar_dados_yfinance(ativo, tentativas=3):
-    for i in range(tentativas):
-        try:
-            df = yf.download(
-                ativo,
-                period="1d",
-                interval="15m",
-                progress=False,
-                threads=False,
-                timeout=10
-            )
-            if not df.empty:
-                return df
-        except Exception as e:
-            print(f"Tentativa {i+1} falhou para {ativo}: {e}")
-        time.sleep(5)  # espera entre tentativas
-    print(f"Falha ao baixar dados de {ativo} após {tentativas} tentativas.")
-    return pd.DataFrame()
-
-# ===================== FUNÇÃO DE PREVISÃO =====================
+# ===================== PREVISÃO =====================
 def prever_proximo_candle(df):
     if len(df) < 11:
         return None
@@ -90,8 +76,18 @@ def analisar_e_enviar_sinais():
     while True:
         for ativo in ativos:
             try:
-                df = baixar_dados_yfinance(ativo)
+                print(f"Baixando dados de {ativo}...")
+                df = yf.download(
+                    ativo,
+                    period="1d",
+                    interval="15m",
+                    progress=False,
+                    threads=False,
+                    session=session
+                )
+
                 if df.empty:
+                    print(f"⚠️ Dados vazios para {ativo}, pulando...")
                     continue
 
                 df = calcular_indicadores(df)
@@ -112,23 +108,25 @@ def analisar_e_enviar_sinais():
                     sinal = f"🔴 VENDA prevista em {ativo} | RSI: {rsi:.2f}"
 
                 if sinal:
+                    print(f"📡 Enviando sinal: {sinal}")
                     send_telegram_message(sinal)
 
             except Exception as e:
                 print(f"Erro em {ativo}: {e}")
 
-        time.sleep(900)  # aguarda 15 minutos para o próximo candle
+        print("⏳ Aguardando 15 minutos para nova análise...")
+        time.sleep(900)
 
-# ===================== FLASK APP PARA MANTER PORTA ABERTA =====================
+# ===================== FLASK APP =====================
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "🤖 Bot de Trading com ML e download robusto de dados 15m rodando!"
+    return "🤖 Bot de Trading com ML e previsão de candle 15m rodando!"
 
-# ===================== THREAD BOT + FLASK =====================
+# ===================== THREAD PRINCIPAL =====================
 if __name__ == "__main__":
     t = threading.Thread(target=analisar_e_enviar_sinais, daemon=True)
     t.start()
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
