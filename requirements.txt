@@ -1,6 +1,7 @@
-yfinance==0.2.40
-pandas==1.5.3
-flask==2.3.3
-requests==2.31.0
-tensorflow-cpu==2.12.0
-numpy==1.23.5
+Flask
+yfinance==0.2.38
+pandas
+numpy
+requests
+tensorflow
+requests-cache
