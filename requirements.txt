@@ -1,7 +1,6 @@
 flask
-yfinance
-requests
-requests_cache
-tensorflow
+yfinance==0.2.43
 pandas
 numpy
+tensorflow==2.17.0
+requests
