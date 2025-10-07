@@ -1,7 +1,7 @@
-Flask
-yfinance==0.2.38
+flask
+yfinance
+requests
+requests_cache
+tensorflow
 pandas
 numpy
-requests
-tensorflow
-requests-cache
