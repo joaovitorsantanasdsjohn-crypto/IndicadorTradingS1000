@@ -22,7 +22,7 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
-# ===================== CONFIGURAÇÃO DO SSL (RENDER) =====================
+# ===================== CONFIGURAÇÃO DO SSL (CORREÇÃO RENDER) =====================
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # ===================== LISTA DE ATIVOS =====================
@@ -99,4 +99,31 @@ def analisar_e_enviar_sinais():
                     continue
 
                 sinal = None
-                if rsi < 40 and pred_close < lower
+                if rsi < 40 and pred_close < lower and pred_close > ema:
+                    sinal = f"🔵 COMPRA prevista em {ativo} | RSI: {rsi:.2f}"
+                elif rsi > 60 and pred_close > upper and pred_close < ema:
+                    sinal = f"🔴 VENDA prevista em {ativo} | RSI: {rsi:.2f}"
+
+                if sinal:
+                    print(f"📡 Enviando sinal: {sinal}")
+                    send_telegram_message(sinal)
+
+            except Exception as e:
+                print(f"❌ Erro em {ativo}: {e}")
+
+        print("⏳ Aguardando 15 minutos para nova análise...")
+        time.sleep(900)
+
+# ===================== FLASK APP =====================
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "🤖 Bot de Trading com ML e previsão de candle 15m rodando!"
+
+# ===================== THREAD PRINCIPAL =====================
+if __name__ == "__main__":
+    t = threading.Thread(target=analisar_e_enviar_sinais, daemon=True)
+    t.start()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
