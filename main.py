@@ -19,7 +19,11 @@ def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {"chat_id": CHAT_ID, "text": message}
     try:
-        requests.post(url, data=data, timeout=10)
+        r = requests.post(url, data=data, timeout=10)
+        if r.status_code == 200:
+            print("✅ Sinal enviado com sucesso para o Telegram.")
+        else:
+            print(f"⚠️ Erro ao enviar sinal. Código: {r.status_code}")
     except Exception as e:
         print(f"Erro ao enviar mensagem: {e}")
 
@@ -48,7 +52,8 @@ modelo = criar_modelo()
 # ===================== INDICADORES =====================
 def calcular_indicadores(df):
     """Calcula EMA, RSI e Bandas de Bollinger."""
-    df["EMA"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
     delta = df["Close"].diff()
     ganho = delta.where(delta > 0, 0)
@@ -103,35 +108,62 @@ def analisar_e_enviar_sinais():
     """Analisa os ativos e envia sinais de compra/venda."""
     while True:
         for ativo in ativos:
-            print(f"📥 Baixando dados de {ativo}...")
+            print(f"\n📥 Baixando dados de {ativo}...")
             df = baixar_dados(ativo)
             if df.empty:
                 continue
 
             df = calcular_indicadores(df)
             close = df["Close"].iloc[-1]
-            ema = df["EMA"].iloc[-1]
+            ema20 = df["EMA20"].iloc[-1]
+            ema50 = df["EMA50"].iloc[-1]
             upper = df["Upper"].iloc[-1]
             lower = df["Lower"].iloc[-1]
             rsi = df["RSI"].iloc[-1]
+            tendencia_alta = ema20 > ema50
+            tendencia_baixa = ema20 < ema50
 
             pred_close = prever_proximo_candle(df)
             if pred_close is None:
                 continue
 
             sinal = None
-            # COMPRA
-            if rsi < 40 and pred_close < lower and pred_close > ema:
-                sinal = f"🔵 COMPRA prevista em {ativo}\nRSI: {rsi:.2f} | Previsão: {pred_close:.5f}"
-            # VENDA
-            elif rsi > 60 and pred_close > upper and pred_close < ema:
-                sinal = f"🔴 VENDA prevista em {ativo}\nRSI: {rsi:.2f} | Previsão: {pred_close:.5f}"
+
+            # ===================== CONDIÇÕES DE COMPRA =====================
+            if (
+                rsi < 40 and 
+                pred_close < lower and 
+                tendencia_alta and 
+                close > ema20
+            ):
+                sinal = (
+                    f"🔵 COMPRA em {ativo}\n"
+                    f"Tendência: Alta (EMA20>{ema50})\n"
+                    f"RSI: {rsi:.2f}\n"
+                    f"Preço: {close:.5f}\n"
+                    f"Previsão próxima vela: {pred_close:.5f}"
+                )
+
+            # ===================== CONDIÇÕES DE VENDA =====================
+            elif (
+                rsi > 60 and 
+                pred_close > upper and 
+                tendencia_baixa and 
+                close < ema20
+            ):
+                sinal = (
+                    f"🔴 VENDA em {ativo}\n"
+                    f"Tendência: Baixa (EMA20<{ema50})\n"
+                    f"RSI: {rsi:.2f}\n"
+                    f"Preço: {close:.5f}\n"
+                    f"Previsão próxima vela: {pred_close:.5f}"
+                )
 
             if sinal:
                 print(f"📡 Enviando sinal: {sinal}")
                 send_telegram_message(sinal)
 
-        print("⏳ Aguardando 15 minutos para nova análise...\n")
+        print("\n⏳ Aguardando 15 minutos para nova análise...")
         time.sleep(900)
 
 # ===================== FLASK APP =====================
@@ -139,7 +171,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "🤖 Bot de Trading com ML e candles de 15m rodando!"
+    return "🤖 Bot de Trading com RSI + Bollinger + EMA rodando (15m)!"
 
 # ===================== THREAD PRINCIPAL =====================
 if __name__ == "__main__":
