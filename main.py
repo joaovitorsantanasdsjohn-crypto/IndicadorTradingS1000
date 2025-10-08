@@ -2,30 +2,25 @@ import os
 import threading
 import time
 import ssl
-import yfinance as yf
-import pandas as pd
+import io
 import requests
+import pandas as pd
+import numpy as np
 from flask import Flask
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, LSTM
-import numpy as np
 
-# ===================== CONFIGURAÇÕES DO TELEGRAM =====================
+# ===================== CONFIGURAÇÕES TELEGRAM =====================
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 CHAT_ID = "6370166264"
 
 def send_telegram_message(message):
-    """Envia mensagens para o Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {"chat_id": CHAT_ID, "text": message}
     try:
-        r = requests.post(url, data=data, timeout=10)
-        if r.status_code == 200:
-            print("✅ Sinal enviado com sucesso para o Telegram.")
-        else:
-            print(f"⚠️ Erro ao enviar sinal. Código: {r.status_code}")
+        requests.post(url, data=data, timeout=10)
     except Exception as e:
-        print(f"Erro ao enviar mensagem: {e}")
+        print(f"❌ Erro ao enviar mensagem: {e}")
 
 # ===================== CONFIGURAÇÃO SSL =====================
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -51,7 +46,6 @@ modelo = criar_modelo()
 
 # ===================== INDICADORES =====================
 def calcular_indicadores(df):
-    """Calcula EMA, RSI e Bandas de Bollinger."""
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
@@ -71,7 +65,6 @@ def calcular_indicadores(df):
 
 # ===================== PREVISÃO =====================
 def prever_proximo_candle(df):
-    """Prevê o próximo fechamento com base nas últimas 10 velas."""
     if len(df) < 11:
         return None
     data = df["Close"].values[-11:-1]
@@ -81,31 +74,30 @@ def prever_proximo_candle(df):
 
 # ===================== DOWNLOAD ROBUSTO =====================
 def baixar_dados(ativo, tentativas=3):
-    """Baixa dados do Yahoo Finance de forma resiliente."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    url = f"https://query1.finance.yahoo.com/v7/finance/download/{ativo}?interval=15m&range=1d"
+    headers = {"User-Agent": "Mozilla/5.0"}
     for i in range(tentativas):
         try:
-            df = yf.download(
-                ativo,
-                period="1d",
-                interval="15m",
-                progress=False,
-                threads=False,
-                headers=headers,
-            )
-            if df is not None and not df.empty and "Close" in df.columns:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code == 200 and len(r.text) > 100:
+                df = pd.read_csv(io.StringIO(r.text))
+                if "Close" not in df.columns:
+                    raise ValueError("Sem coluna Close")
+                df["Datetime"] = pd.to_datetime(df["Date"])
+                df.set_index("Datetime", inplace=True)
+                df = df.dropna()
+                print(f"✅ {ativo}: dados recebidos ({len(df)} candles)")
                 return df
             else:
-                print(f"⚠️ {ativo}: resposta vazia na tentativa {i+1}")
+                print(f"⚠️ {ativo}: resposta vazia ({r.status_code})")
         except Exception as e:
-            print(f"⚠️ Erro ao baixar {ativo} (tentativa {i+1}): {e}")
+            print(f"❌ Erro ao baixar {ativo} (tentativa {i+1}): {e}")
         time.sleep(2)
-    print(f"🚫 Falha total ao baixar {ativo}. Pulando ativo.")
+    print(f"🚫 Falha total ao baixar {ativo}")
     return pd.DataFrame()
 
 # ===================== ANÁLISE E SINAIS =====================
 def analisar_e_enviar_sinais():
-    """Analisa os ativos e envia sinais de compra/venda."""
     while True:
         for ativo in ativos:
             print(f"\n📥 Baixando dados de {ativo}...")
@@ -120,61 +112,40 @@ def analisar_e_enviar_sinais():
             upper = df["Upper"].iloc[-1]
             lower = df["Lower"].iloc[-1]
             rsi = df["RSI"].iloc[-1]
-            tendencia_alta = ema20 > ema50
-            tendencia_baixa = ema20 < ema50
-
             pred_close = prever_proximo_candle(df)
             if pred_close is None:
                 continue
 
+            # ===================== LÓGICA DE SINAIS =====================
             sinal = None
 
-            # ===================== CONDIÇÕES DE COMPRA =====================
-            if (
-                rsi < 40 and 
-                pred_close < lower and 
-                tendencia_alta and 
-                close > ema20
-            ):
-                sinal = (
-                    f"🔵 COMPRA em {ativo}\n"
-                    f"Tendência: Alta (EMA20>{ema50})\n"
-                    f"RSI: {rsi:.2f}\n"
-                    f"Preço: {close:.5f}\n"
-                    f"Previsão próxima vela: {pred_close:.5f}"
-                )
+            # Tendência de alta (EMA20 > EMA50)
+            if ema20 > ema50 and rsi < 40 and pred_close > ema20 and close < lower:
+                sinal = f"🔵 COMPRA prevista em {ativo} | RSI: {rsi:.2f} | EMA20>EMA50"
 
-            # ===================== CONDIÇÕES DE VENDA =====================
-            elif (
-                rsi > 60 and 
-                pred_close > upper and 
-                tendencia_baixa and 
-                close < ema20
-            ):
-                sinal = (
-                    f"🔴 VENDA em {ativo}\n"
-                    f"Tendência: Baixa (EMA20<{ema50})\n"
-                    f"RSI: {rsi:.2f}\n"
-                    f"Preço: {close:.5f}\n"
-                    f"Previsão próxima vela: {pred_close:.5f}"
-                )
+            # Tendência de baixa (EMA20 < EMA50)
+            elif ema20 < ema50 and rsi > 60 and pred_close < ema20 and close > upper:
+                sinal = f"🔴 VENDA prevista em {ativo} | RSI: {rsi:.2f} | EMA20<EMA50"
 
             if sinal:
                 print(f"📡 Enviando sinal: {sinal}")
                 send_telegram_message(sinal)
+            else:
+                print(f"⏸ Nenhum sinal válido em {ativo}.")
 
-        print("\n⏳ Aguardando 15 minutos para nova análise...")
-        time.sleep(900)
+        print("\n⏳ Aguardando 15 minutos para nova análise...\n")
+        time.sleep(900)  # 15 minutos
 
 # ===================== FLASK APP =====================
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "🤖 Bot de Trading com RSI + Bollinger + EMA rodando (15m)!"
+    return "🤖 Bot de Trading com ML, EMA, RSI e Bollinger ativo (15m) rodando!"
 
 # ===================== THREAD PRINCIPAL =====================
 if __name__ == "__main__":
+    print("🚀 Iniciando robô de trading com EMA e download direto do Yahoo...")
     t = threading.Thread(target=analisar_e_enviar_sinais, daemon=True)
     t.start()
     port = int(os.environ.get("PORT", 10000))
