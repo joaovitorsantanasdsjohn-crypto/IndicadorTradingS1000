@@ -15,16 +15,21 @@ TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 CHAT_ID = "6370166264"
 
 def send_telegram_message(message):
-    """Envia mensagem para o Telegram."""
+    """Envia mensagem no Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {"chat_id": CHAT_ID, "text": message}
     try:
         requests.post(url, data=data, timeout=10)
     except Exception as e:
-        print(f"Erro ao enviar mensagem: {e}", flush=True)
+        print(f"Erro ao enviar mensagem: {e}")
 
-# ===================== CONFIGURAÇÃO SSL (para Render) =====================
+# ===================== CONFIGURAÇÃO SSL =====================
 ssl._create_default_https_context = ssl._create_unverified_context
+
+# ===================== AJUSTE DO BACKEND YFINANCE =====================
+# Isso mantém o download direto do Yahoo Finance mas com compatibilidade no Render
+yf.set_tz_cache_location(None)
+yf.set_backend("requests")
 
 # ===================== LISTA DE ATIVOS =====================
 ativos = [
@@ -34,7 +39,7 @@ ativos = [
     "GBPCHF=X", "EURCHF=X", "USDMXN=X"
 ]
 
-# ===================== MODELO LSTM (Machine Learning) =====================
+# ===================== MODELO LSTM =====================
 def criar_modelo():
     model = Sequential()
     model.add(LSTM(50, return_sequences=True, input_shape=(10, 1)))
@@ -47,8 +52,11 @@ modelo = criar_modelo()
 
 # ===================== INDICADORES =====================
 def calcular_indicadores(df):
-    """Calcula EMA, RSI e Bandas de Bollinger."""
-    df["EMA"] = df["Close"].ewm(span=20, adjust=False).mean()
+    """Calcula RSI, Bandas de Bollinger e EMAs."""
+    df["EMA8"] = df["Close"].ewm(span=8, adjust=False).mean()
+    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+
     delta = df["Close"].diff()
     ganho = delta.where(delta > 0, 0)
     perda = -delta.where(delta < 0, 0)
@@ -56,15 +64,16 @@ def calcular_indicadores(df):
     media_perda = perda.rolling(14).mean()
     rs = media_ganho / media_perda
     df["RSI"] = 100 - (100 / (1 + rs))
+
     df["MA20"] = df["Close"].rolling(20).mean()
     df["STD"] = df["Close"].rolling(20).std()
     df["Upper"] = df["MA20"] + (df["STD"] * 2)
     df["Lower"] = df["MA20"] - (df["STD"] * 2)
     return df
 
-# ===================== PREVISÃO (ML) =====================
+# ===================== PREVISÃO =====================
 def prever_proximo_candle(df):
-    """Prevê o próximo fechamento com LSTM."""
+    """Usa o modelo LSTM para prever o próximo fechamento."""
     if len(df) < 11:
         return None
     data = df["Close"].values[-11:-1]
@@ -72,9 +81,9 @@ def prever_proximo_candle(df):
     pred = modelo.predict(data, verbose=0)
     return pred[0][0]
 
-# ===================== DOWNLOAD SEGURO =====================
+# ===================== DOWNLOAD ROBUSTO =====================
 def baixar_dados(ativo, tentativas=3):
-    """Baixa dados do Yahoo Finance com repetição e tratamento de erro."""
+    """Baixa os dados de um ativo com até 3 tentativas."""
     for i in range(tentativas):
         try:
             df = yf.download(
@@ -82,51 +91,52 @@ def baixar_dados(ativo, tentativas=3):
                 period="1d",
                 interval="15m",
                 progress=False,
-                threads=False
+                threads=False,
             )
             if not df.empty:
                 return df
         except Exception as e:
-            print(f"⚠️ Erro ao baixar {ativo}: {e}", flush=True)
-        print(f"🔁 Tentando novamente ({i+1}/{tentativas}) para {ativo}...", flush=True)
+            print(f"⚠️ Erro ao baixar {ativo}: {e}")
+        print(f"🔁 Tentando novamente ({i+1}/{tentativas}) para {ativo}...")
         time.sleep(2)
-    print(f"🚫 Falha total ao baixar {ativo}. Pulando...", flush=True)
+    print(f"🚫 Falha total ao baixar {ativo}. Pulando...")
     return pd.DataFrame()
 
 # ===================== ANÁLISE E SINAIS =====================
 def analisar_e_enviar_sinais():
-    """Loop principal de análise do robô."""
-    print("🚀 Iniciando análise automática de ativos...", flush=True)
+    """Analisa ativos, gera previsões e envia sinais."""
     while True:
         for ativo in ativos:
-            print(f"📥 Baixando dados de {ativo}...", flush=True)
+            print(f"📥 Baixando dados de {ativo}...")
             df = baixar_dados(ativo)
             if df.empty:
                 continue
 
             df = calcular_indicadores(df)
             close = df["Close"].iloc[-1]
-            ema = df["EMA"].iloc[-1]
+            ema8 = df["EMA8"].iloc[-1]
+            ema20 = df["EMA20"].iloc[-1]
+            ema50 = df["EMA50"].iloc[-1]
             upper = df["Upper"].iloc[-1]
             lower = df["Lower"].iloc[-1]
             rsi = df["RSI"].iloc[-1]
-            pred_close = prever_proximo_candle(df)
 
+            pred_close = prever_proximo_candle(df)
             if pred_close is None:
                 continue
 
             sinal = None
-            # Lógica combinada: RSI + EMA + Bandas de Bollinger
-            if rsi < 40 and pred_close > ema and close < lower:
-                sinal = f"🔵 COMPRA prevista em {ativo} | RSI: {rsi:.2f} | EMA: {ema:.5f}"
-            elif rsi > 60 and pred_close < ema and close > upper:
-                sinal = f"🔴 VENDA prevista em {ativo} | RSI: {rsi:.2f} | EMA: {ema:.5f}"
+            # Estratégia com EMAs + RSI + Bollinger
+            if rsi < 40 and pred_close < lower and ema8 > ema20 > ema50:
+                sinal = f"🔵 COMPRA | {ativo} | RSI: {rsi:.2f} | EMA8>EMA20>EMA50"
+            elif rsi > 60 and pred_close > upper and ema8 < ema20 < ema50:
+                sinal = f"🔴 VENDA | {ativo} | RSI: {rsi:.2f} | EMA8<EMA20<EMA50"
 
             if sinal:
-                print(f"📡 Enviando sinal: {sinal}", flush=True)
+                print(f"📡 Enviando sinal: {sinal}")
                 send_telegram_message(sinal)
 
-        print("⏳ Aguardando 15 minutos para nova análise...\n", flush=True)
+        print("⏳ Aguardando 15 minutos para nova análise...")
         time.sleep(900)
 
 # ===================== FLASK APP =====================
@@ -134,14 +144,11 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "🤖 Bot de Trading com ML, EMA e Bollinger ativo! Rodando 24/7 🔥"
+    return "🤖 Bot de Trading com ML, EMAs e Bollinger Bands rodando!"
 
 # ===================== THREAD PRINCIPAL =====================
-def iniciar_bot():
-    thread = threading.Thread(target=analisar_e_enviar_sinais, daemon=True)
-    thread.start()
-
 if __name__ == "__main__":
-    iniciar_bot()
+    t = threading.Thread(target=analisar_e_enviar_sinais, daemon=True)
+    t.start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
