@@ -1,6 +1,15 @@
-flask
+# Servidor web
+flask==3.0.3
+
+# Coleta de dados financeiros
 yfinance==0.2.43
-pandas
-numpy
+requests==2.32.3
+requests_cache==1.2.0
+
+# Análise e manipulação de dados
+pandas==2.2.2
+numpy==1.26.4
+ta==0.11.0  # biblioteca leve para indicadores técnicos (RSI, EMA, Bollinger etc.)
+
+# Machine Learning (CPU apenas)
 tensorflow-cpu==2.17.0
-requests
