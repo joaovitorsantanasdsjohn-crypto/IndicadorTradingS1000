@@ -1,9 +1,6 @@
-flask
+flask==3.0.3
 yfinance==0.2.43
-pandas
-numpy
-tensorflow==2.17.0
-requests
-frozendict
-multitasking
-lxml
+pandas==2.2.2
+numpy==1.26.4
+tensorflow-cpu==2.17.0
+requests==2.32.3
