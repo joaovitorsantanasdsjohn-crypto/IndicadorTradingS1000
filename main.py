@@ -1,3 +1,4 @@
+# main.py
 import os
 import threading
 import time
@@ -7,146 +8,212 @@ import requests
 import pandas as pd
 import numpy as np
 from flask import Flask
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM
+import yfinance as yf
 
-# ===================== CONFIGURAÇÕES TELEGRAM =====================
+# Tentativa de importar TensorFlow (se houver problema: continuamos sem ML)
+TF_OK = True
+try:
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import Dense, LSTM
+except Exception as e:
+    print(f"⚠️ TensorFlow import falhou: {e}", flush=True)
+    TF_OK = False
+
+# ===================== CONFIG TELEGRAM =====================
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 CHAT_ID = "6370166264"
 
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": message}
     try:
-        requests.post(url, data=data, timeout=10)
+        requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=10)
     except Exception as e:
-        print(f"❌ Erro ao enviar mensagem: {e}")
+        print(f"Erro ao enviar Telegram: {e}", flush=True)
 
-# ===================== CONFIGURAÇÃO SSL =====================
+# ===================== SSL / CERTIFI =====================
+# Garante que a validação SSL use certifi (evita alguns erros no Render)
+try:
+    import certifi
+    os.environ["SSL_CERT_FILE"] = certifi.where()
+except Exception:
+    pass
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# ===================== LISTA DE ATIVOS =====================
+# ===================== FORCE YFINANCE BACKEND =====================
+# Evita o uso de curl_cffi que causa JSONDecodeError em alguns ambientes
+try:
+    yf.set_tz_cache_location(None)
+    yf.set_backend("requests")
+except Exception as e:
+    print(f"Aviso yfinance backend: {e}", flush=True)
+
+# ===================== ATIVOS (os 6 que você confirmou) =====================
 ativos = [
-    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
-    "AUDUSD=X", "USDCAD=X", "NZDUSD=X", "EURGBP=X",
-    "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "AUDCAD=X",
-    "GBPCHF=X", "EURCHF=X", "USDMXN=X"
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X",
+    "AUDUSD=X", "USDCAD=X", "USDCHF=X"
 ]
 
-# ===================== MODELO LSTM =====================
-def criar_modelo():
-    model = Sequential()
-    model.add(LSTM(50, return_sequences=True, input_shape=(10, 1)))
-    model.add(LSTM(50))
-    model.add(Dense(1, activation="linear"))
-    model.compile(optimizer="adam", loss="mse")
-    return model
+INTERVAL = "15m"
+PERIOD = "1d"
 
-modelo = criar_modelo()
+# ===================== MODEL (TINY, opcional) =====================
+modelo = None
+if TF_OK:
+    try:
+        # modelo pequeno para reduzir uso de RAM (se o Render permitir)
+        def criar_modelo_pequeno():
+            m = Sequential()
+            m.add(Dense(16, activation="relu", input_shape=(10, 1)))
+            m.add(Dense(1, activation="linear"))
+            m.compile(optimizer="adam", loss="mse")
+            return m
+        modelo = criar_modelo_pequeno()
+        print("✅ Modelo TensorFlow leve inicializado.", flush=True)
+    except Exception as e:
+        print(f"⚠️ Falha ao inicializar modelo TF: {e}", flush=True)
+        modelo = None
 
 # ===================== INDICADORES =====================
 def calcular_indicadores(df):
+    df = df.copy()
+    df["EMA8"] = df["Close"].ewm(span=8, adjust=False).mean()
     df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
 
     delta = df["Close"].diff()
-    ganho = delta.where(delta > 0, 0)
-    perda = -delta.where(delta < 0, 0)
+    ganho = delta.clip(lower=0)
+    perda = -delta.clip(upper=0)
     media_ganho = ganho.rolling(14).mean()
     media_perda = perda.rolling(14).mean()
-    rs = media_ganho / media_perda
+    rs = media_ganho / media_perda.replace(0, np.nan)
     df["RSI"] = 100 - (100 / (1 + rs))
 
     df["MA20"] = df["Close"].rolling(20).mean()
     df["STD"] = df["Close"].rolling(20).std()
-    df["Upper"] = df["MA20"] + (df["STD"] * 2)
-    df["Lower"] = df["MA20"] - (df["STD"] * 2)
-    return df
+    df["Upper"] = df["MA20"] + 2 * df["STD"]
+    df["Lower"] = df["MA20"] - 2 * df["STD"]
+    return df.dropna()
 
-# ===================== PREVISÃO =====================
+# ===================== PREVISÃO (se houver modelo) =====================
 def prever_proximo_candle(df):
+    if modelo is None:
+        return None
     if len(df) < 11:
         return None
-    data = df["Close"].values[-11:-1]
-    data = data.reshape((1, 10, 1))
-    pred = modelo.predict(data, verbose=0)
-    return pred[0][0]
+    arr = df["Close"].values[-11:-1].reshape(1, 10, 1)
+    try:
+        pred = modelo.predict(arr, verbose=0)
+        return float(pred[0][0])
+    except Exception as e:
+        print(f"Erro na previsão ML: {e}", flush=True)
+        return None
 
-# ===================== DOWNLOAD ROBUSTO =====================
-def baixar_dados(ativo, tentativas=3):
-    url = f"https://query1.finance.yahoo.com/v7/finance/download/{ativo}?interval=15m&range=1d"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    for i in range(tentativas):
-        try:
-            r = requests.get(url, headers=headers, timeout=10)
-            if r.status_code == 200 and len(r.text) > 100:
-                df = pd.read_csv(io.StringIO(r.text))
-                if "Close" not in df.columns:
-                    raise ValueError("Sem coluna Close")
-                df["Datetime"] = pd.to_datetime(df["Date"])
-                df.set_index("Datetime", inplace=True)
-                df = df.dropna()
-                print(f"✅ {ativo}: dados recebidos ({len(df)} candles)")
-                return df
-            else:
-                print(f"⚠️ {ativo}: resposta vazia ({r.status_code})")
-        except Exception as e:
-            print(f"❌ Erro ao baixar {ativo} (tentativa {i+1}): {e}")
-        time.sleep(2)
-    print(f"🚫 Falha total ao baixar {ativo}")
+# ===================== DOWNLOAD ROBUSTO (yfinance + fallback CSV) =====================
+def baixar_com_yf(ativo):
+    try:
+        df = yf.download(ativo, period=PERIOD, interval=INTERVAL, progress=False, threads=False)
+        if not df.empty:
+            return df
+    except Exception as e:
+        print(f"yfinance erro para {ativo}: {e}", flush=True)
     return pd.DataFrame()
 
-# ===================== ANÁLISE E SINAIS =====================
-def analisar_e_enviar_sinais():
+def baixar_csv_fallback(ativo):
+    # fallback: tenta baixar CSV direto do endpoint do Yahoo
+    url = f"https://query1.finance.yahoo.com/v7/finance/download/{ativo}?range={PERIOD}&interval={INTERVAL}&events=history"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.get(url, headers=headers, timeout=12)
+        if r.status_code == 200 and len(r.text) > 100:
+            df = pd.read_csv(io.StringIO(r.text))
+            # normalizar índice
+            if "Date" in df.columns:
+                df["Datetime"] = pd.to_datetime(df["Date"])
+                df.set_index("Datetime", inplace=True)
+                # manter colunas esperadas: Open, High, Low, Close, Adj Close, Volume
+                return df
+    except Exception as e:
+        print(f"CSV fallback erro para {ativo}: {e}", flush=True)
+    return pd.DataFrame()
+
+def baixar_dados_robusto(ativo, tentativas=3):
+    for i in range(1, tentativas+1):
+        print(f"🔁 Tentativa {i}/{tentativas} para {ativo} via yfinance...", flush=True)
+        df = baixar_com_yf(ativo)
+        if not df.empty:
+            print(f"✅ {ativo} via yfinance ({len(df)} candles)", flush=True)
+            return df
+        print(f"⚠️ yfinance falhou para {ativo}, tentando fallback CSV...", flush=True)
+        df = baixar_csv_fallback(ativo)
+        if not df.empty:
+            print(f"✅ {ativo} via CSV fallback ({len(df)} candles)", flush=True)
+            return df
+        time.sleep(2 + i)
+    print(f"🚫 Falha total ao baixar {ativo} após {tentativas} tentativas.", flush=True)
+    return pd.DataFrame()
+
+# ===================== EVITA SINAIS DUPLICADOS/CONTRADITÓRIOS =====================
+historico_sinais = {}
+
+def gerar_sinal(df, ativo):
+    df = calcular_indicadores(df)
+    close = float(df["Close"].iloc[-1])
+    ema8 = float(df["EMA8"].iloc[-1])
+    ema20 = float(df["EMA20"].iloc[-1])
+    ema50 = float(df["EMA50"].iloc[-1])
+    upper = float(df["Upper"].iloc[-1])
+    lower = float(df["Lower"].iloc[-1])
+    rsi = float(df["RSI"].iloc[-1])
+    pred = prever_proximo_candle(df)
+
+    sinal = None
+    # critério estrito: todas as EMAs alinhadas + RSI em regiões fortes + posição relative às Bollinger
+    if ema8 > ema20 > ema50 and rsi < 40 and pred is not None and pred > ema8 and close < lower:
+        sinal = f"🔵 COMPRA prevista | {ativo} | RSI {rsi:.1f}"
+    elif ema8 < ema20 < ema50 and rsi > 60 and pred is not None and pred < ema8 and close > upper:
+        sinal = f"🔴 VENDA prevista | {ativo} | RSI {rsi:.1f}"
+
+    chave = f"{ativo}_{INTERVAL}"
+    ultimo = historico_sinais.get(chave)
+    if sinal and ultimo == sinal:
+        return None
+    if sinal:
+        historico_sinais[chave] = sinal
+    return sinal
+
+# ===================== LOOP PRINCIPAL =====================
+def loop_bot():
+    print("🚀 Bot iniciado: loop de análise ativo", flush=True)
     while True:
         for ativo in ativos:
-            print(f"\n📥 Baixando dados de {ativo}...")
-            df = baixar_dados(ativo)
+            print(f"\n📥 Baixando {ativo} ...", flush=True)
+            df = baixar_dados_robusto(ativo, tentativas=3)
             if df.empty:
                 continue
+            try:
+                sinal = gerar_sinal(df, ativo)
+                if sinal:
+                    print(f"📡 Enviando: {sinal}", flush=True)
+                    send_telegram_message(sinal)
+                else:
+                    print(f"⏸ Sem sinal para {ativo}", flush=True)
+            except Exception as e:
+                print(f"Erro processando {ativo}: {e}", flush=True)
+        print("\n⏳ Aguardando 15 minutos para próxima varredura...\n", flush=True)
+        time.sleep(15 * 60)
 
-            df = calcular_indicadores(df)
-            close = df["Close"].iloc[-1]
-            ema20 = df["EMA20"].iloc[-1]
-            ema50 = df["EMA50"].iloc[-1]
-            upper = df["Upper"].iloc[-1]
-            lower = df["Lower"].iloc[-1]
-            rsi = df["RSI"].iloc[-1]
-            pred_close = prever_proximo_candle(df)
-            if pred_close is None:
-                continue
-
-            # ===================== LÓGICA DE SINAIS =====================
-            sinal = None
-
-            # Tendência de alta (EMA20 > EMA50)
-            if ema20 > ema50 and rsi < 40 and pred_close > ema20 and close < lower:
-                sinal = f"🔵 COMPRA prevista em {ativo} | RSI: {rsi:.2f} | EMA20>EMA50"
-
-            # Tendência de baixa (EMA20 < EMA50)
-            elif ema20 < ema50 and rsi > 60 and pred_close < ema20 and close > upper:
-                sinal = f"🔴 VENDA prevista em {ativo} | RSI: {rsi:.2f} | EMA20<EMA50"
-
-            if sinal:
-                print(f"📡 Enviando sinal: {sinal}")
-                send_telegram_message(sinal)
-            else:
-                print(f"⏸ Nenhum sinal válido em {ativo}.")
-
-        print("\n⏳ Aguardando 15 minutos para nova análise...\n")
-        time.sleep(900)  # 15 minutos
-
-# ===================== FLASK APP =====================
-app = Flask(__name__)
+# ===================== FLASK (keepalive) =====================
+app = Flask("mayim_bot")
 
 @app.route("/")
 def home():
-    return "🤖 Bot de Trading com ML, EMA, RSI e Bollinger ativo (15m) rodando!"
+    return "Mayim bot online"
 
-# ===================== THREAD PRINCIPAL =====================
-if __name__ == "__main__":
-    print("🚀 Iniciando robô de trading com EMA e download direto do Yahoo...")
-    t = threading.Thread(target=analisar_e_enviar_sinais, daemon=True)
-    t.start()
-    port = int(os.environ.get("PORT", 10000))
+def start_threads_and_flask():
+    thread = threading.Thread(target=loop_bot, daemon=True)
+    thread.start()
+    port = int(os.environ.get("PORT", 0)) or 5000
     app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    start_threads_and_flask()
