@@ -1,6 +1,7 @@
 flask
-yfinance==0.2.43
+tensorflow-cpu
+yfinance
 pandas
 numpy
-tensorflow==2.17.0
 requests
+certifi
