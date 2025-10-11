@@ -1,177 +1,144 @@
-# ===============================================
-# INDICADOR TRADING S1000
-# ===============================================
-import os, io, ssl, time, threading, json, requests, datetime as dt
-import pandas as pd, numpy as np
+import os
+import time
+import json
+import threading
+import requests
+import pandas as pd
+import numpy as np
 import yfinance as yf
 from flask import Flask
+from datetime import datetime, timedelta
+import tensorflow as tf
 
-# TensorFlow (modelo leve)
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM
-
-# ================== TELEGRAM =====================
+# ========== CONFIGURAÇÕES ==========
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 CHAT_ID = "6370166264"
+LOG_FILE = "indicador_log.txt"
+INTERVALO_MINUTOS = 15
 
-def telegram(msg):
+# ========== FLASK APP ==========
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Indicador Trading S1000 ativo ✅"
+
+# ========== FUNÇÕES DE SUPORTE ==========
+
+def enviar_telegram(msg):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": msg},
-            timeout=10,
-        )
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": msg}
+        requests.post(url, json=payload)
     except Exception as e:
-        print("Telegram erro:", e)
+        print(f"Erro ao enviar Telegram: {e}")
 
-# ================== CONFIG =====================
-ativos = ["EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","USDCHF=X"]
-INTERVAL = "15m"
-PERIOD = "1d"
-CACHE_DIR = "cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
-LOG_PATH = os.path.join(CACHE_DIR, "logs.csv")
+def log(msg):
+    print(msg)
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
 
-# ================== SSL FIX =====================
-import certifi
-os.environ["SSL_CERT_FILE"] = certifi.where()
-ssl._create_default_https_context = ssl._create_unverified_context
+def resetar_log_diario():
+    while True:
+        time.sleep(86400)
+        if os.path.exists(LOG_FILE):
+            open(LOG_FILE, "w").close()
+            log("🔁 Log diário resetado.")
 
-yf.set_backend("requests")
+def resumo_telegram_periodico():
+    while True:
+        time.sleep(1800)
+        try:
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE, "r") as f:
+                    linhas = f.readlines()[-20:]
+                resumo = "".join(linhas)
+                enviar_telegram(f"📊 Resumo dos últimos sinais:\n\n{resumo}")
+        except Exception as e:
+            log(f"Erro no resumo periódico: {e}")
 
-# ================== ML MODEL =====================
-def criar_modelo():
-    m = Sequential()
-    m.add(Dense(32, activation="relu", input_shape=(5,)))
-    m.add(Dense(16, activation="relu"))
-    m.add(Dense(1, activation="tanh"))  # saída -1 a 1
-    m.compile(optimizer="adam", loss="mse")
-    return m
+# ========== CÁLCULOS DE INDICADORES ==========
 
-modelo = criar_modelo()
+def calcular_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-# ================== INDICADORES =====================
-def indicadores(df):
-    df = df.copy()
-    df["EMA8"]  = df["Close"].ewm(span=8).mean()
-    df["EMA20"] = df["Close"].ewm(span=20).mean()
-    df["EMA50"] = df["Close"].ewm(span=50).mean()
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = -delta.clip(upper=0).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df["RSI"] = 100 - (100 / (1 + rs))
-    df["MA20"] = df["Close"].rolling(20).mean()
-    df["STD"]  = df["Close"].rolling(20).std()
-    df["Upper"] = df["MA20"] + 2 * df["STD"]
-    df["Lower"] = df["MA20"] - 2 * df["STD"]
-    return df.dropna()
+def calcular_ema(series, period=20):
+    return series.ewm(span=period, adjust=False).mean()
 
-# ================== CACHE + DOWNLOAD =====================
-def cache_path(symbol):
-    return os.path.join(CACHE_DIR, f"{symbol.replace('=','_')}.csv")
+def calcular_bollinger_bands(series, period=20):
+    sma = series.rolling(window=period).mean()
+    std = series.rolling(window=period).std()
+    return sma + 2*std, sma - 2*std
 
-def baixar_dados(ativo):
-    path = cache_path(ativo)
-    # tenta cache
-    if os.path.exists(path):
-        mtime = os.path.getmtime(path)
-        if time.time() - mtime < 900:  # 15min
-            try:
-                return pd.read_csv(path, index_col=0, parse_dates=True)
-            except: pass
-    try:
-        df = yf.download(ativo, period=PERIOD, interval=INTERVAL, progress=False, threads=False)
-        if not df.empty:
-            df.to_csv(path)
-            return df
-    except Exception as e:
-        print(f"yfinance erro {ativo}:", e)
-    return pd.DataFrame()
+# ========== CACHE E ML ==========
+cache_dados = {}
 
-# ================== GERAÇÃO DE SINAL =====================
-historico = {}
-logs = []
+def baixar_dados(ticker):
+    if ticker in cache_dados and datetime.now() - cache_dados[ticker]["hora"] < timedelta(minutes=15):
+        return cache_dados[ticker]["dados"]
 
-def gerar_sinal(df, ativo):
-    df = indicadores(df)
-    if len(df) < 25: return None
-    row = df.iloc[-1]
-    features = np.array([
-        row["RSI"], row["EMA8"], row["EMA20"],
-        row["Upper"], row["Lower"]
-    ]).reshape(1, -1)
-    pred = float(modelo.predict(features, verbose=0)[0][0])
+    data = yf.download(ticker, period="1d", interval="15m", progress=False)
+    cache_dados[ticker] = {"dados": data, "hora": datetime.now()}
+    return data
 
-    close = row["Close"]
-    ema8, ema20, ema50 = row["EMA8"], row["EMA20"], row["EMA50"]
-    rsi, upper, lower = row["RSI"], row["Upper"], row["Lower"]
+def modelo_ml_previsao(dados):
+    if len(dados) < 50:
+        return None
+    close = dados["Close"].values[-50:].reshape(-1, 1)
+    model = tf.keras.Sequential([
+        tf.keras.layers.LSTM(32, return_sequences=True, input_shape=(None, 1)),
+        tf.keras.layers.LSTM(16),
+        tf.keras.layers.Dense(1)
+    ])
+    model.compile(optimizer="adam", loss="mse")
+    model.fit(close[:-1].reshape(1, -1, 1), close[1:].reshape(1, -1, 1), epochs=2, verbose=0)
+    pred = model.predict(close[-10:].reshape(1, -1, 1), verbose=0)
+    return float(pred[-1])
 
-    sinal = None
-    if ema8 > ema20 > ema50 and rsi < 40 and close < lower and pred > 0:
-        sinal = f"🔵 COMPRA | {ativo} | RSI {rsi:.1f}"
-    elif ema8 < ema20 < ema50 and rsi > 60 and close > upper and pred < 0:
-        sinal = f"🔴 VENDA | {ativo} | RSI {rsi:.1f}"
+# ========== ANÁLISE PRINCIPAL ==========
 
-    chave = f"{ativo}_{INTERVAL}"
-    if sinal and historico.get(chave) != sinal:
-        historico[chave] = sinal
-        logs.append({"hora": dt.datetime.now(), "ativo": ativo, "sinal": sinal})
-        return sinal
-    return None
-
-# ================== LOOP PRINCIPAL =====================
-ultima_limpeza = time.time()
-ultima_sintese = time.time()
-
-def loop():
-    global ultima_limpeza, ultima_sintese
-    print("🚀 Indicador Trading S1000 iniciado.")
-    telegram("🚀 Indicador Trading S1000 iniciado.")
+def analisar_ativos():
+    ativos = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X", "AUDUSD=X", "USDCAD=X"]
     while True:
         for ativo in ativos:
-            print(f"📥 {ativo}")
-            df = baixar_dados(ativo)
-            if df.empty: continue
             try:
-                s = gerar_sinal(df, ativo)
-                if s:
-                    print("📡", s)
-                    telegram(s)
-                else:
-                    print("⏸ Sem sinal para", ativo)
+                df = baixar_dados(ativo)
+                if df.empty:
+                    continue
+
+                close = df["Close"]
+                rsi = calcular_rsi(close)
+                ema = calcular_ema(close)
+                bb_sup, bb_inf = calcular_bollinger_bands(close)
+                pred_ml = modelo_ml_previsao(df)
+
+                rsi_atual = rsi.iloc[-1]
+                preco = close.iloc[-1]
+                sinal = None
+
+                if rsi_atual < 30 and preco <= bb_inf.iloc[-1]:
+                    sinal = "📈 Possível COMPRA"
+                elif rsi_atual > 70 and preco >= bb_sup.iloc[-1]:
+                    sinal = "📉 Possível VENDA"
+
+                if sinal:
+                    msg = f"{ativo} | RSI: {rsi_atual:.2f} | EMA: {ema.iloc[-1]:.4f}\n{str(sinal)}\nML Previsão: {pred_ml:.4f}"
+                    log(msg)
+                    enviar_telegram(msg)
+
             except Exception as e:
-                print("Erro ativo", ativo, ":", e)
-        # resumo a cada 30 min
-        if time.time() - ultima_sintese > 1800:
-            ultima_sintese = time.time()
-            if logs:
-                resumo = pd.DataFrame(logs).tail(10)
-                texto = "🧾 Resumo últimas 10 operações:\n"
-                for _,r in resumo.iterrows():
-                    texto += f"{r['hora']:%H:%M} | {r['sinal']}\n"
-                telegram(texto)
-                pd.DataFrame(logs).to_csv(LOG_PATH, index=False)
-        # limpeza a cada 24h
-        if time.time() - ultima_limpeza > 86400:
-            ultima_limpeza = time.time()
-            logs.clear()
-            open(LOG_PATH,"w").close()
-            telegram("🧹 Logs zerados (reset diário).")
-        time.sleep(15*60)
+                log(f"Erro em {ativo}: {e}")
 
-# ================== FLASK KEEPALIVE =====================
-app = Flask("IndicadorTradingS1000")
+        log("⏳ Aguardando próxima varredura (15min)...")
+        time.sleep(900)
 
-@app.route("/")
-def home():
-    return "Indicador Trading S1000 online"
-
-def start():
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
-    port = int(os.environ.get("PORT", 0)) or 5000
-    app.run(host="0.0.0.0", port=port)
-
+# ========== THREADS ==========
 if __name__ == "__main__":
-    start()
+    threading.Thread(target=resetar_log_diario, daemon=True).start()
+    threading.Thread(target=resumo_telegram_periodico, daemon=True).start()
+    threading.Thread(target=analisar_ativos, daemon=True).start()
+    app.run(host="0.0.0.0", port=8080)
