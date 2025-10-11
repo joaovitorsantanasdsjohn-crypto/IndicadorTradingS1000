@@ -1,7 +1,6 @@
-flask
-tensorflow-cpu
-yfinance
-pandas
-numpy
-requests
-certifi
+Flask==3.0.3
+requests==2.32.3
+pandas==2.2.2
+numpy==1.26.4
+yfinance==0.2.43
+tensorflow-cpu==2.17.0
