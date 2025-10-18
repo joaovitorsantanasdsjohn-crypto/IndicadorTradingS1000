@@ -38,8 +38,8 @@ SCAN_INTERVAL = 15 * 60
 SUMMARY_INTERVAL_MINUTES = 30
 
 # ----------------- VARIÁVEIS DE AMBIENTE (NÃO COMITAR TOKEN) -----------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0")
+CHAT_ID = os.getenv("6370166264")
 PORT = int(os.getenv("PORT", 5000))
 
 # ----------------- LOGGING -----------------
@@ -301,3 +301,4 @@ def start():
 if __name__ == "__main__":
     logger.info("Inicializando Indicador Trading S1000...")
     start()
+
