@@ -37,10 +37,11 @@ SCAN_INTERVAL = 15 * 60
 # Resumo por Telegram a cada X minutos
 SUMMARY_INTERVAL_MINUTES = 30
 
-# ----------------- VARIÁVEIS DE AMBIENTE (NÃO COMITAR TOKEN) -----------------
-TELEGRAM_TOKEN = os.getenv("7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0")
-CHAT_ID = os.getenv("6370166264")
-PORT = int(os.getenv("PORT", 5000))
+# ========== CONFIGURAÇÕES TELEGRAN ==========
+TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
+CHAT_ID = "6370166264"
+LOG_FILE = "indicador_log.txt"
+INTERVALO_MINUTOS = 15
 
 # ----------------- LOGGING -----------------
 LOG_DIR = "logs"
@@ -301,4 +302,5 @@ def start():
 if __name__ == "__main__":
     logger.info("Inicializando Indicador Trading S1000...")
     start()
+
 
