@@ -1,20 +1,22 @@
-# Usa Python 3.11 slim como base
+# Use Python 3.11 slim como base
 FROM python:3.11.6-slim
 
-# Define o diretório de trabalho
+# Define o diretório de trabalho dentro do container
 WORKDIR /app
 
-# Copia os arquivos necessários
+# Copia o requirements.txt para o container
 COPY requirements.txt .
-COPY main.py .
-COPY ml_model.py .
 
 # Atualiza pip e instala dependências
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Expõe porta 5000 para Flask (Uptime Robot)
+# Copia os arquivos da aplicação para o container
+COPY main.py .
+COPY ml_model.py .
+
+# Expõe porta 5000 para Flask
 EXPOSE 5000
 
-# Comando para rodar sua aplicação
+# Define o comando de inicialização da aplicação
 CMD ["python", "main.py"]
