@@ -1,6 +1,7 @@
-websocket-client==1.9.0
-pandas==2.2.6
+pandas==2.3.3
 numpy==1.26.5
-pandas_ta==0.3.50b0
-python-telegram-bot==20.4
-Flask==2.3.6
+websocket-client==1.9.0
+python-telegram-bot==20.3
+Flask==2.3.4
+pandas-ta==0.3.27b0
+
