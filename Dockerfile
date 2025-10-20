@@ -1,20 +1,19 @@
-# Use imagem oficial do Python 3.10
-FROM python:3.10-slim
+# FORÇA Python 3.10 exato
+FROM python:3.10.12-slim
 
-# Define diretório de trabalho
+# Diretório de trabalho
 WORKDIR /app
 
 # Copia arquivos do projeto
 COPY requirements.txt .
 COPY main.py .
 COPY ml_model.py .
-COPY .gitignore .
 
-# Instala dependências
+# Atualiza pip e instala dependências
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Expõe a porta 5000 para Flask
+# Expõe porta 5000 para Flask (Uptime Robot)
 EXPOSE 5000
 
 # Comando para rodar o bot
