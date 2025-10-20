@@ -1,10 +1,10 @@
-# FORÇA Python 3.10 exato
-FROM python:3.10.12-slim
+# Usa Python 3.11 slim como base
+FROM python:3.11.6-slim
 
-# Diretório de trabalho
+# Define o diretório de trabalho
 WORKDIR /app
 
-# Copia arquivos do projeto
+# Copia os arquivos necessários
 COPY requirements.txt .
 COPY main.py .
 COPY ml_model.py .
@@ -16,5 +16,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Expõe porta 5000 para Flask (Uptime Robot)
 EXPOSE 5000
 
-# Comando para rodar o bot
+# Comando para rodar sua aplicação
 CMD ["python", "main.py"]
