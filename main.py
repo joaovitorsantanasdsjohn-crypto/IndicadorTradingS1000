@@ -2,9 +2,6 @@ import websocket
 import json
 import pandas as pd
 import numpy as np
-from ta.trend import EMAIndicator
-from ta.momentum import RSIIndicator
-from ta.volatility import BollingerBands
 from telegram import Bot
 from ml_model import SignalFilter
 from flask import Flask
@@ -38,13 +35,21 @@ def send_telegram(message):
     bot.send_message(chat_id=CHAT_ID, text=message)
 
 def calculate_indicators(df):
-    df['EMA_short'] = EMAIndicator(df['close'], window=5).ema_indicator()
-    df['EMA_medium'] = EMAIndicator(df['close'], window=13).ema_indicator()
-    df['EMA_long'] = EMAIndicator(df['close'], window=21).ema_indicator()
-    df['RSI'] = RSIIndicator(df['close'], window=14).rsi()
-    bb = BollingerBands(df['close'], window=20, window_dev=2)
-    df['BB_upper'] = bb.bollinger_hband()
-    df['BB_lower'] = bb.bollinger_lband()
+    import pandas_ta as ta
+
+    # Médias móveis exponenciais
+    df['EMA_short'] = df.ta.ema(length=5)
+    df['EMA_medium'] = df.ta.ema(length=13)
+    df['EMA_long'] = df.ta.ema(length=21)
+
+    # RSI
+    df['RSI'] = df.ta.rsi(length=14)
+
+    # Bandas de Bollinger
+    bb = df.ta.bbands(length=20, std=2)
+    df['BB_upper'] = bb['BBU_20_2.0']
+    df['BB_lower'] = bb['BBL_20_2.0']
+
     return df
 
 def generate_signal(df, ativo):
