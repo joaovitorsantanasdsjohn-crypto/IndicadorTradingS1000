@@ -1,29 +1,27 @@
-# Base image completa com Python 3.11
+# Use a imagem oficial do Python 3.11
 FROM python:3.11
 
-# Diretório de trabalho
+# Defina o diretório de trabalho
 WORKDIR /app
 
-# Copiar arquivo de dependências
+# Copie o arquivo de dependências
 COPY requirements.txt .
 
-# Atualizar pip
-RUN pip install --upgrade pip
-
-# Instalar dependências do sistema necessárias para pandas/numpy
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    gfortran \
-    libatlas-base-dev \
-    liblapack-dev \
+# Atualize pip e instale dependências do sistema necessárias
+RUN pip install --upgrade pip && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        gfortran \
+        liblapack-dev \
     && pip install --no-cache-dir -r requirements.txt \
-    && apt-get remove -y build-essential gfortran libatlas-base-dev liblapack-dev \
+    && apt-get remove -y build-essential gfortran liblapack-dev \
     && apt-get autoremove -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copiar código da aplicação
+# Copie o restante do código da aplicação
 COPY . .
 
-# Comando para iniciar sua aplicação
+# Comando padrão para rodar a aplicação
 CMD ["python", "main.py"]
