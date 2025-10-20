@@ -1,18 +1,25 @@
-# Usa Python 3.10 slim, compatível com ta==0.12.2
+# --------------------------
+# Dockerfile para IndicadorTradingS1000
+# --------------------------
+
+# Imagem base
 FROM python:3.10-slim
 
-# Define o diretório de trabalho no container
+# Definir diretório de trabalho
 WORKDIR /app
 
-# Copia o arquivo de dependências
+# Copiar requirements
 COPY requirements.txt .
 
-# Atualiza pip e instala dependências
+# Atualizar pip e instalar dependências
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia os arquivos da aplicação para o container
+# Copiar o código da aplicação
 COPY . .
 
+# Expor porta para Flask
+EXPOSE 5000
+
 # Comando padrão para rodar a aplicação
-CMD ["python", "main.py"]
+CMD ["python", "mine.py"]
