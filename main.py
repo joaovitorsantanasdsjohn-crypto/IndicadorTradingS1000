@@ -1,307 +1,134 @@
-#!/usr/bin/env python3
-# main.py - Indicador Trading S1000
-# Rodar com Python >=3.10 (ajuste conforme sua infra). Use variáveis de ambiente para token/chat.
-
-import os
-import threading
-import time
-import io
-import logging
-from logging.handlers import TimedRotatingFileHandler
-import random
+import websocket
 import json
-from datetime import datetime, timedelta
-import requests
 import pandas as pd
 import numpy as np
+from ta.trend import EMAIndicator
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands
+from telegram import Bot
+from ml_model import SignalFilter
 from flask import Flask
-import yfinance as yf
+import threading
 
-# ----------------- CONFIGURAÇÕES (ajustáveis) -----------------
-INTERVAL = "15m"
-PERIOD = "1d"
-ATIVOS = [
-    "EURUSD=X","GBPUSD=X","USDJPY=X","USDCHF=X",
-    "AUDUSD=X","USDCAD=X","NZDUSD=X","EURGBP=X",
-    "EURJPY=X","GBPJPY=X","AUDJPY=X","AUDCAD=X",
-    "GBPCHF=X","EURCHF=X","USDMXN=X"
+# ========================
+# CONFIGURAÇÕES
+# ========================
+TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
+CHAT_ID = "6370166264"
+OLYMP_WEBSOCKET_URL = "wss://ws.olymptrade.com/otp?cid_ver=1&cid_app=web%40OlympTrade%402025.4.27904%4027904&cid_device=%40%40desktop&cid_os=windows%4010"
+
+# Pares principais
+ativos = [
+    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
+    "NZDUSD", "EURJPY", "GBPJPY", "EURGBP", "AUDJPY",
+    "EURCHF", "USDCHF", "GBPCHF", "AUDNZD", "NZDJPY"
 ]
 
-# Critérios rígidos (você pode ajustar)
-RSI_BUY_THRESHOLD = 40.0   # RSI < esse => condição de sobrevenda para compra
-RSI_SELL_THRESHOLD = 60.0  # RSI > esse => condição de sobrecompra para venda
+# Inicializa bot Telegram
+bot = Bot(token=TELEGRAM_TOKEN)
+ml_filter = SignalFilter()
 
-# Tempo entre varreduras (em segundos) - 15 minutos
-SCAN_INTERVAL = 15 * 60
+# Armazena candles por ativo
+candles_por_ativo = {ativo: [] for ativo in ativos}
 
-# Resumo por Telegram a cada X minutos
-SUMMARY_INTERVAL_MINUTES = 30
+# ========================
+# FUNÇÕES
+# ========================
+def send_telegram(message):
+    bot.send_message(chat_id=CHAT_ID, text=message)
 
-# ========== CONFIGURAÇÕES TELEGRAN ==========
-TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
-CHAT_ID = "6370166264"
-LOG_FILE = "indicador_log.txt"
-INTERVALO_MINUTOS = 15
+def calculate_indicators(df):
+    df['EMA_short'] = EMAIndicator(df['close'], window=5).ema_indicator()
+    df['EMA_medium'] = EMAIndicator(df['close'], window=13).ema_indicator()
+    df['EMA_long'] = EMAIndicator(df['close'], window=21).ema_indicator()
+    df['RSI'] = RSIIndicator(df['close'], window=14).rsi()
+    bb = BollingerBands(df['close'], window=20, window_dev=2)
+    df['BB_upper'] = bb.bollinger_hband()
+    df['BB_lower'] = bb.bollinger_lband()
+    return df
 
-# ----------------- LOGGING -----------------
-LOG_DIR = "logs"
-os.makedirs(LOG_DIR, exist_ok=True)
-logger = logging.getLogger("indicador_s1000")
-logger.setLevel(logging.INFO)
-handler = TimedRotatingFileHandler(f"{LOG_DIR}/indicador.log", when="midnight", backupCount=7, utc=True)
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-# Also log to console
-console = logging.StreamHandler()
-console.setFormatter(formatter)
-logger.addHandler(console)
+def generate_signal(df, ativo):
+    last = df.iloc[-1]
+    features = [last['EMA_short'], last['EMA_medium'], last['EMA_long'], last['RSI'], last['BB_upper'], last['BB_lower']]
+    prob = ml_filter.predict(features)
 
-# In-memory history (for summaries)
-signals_sent = []        # tuples (timestamp, ativo, sinal_text)
-errors_logged = []       # tuples (timestamp, ativo, error_text)
+    # Sinal COMPRA
+    if last['EMA_short'] > last['EMA_medium'] > last['EMA_long'] and last['RSI'] < 70 and last['close'] > last['BB_lower'] and prob > 0.6:
+        send_telegram(f"📈 {ativo}: Sinal de COMPRA! Probabilidade {prob:.2f}")
 
-# ----------------- TENTAR IMPORTAR TENSORFLOW (ML opcional) -----------------
-TF_OK = False
-modelo = None
-try:
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import Dense, LSTM
-    TF_OK = True
-    # criar modelo muito leve (apenas para demonstração)
-    def criar_modelo_pequeno():
-        m = Sequential()
-        # Usaremos Dense simples em vez de LSTM para reduzir chance de erro em ambiente restrito
-        m.add(Dense(16, activation="relu", input_shape=(10, 1)))
-        m.add(Dense(1, activation="linear"))
-        m.compile(optimizer="adam", loss="mse")
-        return m
-    modelo = criar_modelo_pequeno()
-    logger.info("✅ TensorFlow disponível — modelo leve inicializado.")
-except Exception as e:
-    logger.warning(f"⚠️ TensorFlow não disponível ou falhou import: {e}. O bot rodará sem ML.")
+    # Sinal VENDA
+    elif last['EMA_short'] < last['EMA_medium'] < last['EMA_long'] and last['RSI'] > 30 and last['close'] < last['BB_upper'] and prob > 0.6:
+        send_telegram(f"📉 {ativo}: Sinal de VENDA! Probabilidade {prob:.2f}")
 
-# ----------------- Função de envio Telegram -----------------
-def send_telegram_message(text):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.error("TELEGRAM_TOKEN ou CHAT_ID não configurados. Mensagem não será enviada.")
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-    try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            logger.warning(f"Telegram returned {r.status_code}: {r.text}")
-            return False
-        return True
-    except Exception as e:
-        logger.exception(f"Erro ao enviar Telegram: {e}")
-        return False
+# ========================
+# WEBSOCKET
+# ========================
+def on_message(ws, message):
+    data = json.loads(message)
+    ativo = data.get('symbol')
+    if ativo not in ativos:
+        return
 
-# ----------------- Indicadores -----------------
-def calcular_indicadores(df):
-    df = df.copy()
-    df["EMA8"] = df["Close"].ewm(span=8, adjust=False).mean()
-    df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
-    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+    candle = {
+        'time': data['time'],
+        'open': data['open'],
+        'high': data['high'],
+        'low': data['low'],
+        'close': data['close']
+    }
+    candles_por_ativo[ativo].append(candle)
+    if len(candles_por_ativo[ativo]) > 100:
+        candles_por_ativo[ativo].pop(0)
 
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean().replace(0, np.nan)
-    rs = avg_gain / avg_loss
-    df["RSI"] = 100 - (100 / (1 + rs))
+    df = pd.DataFrame(candles_por_ativo[ativo])
+    df = calculate_indicators(df)
+    generate_signal(df, ativo)
 
-    df["MA20"] = df["Close"].rolling(20).mean()
-    df["STD"] = df["Close"].rolling(20).std()
-    df["Upper"] = df["MA20"] + 2 * df["STD"]
-    df["Lower"] = df["MA20"] - 2 * df["STD"]
+def on_error(ws, error):
+    print("Erro:", error)
 
-    return df.dropna()
+def on_close(ws, close_status_code, close_msg):
+    print("Conexão fechada")
 
-# ----------------- Previsão (usando modelo leve quando disponível) -----------------
-def prever_proximo_candle(df):
-    if modelo is None:
-        return None
-    if len(df) < 11:
-        return None
-    try:
-        arr = df["Close"].values[-11:-1].reshape(1, 10, 1)
-        pred = modelo.predict(arr, verbose=0)
-        return float(pred[0][0])
-    except Exception as e:
-        logger.exception(f"Erro na previsão ML: {e}")
-        return None
+def on_open(ws):
+    print("Conexão WebSocket aberta")
+    for ativo in ativos:
+        subscribe_msg = {
+            "type": "subscribe",
+            "symbol": ativo,
+            "interval": 5
+        }
+        ws.send(json.dumps(subscribe_msg))
 
-# ----------------- DOWNLOAD ROBUSTO -----------------
-def tentar_yfinance(ativo):
-    try:
-        # threads=False evita paralelismo que às vezes causa problemas em ambientes serverless
-        df = yf.download(ativo, period=PERIOD, interval=INTERVAL, progress=False, threads=False)
-        if df is not None and not df.empty:
-            return df
-    except Exception as e:
-        # captura erros de yfinance
-        logger.debug(f"yfinance erro para {ativo}: {e}")
-    return pd.DataFrame()
+def run_ws():
+    ws = websocket.WebSocketApp(
+        OLYMP_WEBSOCKET_URL,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    ws.run_forever()
 
-def fallback_csv(ativo):
-    url = f"https://query1.finance.yahoo.com/v7/finance/download/{ativo}?range={PERIOD}&interval={INTERVAL}&events=history"
-    headers = {"User-Agent": random.choice([
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        "Mozilla/5.0 (X11; Linux x86_64)"
-    ])}
-    try:
-        r = requests.get(url, headers=headers, timeout=12)
-        if r.status_code == 200 and len(r.text) > 50:
-            df = pd.read_csv(io.StringIO(r.text), parse_dates=["Date"])
-            df = df.set_index(pd.to_datetime(df["Date"]))
-            # manter colunas com nomes esperados
-            # renomear caso necessário
-            return df
-    except Exception as e:
-        logger.debug(f"fallback_csv erro para {ativo}: {e}")
-    return pd.DataFrame()
+# ========================
+# FLASK PARA UPTIME ROBOT
+# ========================
+app = Flask(__name__)
 
-def baixar_dados(ativo, tentativas=3):
-    backoff = 1
-    for i in range(1, tentativas + 1):
-        logger.info(f"🔁 Tentativa {i}/{tentativas} para {ativo} via yfinance...")
-        df = tentar_yfinance(ativo)
-        if not df.empty:
-            logger.info(f"✅ {ativo} obtido via yfinance ({len(df)} candles)")
-            return df
-        logger.info(f"⚠️ yfinance falhou para {ativo}. Tentando fallback CSV...")
-        df = fallback_csv(ativo)
-        if not df.empty:
-            logger.info(f"✅ {ativo} obtido via CSV fallback ({len(df)} candles)")
-            return df
-        # se receber 429 da Yahoo, aumentar backoff
-        logger.info(f"⏳ Aguardando {backoff}s antes da próxima tentativa para {ativo}...")
-        time.sleep(backoff)
-        backoff *= 2
-    logger.error(f"🚫 Falha total ao baixar {ativo} após {tentativas} tentativas.")
-    errors_logged.append((datetime.utcnow(), ativo, "Falha download"))
-    return pd.DataFrame()
-
-# ----------------- Geração de sinal (condições rígidas) -----------------
-historico_sinais = {}  # evita repetição idêntica por ativo+intervalo
-
-def gerar_sinal_para_df(df, ativo):
-    try:
-        df_ind = calcular_indicadores(df)
-    except Exception as e:
-        logger.exception(f"Erro ao calcular indicadores para {ativo}: {e}")
-        errors_logged.append((datetime.utcnow(), ativo, f"calc_indicator:{e}"))
-        return None
-
-    close = float(df_ind["Close"].iloc[-1])
-    ema8 = float(df_ind["EMA8"].iloc[-1])
-    ema20 = float(df_ind["EMA20"].iloc[-1])
-    ema50 = float(df_ind["EMA50"].iloc[-1])
-    upper = float(df_ind["Upper"].iloc[-1])
-    lower = float(df_ind["Lower"].iloc[-1])
-    rsi = float(df_ind["RSI"].iloc[-1])
-    pred = prever_proximo_candle(df_ind)
-
-    sinal = None
-    # Condições estritas — concordância entre EMAs (trend), RSI e posição em relação às bandas
-    # COMPRA: EMAs alinhadas (curto > médio > longo), RSI em zona de compra (baixo),
-    # previsão (se houver) indicando subida, e preço perto/inferior da banda -> sinal conservador
-    if (ema8 > ema20 > ema50) and (rsi < RSI_BUY_THRESHOLD) and (pred is not None and pred > ema8) and (close <= lower * 1.002):
-        sinal = f"🔵 COMPRA prevista | {ativo} | RSI {rsi:.1f} | close {close:.5f}"
-    # VENDA: EMAs alinhadas de baixa, RSI alto, previsão indicando queda, e preço perto/superior da banda
-    elif (ema8 < ema20 < ema50) and (rsi > RSI_SELL_THRESHOLD) and (pred is not None and pred < ema8) and (close >= upper * 0.998):
-        sinal = f"🔴 VENDA prevista | {ativo} | RSI {rsi:.1f} | close {close:.5f}"
-
-    if sinal:
-        chave = f"{ativo}_{INTERVAL}"
-        # evita enviar sinal idêntico repetido
-        if historico_sinais.get(chave) == sinal:
-            return None
-        historico_sinais[chave] = sinal
-        # guarda histórico pra resumo
-        signals_sent.append((datetime.utcnow(), ativo, sinal))
-        logger.info(f"📡 SINAL GERADO: {sinal}")
-        return sinal
-    else:
-        logger.debug(f"Sem sinal para {ativo} (RSI={rsi:.1f}, close={close:.5f})")
-    return None
-
-# ----------------- Loop principal -----------------
-def loop_bot():
-    logger.info("🚀 Bot iniciado: loop de análise ativo")
-    next_summary = datetime.utcnow() + timedelta(minutes=SUMMARY_INTERVAL_MINUTES)
-    while True:
-        for ativo in ATIVOS:
-            logger.info(f"📥 Baixando dados de {ativo}...")
-            df = baixar_dados(ativo, tentativas=3)
-            if df.empty:
-                logger.warning(f"Dados vazios para {ativo}, pulando...")
-                continue
-            try:
-                sinal = gerar_sinal_para_df(df, ativo)
-                if sinal:
-                    send_telegram_message(sinal)
-            except Exception as e:
-                logger.exception(f"Erro processando {ativo}: {e}")
-                errors_logged.append((datetime.utcnow(), ativo, str(e)))
-            # pequeno sleep entre ativos para reduzir taxa de requisições
-            time.sleep(1 + random.random() * 0.5)
-
-        # Enviar resumo se chegou o horário
-        if datetime.utcnow() >= next_summary:
-            enviar_resumo()
-            next_summary = datetime.utcnow() + timedelta(minutes=SUMMARY_INTERVAL_MINUTES)
-
-        logger.info(f"⏳ Aguardando {SCAN_INTERVAL} segundos para próxima varredura...")
-        time.sleep(SCAN_INTERVAL)
-
-# ----------------- Resumo (a cada X minutos) -----------------
-def enviar_resumo():
-    # montar resumo dos últimos SUMMARY_INTERVAL_MINUTES
-    agora = datetime.utcnow()
-    janela = agora - timedelta(minutes=SUMMARY_INTERVAL_MINUTES)
-    sinais_ult = [s for s in signals_sent if s[0] >= janela]
-    erros_ult = [e for e in errors_logged if e[0] >= janela]
-
-    texto = f"📊 Resumo {agora.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-    texto += f"- Período: últimos {SUMMARY_INTERVAL_MINUTES} minutos\n"
-    texto += f"- Sinais enviados: {len(sinais_ult)}\n"
-    if len(sinais_ult) > 0:
-        for t,a,s in sinais_ult[-5:]:
-            texto += f"  • {t.strftime('%H:%M')} {a} -> {s.split('|')[0].strip()}\n"
-    texto += f"- Erros recentes: {len(erros_ult)}\n"
-    if len(erros_ult) > 0:
-        for t,a,e in erros_ult[-5:]:
-            texto += f"  • {t.strftime('%H:%M')} {a} -> {e}\n"
-
-    # enviar via Telegram e logar localmente
-    logger.info("Enviando resumo por Telegram...")
-    ok = send_telegram_message(texto)
-    if ok:
-        logger.info("✅ Resumo enviado.")
-    else:
-        logger.warning("❌ Falha ao enviar resumo por Telegram.")
-
-# ----------------- FLASK para keepalive -----------------
-app = Flask("indicador_s1000")
-
-@app.route("/")
+@app.route('/')
 def home():
-    return "Indicador Trading S1000 ativo. (Keepalive ping)"
+    return "IndicadorTradingS1000 ativo!"
 
-# ----------------- Start threads -----------------
-def start():
-    t = threading.Thread(target=loop_bot, daemon=True)
-    t.start()
-    app.run(host="0.0.0.0", port=8080)
+def run_flask():
+    app.run(host="0.0.0.0", port=5000)
 
+# ========================
+# EXECUÇÃO
+# ========================
 if __name__ == "__main__":
-    logger.info("Inicializando Indicador Trading S1000...")
-    start()
+    # Rodar WebSocket em thread separada
+    ws_thread = threading.Thread(target=run_ws)
+    ws_thread.start()
 
-
-
+    # Rodar Flask para Uptime Robot
+    run_flask()
