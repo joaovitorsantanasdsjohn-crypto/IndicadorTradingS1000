@@ -6,6 +6,7 @@ from telegram import Bot
 from ml_model import SignalFilter
 from flask import Flask
 import threading
+from datetime import datetime
 
 # ========================
 # CONFIGURAÇÕES
@@ -13,19 +14,24 @@ import threading
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 CHAT_ID = "6370166264"
 
-# Pares principais (Binance Forex Futures)
+# WebSocket DERIV - Forex
+DERIV_WEBSOCKET_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+
+# Pares principais
 ativos = [
-    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
-    "NZDUSD", "EURJPY", "GBPJPY", "EURGBP", "AUDJPY",
-    "EURCHF", "USDCHF", "GBPCHF", "AUDNZD", "NZDJPY"
+    "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxUSDCAD",
+    "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP", "frxAUDJPY",
+    "frxEURCHF", "frxUSDCHF", "frxGBPCHF", "frxAUDNZD", "frxNZDJPY"
 ]
 
-# Inicializa bot Telegram
+# Inicializa bot Telegram e ML
 bot = Bot(token=TELEGRAM_TOKEN)
 ml_filter = SignalFilter()
 
-# Armazena candles por ativo
+# Candles por ativo
 candles_por_ativo = {ativo: [] for ativo in ativos}
+ticks_por_ativo = {ativo: [] for ativo in ativos}
+current_candle_time = {ativo: None for ativo in ativos}
 
 # ========================
 # FUNÇÕES
@@ -35,7 +41,6 @@ def send_telegram(message):
 
 def calculate_indicators(df):
     import ta
-
     df['EMA_short'] = ta.trend.EMAIndicator(df['close'], window=5).ema_indicator()
     df['EMA_medium'] = ta.trend.EMAIndicator(df['close'], window=13).ema_indicator()
     df['EMA_long'] = ta.trend.EMAIndicator(df['close'], window=21).ema_indicator()
@@ -43,46 +48,67 @@ def calculate_indicators(df):
     bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
     df['BB_upper'] = bb.bollinger_hband()
     df['BB_lower'] = bb.bollinger_lband()
-
     return df
 
 def generate_signal(df, ativo):
     last = df.iloc[-1]
-    features = [last['EMA_short'], last['EMA_medium'], last['EMA_long'],
-                last['RSI'], last['BB_upper'], last['BB_lower']]
+    features = [last['EMA_short'], last['EMA_medium'], last['EMA_long'], last['RSI'], last['BB_upper'], last['BB_lower']]
     prob = ml_filter.predict(features)
 
+    # Sinal COMPRA
     if last['EMA_short'] > last['EMA_medium'] > last['EMA_long'] and last['RSI'] < 70 and last['close'] > last['BB_lower'] and prob > 0.6:
         send_telegram(f"📈 {ativo}: Sinal de COMPRA! Probabilidade {prob:.2f}")
+
+    # Sinal VENDA
     elif last['EMA_short'] < last['EMA_medium'] < last['EMA_long'] and last['RSI'] > 30 and last['close'] < last['BB_upper'] and prob > 0.6:
         send_telegram(f"📉 {ativo}: Sinal de VENDA! Probabilidade {prob:.2f}")
 
 # ========================
-# WEBSOCKET BINANCE
+# WEBSOCKET
 # ========================
 def on_message(ws, message):
     data = json.loads(message)
-    stream = data['s'].upper() if 's' in data else None
-    if stream not in [ativo.replace('/', '').upper() for ativo in ativos]:
+    
+    if 'tick' not in data:
+        return
+    
+    tick = data['tick']
+    ativo = tick['symbol']
+    if ativo not in ativos:
         return
 
-    candle_data = data['k']
-    candle = {
-        'time': candle_data['t'],
-        'open': float(candle_data['o']),
-        'high': float(candle_data['h']),
-        'low': float(candle_data['l']),
-        'close': float(candle_data['c'])
-    }
+    tick_price = tick['quote']
+    tick_time = int(tick['epoch'])
 
-    ativo = stream
-    candles_por_ativo[ativo].append(candle)
-    if len(candles_por_ativo[ativo]) > 100:
-        candles_por_ativo[ativo].pop(0)
+    # Inicializa tempo do candle
+    if current_candle_time[ativo] is None:
+        current_candle_time[ativo] = tick_time - (tick_time % 300)  # múltiplo de 5 min
 
-    df = pd.DataFrame(candles_por_ativo[ativo])
-    df = calculate_indicators(df)
-    generate_signal(df, ativo)
+    # Adiciona tick ao buffer
+    ticks_por_ativo[ativo].append(tick_price)
+
+    # Fecha candle a cada 5 minutos
+    if tick_time >= current_candle_time[ativo] + 300:
+        candle_ticks = ticks_por_ativo[ativo]
+        candle = {
+            'time': current_candle_time[ativo],
+            'open': candle_ticks[0],
+            'high': max(candle_ticks),
+            'low': min(candle_ticks),
+            'close': candle_ticks[-1]
+        }
+        candles_por_ativo[ativo].append(candle)
+        if len(candles_por_ativo[ativo]) > 100:
+            candles_por_ativo[ativo].pop(0)
+
+        # Reseta buffer e tempo
+        ticks_por_ativo[ativo] = []
+        current_candle_time[ativo] += 300
+
+        # Calcula indicadores e gera sinais
+        df = pd.DataFrame(candles_por_ativo[ativo])
+        df = calculate_indicators(df)
+        generate_signal(df, ativo)
 
 def on_error(ws, error):
     print("Erro:", error)
@@ -92,12 +118,16 @@ def on_close(ws, close_status_code, close_msg):
 
 def on_open(ws):
     print("Conexão WebSocket aberta")
+    for ativo in ativos:
+        subscribe_msg = {
+            "ticks": ativo,
+            "subscribe": 1
+        }
+        ws.send(json.dumps(subscribe_msg))
 
 def run_ws():
-    streams = "/".join([f"{ativo.lower()}@kline_1m" for ativo in ativos])
-    ws_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
     ws = websocket.WebSocketApp(
-        ws_url,
+        DERIV_WEBSOCKET_URL,
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
@@ -121,8 +151,10 @@ def run_flask():
 # EXECUÇÃO
 # ========================
 if __name__ == "__main__":
+    # Rodar Flask em thread separada
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
 
+    # Rodar WebSocket como processo principal
     run_ws()
