@@ -4,6 +4,7 @@ import pandas as pd
 from telegram import Bot
 from ml_model import SignalFilter
 from datetime import datetime
+import time
 
 # ========================
 # CONFIGURAÇÕES
@@ -11,21 +12,17 @@ from datetime import datetime
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 CHAT_ID = "6370166264"
 
-# WebSocket DERIV - Forex
 DERIV_WEBSOCKET_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
-# Pares principais
 ativos = [
     "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxUSDCAD",
     "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP", "frxAUDJPY",
     "frxEURCHF", "frxUSDCHF", "frxGBPCHF", "frxAUDNZD", "frxNZDJPY"
 ]
 
-# Inicializa bot Telegram e ML
 bot = Bot(token=TELEGRAM_TOKEN)
 ml_filter = SignalFilter()
 
-# Candles por ativo
 candles_por_ativo = {ativo: [] for ativo in ativos}
 ticks_por_ativo = {ativo: [] for ativo in ativos}
 current_candle_time = {ativo: None for ativo in ativos}
@@ -52,11 +49,8 @@ def generate_signal(df, ativo):
     features = [last['EMA_short'], last['EMA_medium'], last['EMA_long'], last['RSI'], last['BB_upper'], last['BB_lower']]
     prob = ml_filter.predict(features)
 
-    # Sinal COMPRA
     if last['EMA_short'] > last['EMA_medium'] > last['EMA_long'] and last['RSI'] < 70 and last['close'] > last['BB_lower'] and prob > 0.6:
         send_telegram(f"📈 {ativo}: Sinal de COMPRA! Probabilidade {prob:.2f}")
-
-    # Sinal VENDA
     elif last['EMA_short'] < last['EMA_medium'] < last['EMA_long'] and last['RSI'] > 30 and last['close'] < last['BB_upper'] and prob > 0.6:
         send_telegram(f"📉 {ativo}: Sinal de VENDA! Probabilidade {prob:.2f}")
 
@@ -65,7 +59,6 @@ def generate_signal(df, ativo):
 # ========================
 def on_message(ws, message):
     data = json.loads(message)
-    
     if 'tick' not in data:
         return
     
@@ -77,14 +70,11 @@ def on_message(ws, message):
     tick_price = tick['quote']
     tick_time = int(tick['epoch'])
 
-    # Inicializa tempo do candle
     if current_candle_time[ativo] is None:
-        current_candle_time[ativo] = tick_time - (tick_time % 300)  # múltiplo de 5 min
+        current_candle_time[ativo] = tick_time - (tick_time % 300)
 
-    # Adiciona tick ao buffer
     ticks_por_ativo[ativo].append(tick_price)
 
-    # Fecha candle a cada 5 minutos
     if tick_time >= current_candle_time[ativo] + 300:
         candle_ticks = ticks_por_ativo[ativo]
         candle = {
@@ -98,11 +88,9 @@ def on_message(ws, message):
         if len(candles_por_ativo[ativo]) > 100:
             candles_por_ativo[ativo].pop(0)
 
-        # Reseta buffer e tempo
         ticks_por_ativo[ativo] = []
         current_candle_time[ativo] += 300
 
-        # Calcula indicadores e gera sinais
         df = pd.DataFrame(candles_por_ativo[ativo])
         df = calculate_indicators(df)
         generate_signal(df, ativo)
@@ -111,29 +99,31 @@ def on_error(ws, error):
     print("Erro:", error)
 
 def on_close(ws, close_status_code, close_msg):
-    print("Conexão fechada")
+    print(f"Conexão fechada: {close_status_code}, {close_msg}")
 
 def on_open(ws):
     print("Conexão WebSocket aberta")
     for ativo in ativos:
-        subscribe_msg = {
-            "ticks": ativo,
-            "subscribe": 1
-        }
+        subscribe_msg = {"ticks": ativo, "subscribe": 1}
         ws.send(json.dumps(subscribe_msg))
 
-def run_ws():
-    ws = websocket.WebSocketApp(
-        DERIV_WEBSOCKET_URL,
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
-    ws.run_forever()
+# ========================
+# EXECUÇÃO COM RECONEXÃO
+# ========================
+def run_ws_forever():
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                DERIV_WEBSOCKET_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+            ws.run_forever()
+        except Exception as e:
+            print(f"Erro no WS, reconectando em 5s: {e}")
+            time.sleep(5)
 
-# ========================
-# EXECUÇÃO
-# ========================
 if __name__ == "__main__":
-    run_ws()
+    run_ws_forever()
