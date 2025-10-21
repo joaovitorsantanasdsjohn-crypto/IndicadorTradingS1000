@@ -12,9 +12,8 @@ import threading
 # ========================
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 CHAT_ID = "6370166264"
-OLYMP_WEBSOCKET_URL = "wss://ws.olymptrade.com/otp?cid_ver=1&cid_app=web%40OlympTrade%402025.4.27904%4027904&cid_device=%40%40desktop&cid_os=windows%4010"
 
-# Pares principais
+# Pares principais (Binance Forex Futures)
 ativos = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
     "NZDUSD", "EURJPY", "GBPJPY", "EURGBP", "AUDJPY",
@@ -37,15 +36,10 @@ def send_telegram(message):
 def calculate_indicators(df):
     import ta
 
-    # Médias móveis exponenciais
     df['EMA_short'] = ta.trend.EMAIndicator(df['close'], window=5).ema_indicator()
     df['EMA_medium'] = ta.trend.EMAIndicator(df['close'], window=13).ema_indicator()
     df['EMA_long'] = ta.trend.EMAIndicator(df['close'], window=21).ema_indicator()
-
-    # RSI
     df['RSI'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-
-    # Bandas de Bollinger
     bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
     df['BB_upper'] = bb.bollinger_hband()
     df['BB_lower'] = bb.bollinger_lband()
@@ -54,33 +48,34 @@ def calculate_indicators(df):
 
 def generate_signal(df, ativo):
     last = df.iloc[-1]
-    features = [last['EMA_short'], last['EMA_medium'], last['EMA_long'], last['RSI'], last['BB_upper'], last['BB_lower']]
+    features = [last['EMA_short'], last['EMA_medium'], last['EMA_long'],
+                last['RSI'], last['BB_upper'], last['BB_lower']]
     prob = ml_filter.predict(features)
 
-    # Sinal COMPRA
     if last['EMA_short'] > last['EMA_medium'] > last['EMA_long'] and last['RSI'] < 70 and last['close'] > last['BB_lower'] and prob > 0.6:
         send_telegram(f"📈 {ativo}: Sinal de COMPRA! Probabilidade {prob:.2f}")
-
-    # Sinal VENDA
     elif last['EMA_short'] < last['EMA_medium'] < last['EMA_long'] and last['RSI'] > 30 and last['close'] < last['BB_upper'] and prob > 0.6:
         send_telegram(f"📉 {ativo}: Sinal de VENDA! Probabilidade {prob:.2f}")
 
 # ========================
-# WEBSOCKET
+# WEBSOCKET BINANCE
 # ========================
 def on_message(ws, message):
     data = json.loads(message)
-    ativo = data.get('symbol')
-    if ativo not in ativos:
+    stream = data['s'].upper() if 's' in data else None
+    if stream not in [ativo.replace('/', '').upper() for ativo in ativos]:
         return
 
+    candle_data = data['k']
     candle = {
-        'time': data['time'],
-        'open': data['open'],
-        'high': data['high'],
-        'low': data['low'],
-        'close': data['close']
+        'time': candle_data['t'],
+        'open': float(candle_data['o']),
+        'high': float(candle_data['h']),
+        'low': float(candle_data['l']),
+        'close': float(candle_data['c'])
     }
+
+    ativo = stream
     candles_por_ativo[ativo].append(candle)
     if len(candles_por_ativo[ativo]) > 100:
         candles_por_ativo[ativo].pop(0)
@@ -97,17 +92,12 @@ def on_close(ws, close_status_code, close_msg):
 
 def on_open(ws):
     print("Conexão WebSocket aberta")
-    for ativo in ativos:
-        subscribe_msg = {
-            "type": "subscribe",
-            "symbol": ativo,
-            "interval": 5
-        }
-        ws.send(json.dumps(subscribe_msg))
 
 def run_ws():
+    streams = "/".join([f"{ativo.lower()}@kline_1m" for ativo in ativos])
+    ws_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
     ws = websocket.WebSocketApp(
-        OLYMP_WEBSOCKET_URL,
+        ws_url,
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
@@ -131,12 +121,8 @@ def run_flask():
 # EXECUÇÃO
 # ========================
 if __name__ == "__main__":
-    # Rodar Flask em thread separada
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Rodar WebSocket como processo principal
     run_ws()
-
-
