@@ -131,9 +131,12 @@ def run_flask():
 # EXECUÇÃO
 # ========================
 if __name__ == "__main__":
-    # Rodar WebSocket em thread separada
-    ws_thread = threading.Thread(target=run_ws)
-    ws_thread.start()
+    # Rodar Flask em thread separada
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
 
-    # Rodar Flask para Uptime Robot
-    run_flask()
+    # Rodar WebSocket como processo principal
+    run_ws()
+
+
