@@ -7,24 +7,21 @@ from ml_model import SignalFilter
 from flask import Flask
 import threading
 from datetime import datetime
+import time
 
 # ========================
 # CONFIGURAÇÕES
 # ========================
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 CHAT_ID = "6370166264"
-
-# WebSocket DERIV - Forex
 DERIV_WEBSOCKET_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
-# Pares principais
 ativos = [
     "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxUSDCAD",
     "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP", "frxAUDJPY",
     "frxEURCHF", "frxUSDCHF", "frxGBPCHF", "frxAUDNZD", "frxNZDJPY"
 ]
 
-# Inicializa bot Telegram e ML
 bot = Bot(token=TELEGRAM_TOKEN)
 ml_filter = SignalFilter()
 
@@ -37,7 +34,11 @@ current_candle_time = {ativo: None for ativo in ativos}
 # FUNÇÕES
 # ========================
 def send_telegram(message):
-    bot.send_message(chat_id=CHAT_ID, text=message)
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=message)
+        print(f"[Telegram] {message}")
+    except Exception as e:
+        print(f"[Erro Telegram] {e}")
 
 def calculate_indicators(df):
     import ta
@@ -55,11 +56,11 @@ def generate_signal(df, ativo):
     features = [last['EMA_short'], last['EMA_medium'], last['EMA_long'], last['RSI'], last['BB_upper'], last['BB_lower']]
     prob = ml_filter.predict(features)
 
-    # Sinal COMPRA
+    # COMPRA
     if last['EMA_short'] > last['EMA_medium'] > last['EMA_long'] and last['RSI'] < 70 and last['close'] > last['BB_lower'] and prob > 0.6:
         send_telegram(f"📈 {ativo}: Sinal de COMPRA! Probabilidade {prob:.2f}")
 
-    # Sinal VENDA
+    # VENDA
     elif last['EMA_short'] < last['EMA_medium'] < last['EMA_long'] and last['RSI'] > 30 and last['close'] < last['BB_upper'] and prob > 0.6:
         send_telegram(f"📉 {ativo}: Sinal de VENDA! Probabilidade {prob:.2f}")
 
@@ -80,14 +81,12 @@ def on_message(ws, message):
     tick_price = tick['quote']
     tick_time = int(tick['epoch'])
 
-    # Inicializa tempo do candle
     if current_candle_time[ativo] is None:
-        current_candle_time[ativo] = tick_time - (tick_time % 300)  # múltiplo de 5 min
+        current_candle_time[ativo] = tick_time - (tick_time % 300)
 
-    # Adiciona tick ao buffer
     ticks_por_ativo[ativo].append(tick_price)
 
-    # Fecha candle a cada 5 minutos
+    # Fecha candle de 5 minutos
     if tick_time >= current_candle_time[ativo] + 300:
         candle_ticks = ticks_por_ativo[ativo]
         candle = {
@@ -101,23 +100,23 @@ def on_message(ws, message):
         if len(candles_por_ativo[ativo]) > 100:
             candles_por_ativo[ativo].pop(0)
 
-        # Reseta buffer e tempo
         ticks_por_ativo[ativo] = []
         current_candle_time[ativo] += 300
 
-        # Calcula indicadores e gera sinais
         df = pd.DataFrame(candles_por_ativo[ativo])
         df = calculate_indicators(df)
         generate_signal(df, ativo)
 
 def on_error(ws, error):
-    print("Erro:", error)
+    print(f"[Erro WS] {error}")
 
 def on_close(ws, close_status_code, close_msg):
-    print("Conexão fechada")
+    print(f"[WS fechado] code={close_status_code} msg={close_msg}")
+    time.sleep(5)
+    start_ws()  # reconecta automaticamente
 
 def on_open(ws):
-    print("Conexão WebSocket aberta")
+    print("[WS aberto]")
     for ativo in ativos:
         subscribe_msg = {
             "ticks": ativo,
@@ -125,7 +124,7 @@ def on_open(ws):
         }
         ws.send(json.dumps(subscribe_msg))
 
-def run_ws():
+def start_ws():
     ws = websocket.WebSocketApp(
         DERIV_WEBSOCKET_URL,
         on_open=on_open,
@@ -136,7 +135,7 @@ def run_ws():
     ws.run_forever()
 
 # ========================
-# FLASK PARA UPTIME ROBOT
+# FLASK PARA UPTIME
 # ========================
 app = Flask(__name__)
 
@@ -151,10 +150,10 @@ def run_flask():
 # EXECUÇÃO
 # ========================
 if __name__ == "__main__":
-    # Rodar Flask em thread separada
+    # Flask em thread separada
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Rodar WebSocket como processo principal
-    run_ws()
+    # WebSocket principal
+    start_ws()
