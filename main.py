@@ -35,20 +35,20 @@ def send_telegram(message):
     bot.send_message(chat_id=CHAT_ID, text=message)
 
 def calculate_indicators(df):
-    import pandas_ta as ta
+    import ta
 
     # Médias móveis exponenciais
-    df['EMA_short'] = df.ta.ema(length=5)
-    df['EMA_medium'] = df.ta.ema(length=13)
-    df['EMA_long'] = df.ta.ema(length=21)
+    df['EMA_short'] = ta.trend.EMAIndicator(df['close'], window=5).ema_indicator()
+    df['EMA_medium'] = ta.trend.EMAIndicator(df['close'], window=13).ema_indicator()
+    df['EMA_long'] = ta.trend.EMAIndicator(df['close'], window=21).ema_indicator()
 
     # RSI
-    df['RSI'] = df.ta.rsi(length=14)
+    df['RSI'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
 
     # Bandas de Bollinger
-    bb = df.ta.bbands(length=20, std=2)
-    df['BB_upper'] = bb['BBU_20_2.0']
-    df['BB_lower'] = bb['BBL_20_2.0']
+    bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
+    df['BB_upper'] = bb.bollinger_hband()
+    df['BB_lower'] = bb.bollinger_lband()
 
     return df
 
