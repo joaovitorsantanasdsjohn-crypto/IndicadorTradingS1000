@@ -1,7 +1,7 @@
-pandas==2.3.3
-numpy==1.25.2
-websocket-client==1.9.0
-python-telegram-bot==20.3
-Flask==2.3.3
-ta==0.11.0
-tensorflow==2.16.1
+flask
+websocket-client
+pandas
+numpy
+tensorflow
+scikit-learn
+requests
