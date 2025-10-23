@@ -43,17 +43,28 @@ PRINT_TICK_SUMMARY_EVERY = 10  # mostra contagem a cada N ticks no buffer
 # ========================
 # AUXILIARES: indicadores, envio telegram, formatação
 # ========================
-def send_telegram(message):
+import asyncio
+import time
+
+def send_telegram(message, retries=3, delay=1):
     """
     Envia mensagem para o Telegram de forma síncrona.
+    Se houver falha, tenta até `retries` vezes com `delay` segundos entre tentativas.
     """
-    try:
-        print(f"Tentando enviar Telegram: {message}")
-        bot.send_message(chat_id=CHAT_ID, text=message)
-        print("✅ Telegram enviado com sucesso.")
-    except Exception as e:
-        print(f"❌ Erro ao enviar Telegram: {e}")
-        traceback.print_exc()
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"Tentativa {attempt} de enviar Telegram: {message}")
+            asyncio.run(bot.send_message(chat_id=CHAT_ID, text=message))
+            print(f"✅ Telegram enviado com sucesso na tentativa {attempt}.")
+            break  # saiu do loop se enviado com sucesso
+        except Exception as e:
+            print(f"❌ Erro ao enviar Telegram na tentativa {attempt}: {e}")
+            traceback.print_exc()
+            if attempt < retries:
+                print(f"Aguardando {delay}s antes da próxima tentativa...")
+                time.sleep(delay)
+            else:
+                print("❌ Falha ao enviar Telegram após todas as tentativas.")
 
 def calculate_indicators(df):
     """
@@ -272,5 +283,6 @@ if __name__ == "__main__":
     flask_thread.start()
     # run ws in main thread (principal)
     run_ws_forever()
+
 
 
