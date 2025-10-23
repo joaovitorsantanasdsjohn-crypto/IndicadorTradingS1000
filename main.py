@@ -41,7 +41,7 @@ _lock = threading.Lock()
 # ========================
 def send_telegram(message):
     try:
-        bot.send_message(chat_id=CHAT_ID, text=message)
+        bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
         print("Telegram enviado:", message)
     except Exception as e:
         print("Erro ao enviar Telegram:", e)
@@ -60,10 +60,14 @@ def calculate_indicators(df):
     df['BB_lower'] = bb.bollinger_lband()
     return df
 
+# ========================
+# FUNÇÃO DE ANÁLISE E SINAL
+# ========================
 def generate_signal(df, ativo):
     try:
         if df.empty or len(df) < 21:
             return
+
         last = df.iloc[-1]
         features = [
             float(last.get('EMA_short', np.nan)),
@@ -73,14 +77,34 @@ def generate_signal(df, ativo):
             float(last.get('BB_upper', np.nan)),
             float(last.get('BB_lower', np.nan))
         ]
+
         prob = ml_filter.predict(features)
-        msg = None
+        direction = "NEUTRO"
+        emoji = "⚪"
+
+        # Lógica principal de sinal
         if last['EMA_short'] > last['EMA_medium'] > last['EMA_long'] and last['RSI'] < 70 and last['close'] > last['BB_lower'] and prob > 0.6:
-            msg = f"📈 {ativo}: Sinal de COMPRA! Probabilidade {prob:.2f}"
+            direction = "COMPRA"
+            emoji = "📈"
         elif last['EMA_short'] < last['EMA_medium'] < last['EMA_long'] and last['RSI'] > 30 and last['close'] < last['BB_upper'] and prob > 0.6:
-            msg = f"📉 {ativo}: Sinal de VENDA! Probabilidade {prob:.2f}"
-        if msg:
-            send_telegram(msg)
+            direction = "VENDA"
+            emoji = "📉"
+
+        # Cria o texto da análise completa
+        msg = (
+            f"{emoji} *Análise {ativo}*\n\n"
+            f"EMA5: `{last['EMA_short']:.5f}`\n"
+            f"EMA13: `{last['EMA_medium']:.5f}`\n"
+            f"EMA21: `{last['EMA_long']:.5f}`\n"
+            f"RSI: `{last['RSI']:.2f}`\n"
+            f"Bollinger Superior: `{last['BB_upper']:.5f}`\n"
+            f"Bollinger Inferior: `{last['BB_lower']:.5f}`\n"
+            f"Probabilidade ML: `{prob:.2f}`\n\n"
+            f"*Sinal:* {direction}"
+        )
+
+        send_telegram(msg)
+
     except Exception:
         print("Erro em generate_signal:\n", traceback.format_exc())
 
