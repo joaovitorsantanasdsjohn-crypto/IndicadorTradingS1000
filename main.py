@@ -8,21 +8,19 @@ from flask import Flask
 import threading
 import time
 import traceback
-import os
 
 # ========================
 # CONFIGURAÇÕES
 # ========================
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 CHAT_ID = "6370166264"
-DERIV_WEBSOCKET_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
-BACKUP_FILE = "data_backup.json"
 
-# 15 pares de moedas
+DERIV_WEBSOCKET_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+
+# 7 pares mais lucrativos
 ativos = [
-    "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "frxUSDCAD",
-    "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP", "frxAUDJPY",
-    "frxEURCHF", "frxUSDCHF", "frxGBPCHF", "frxAUDNZD", "frxNZDJPY"
+    "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD",
+    "frxUSDCAD", "frxUSDCHF", "frxNZDUSD"
 ]
 
 # ========================
@@ -34,56 +32,21 @@ ml_filter = SignalFilter()
 candles_por_ativo = {ativo: [] for ativo in ativos}
 ticks_por_ativo = {ativo: [] for ativo in ativos}
 current_candle_time = {ativo: None for ativo in ativos}
+
+last_tick_time = {ativo: time.time() for ativo in ativos}
+
 _lock = threading.Lock()
 
 # ========================
-# BACKUP DE DADOS
-# ========================
-def load_backup():
-    global candles_por_ativo
-    try:
-        if os.path.exists(BACKUP_FILE):
-            with open(BACKUP_FILE, "r") as f:
-                data = json.load(f)
-            if "candles" in data:
-                for ativo, candles in data["candles"].items():
-                    candles_por_ativo[ativo] = candles[-500:]  # limita pra não ficar pesado
-            print("✅ Backup restaurado com sucesso.")
-        else:
-            print("Nenhum backup anterior encontrado.")
-    except Exception as e:
-        print("Erro ao carregar backup:", e)
-
-def save_backup():
-    try:
-        data = {"candles": candles_por_ativo}
-        tmp_file = BACKUP_FILE + ".tmp"
-        with open(tmp_file, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp_file, BACKUP_FILE)
-        print("💾 Backup salvo.")
-    except Exception as e:
-        print("Erro ao salvar backup:", e)
-
-def periodic_backup():
-    while True:
-        time.sleep(300)  # salva a cada 5 minutos
-        with _lock:
-            save_backup()
-
-# ========================
-# TELEGRAM
+# FUNÇÕES AUXILIARES
 # ========================
 def send_telegram(message):
     try:
         bot.send_message(chat_id=CHAT_ID, text=message)
-        print("📨 Telegram enviado:", message)
+        print("Telegram enviado:", message)
     except Exception as e:
         print("Erro ao enviar Telegram:", e)
 
-# ========================
-# INDICADORES E SINAIS
-# ========================
 def calculate_indicators(df):
     import ta
     if df.empty or len(df) < 5:
@@ -114,12 +77,11 @@ def generate_signal(df, ativo):
         prob = ml_filter.predict(features)
         msg = None
         if last['EMA_short'] > last['EMA_medium'] > last['EMA_long'] and last['RSI'] < 70 and last['close'] > last['BB_lower'] and prob > 0.6:
-            msg = f"📈 {ativo}: Sinal de COMPRA detectado!\nProbabilidade ML: {prob:.2f}"
+            msg = f"📈 {ativo}: Sinal de COMPRA! Probabilidade {prob:.2f}"
         elif last['EMA_short'] < last['EMA_medium'] < last['EMA_long'] and last['RSI'] > 30 and last['close'] < last['BB_upper'] and prob > 0.6:
-            msg = f"📉 {ativo}: Sinal de VENDA detectado!\nProbabilidade ML: {prob:.2f}"
+            msg = f"📉 {ativo}: Sinal de VENDA! Probabilidade {prob:.2f}"
         if msg:
             send_telegram(msg)
-            print("🔎 Análise concluída e sinal enviado para", ativo)
     except Exception:
         print("Erro em generate_signal:\n", traceback.format_exc())
 
@@ -138,6 +100,8 @@ def on_message(ws, message):
                 return
             tick_price = float(tick.get('quote'))
             tick_time = int(tick.get('epoch'))
+
+            last_tick_time[ativo] = time.time()
 
             if current_candle_time[ativo] is None:
                 current_candle_time[ativo] = tick_time - (tick_time % 300)
@@ -162,11 +126,8 @@ def on_message(ws, message):
                         df = pd.DataFrame(candles_por_ativo[ativo])
                         df = calculate_indicators(df)
                         generate_signal(df, ativo)
-                    else:
-                        print(f"[{ativo}] Sem ticks no período {current_candle_time[ativo]}")
                     ticks_por_ativo[ativo] = []
                     current_candle_time[ativo] += 300
-                    save_backup()  # salva imediatamente após cada candle
 
             ticks_por_ativo[ativo].append(tick_price)
             if len(ticks_por_ativo[ativo]) % 10 == 0:
@@ -181,7 +142,7 @@ def on_close(ws, close_status_code, close_msg):
     print("Conexão fechada:", close_status_code, close_msg)
 
 def on_open(ws):
-    print("✅ Conexão WebSocket aberta - assinando ativos...")
+    print("Conexão WebSocket aberta - assinando ativos...")
     try:
         for ativo in ativos:
             ws.send(json.dumps({"ticks": ativo, "subscribe": 1}))
@@ -189,19 +150,32 @@ def on_open(ws):
     except Exception:
         print("Erro em on_open:\n", traceback.format_exc())
 
+# ========================
+# RECONEXÃO AUTOMÁTICA COM HEARTBEAT
+# ========================
+def monitor_ticks(ws_app):
+    while True:
+        time.sleep(10)
+        for ativo in ativos:
+            if time.time() - last_tick_time[ativo] > 60:
+                print(f"Sem ticks recentes para {ativo}, forçando reconexão...")
+                ws_app.close()
+
 def run_ws_forever():
     backoff = 1
     while True:
         try:
-            print("🔌 Conectando ao WebSocket da Deriv...")
-            ws = websocket.WebSocketApp(
+            print("Conectando ao WebSocket da Deriv...")
+            ws_app = websocket.WebSocketApp(
                 DERIV_WEBSOCKET_URL,
                 on_open=on_open,
                 on_message=on_message,
                 on_error=on_error,
                 on_close=on_close
             )
-            ws.run_forever(ping_interval=30, ping_timeout=10)
+            monitor_thread = threading.Thread(target=monitor_ticks, args=(ws_app,), daemon=True)
+            monitor_thread.start()
+            ws_app.run_forever(ping_interval=30, ping_timeout=10)
         except Exception:
             print("Exceção em run_ws_forever:\n", traceback.format_exc())
         print(f"Reconectando em {backoff}s...")
@@ -224,8 +198,7 @@ def run_flask():
 # MAIN
 # ========================
 if __name__ == "__main__":
-    print("Iniciando servidor Flask + WebSocket Deriv com persistência de dados")
-    load_backup()
-    threading.Thread(target=periodic_backup, daemon=True).start()
-    threading.Thread(target=run_flask, daemon=True).start()
+    print("Iniciando servidor Flask + WebSocket Deriv")
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     run_ws_forever()
