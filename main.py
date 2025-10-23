@@ -45,13 +45,12 @@ PRINT_TICK_SUMMARY_EVERY = 10  # mostra contagem a cada N ticks no buffer
 # ========================
 def send_telegram(message):
     """
-    Envia mensagem para o Telegram.
-    Mantém logs detalhados para garantir que as mensagens sejam enviadas.
+    Envia mensagem para o Telegram de forma síncrona.
     """
     try:
         print(f"Tentando enviar Telegram: {message}")
-        result = bot.send_message(chat_id=CHAT_ID, text=message)
-        print(f"✅ Telegram enviado com sucesso. Message ID: {result.message_id}")
+        bot.send_message(chat_id=CHAT_ID, text=message)
+        print("✅ Telegram enviado com sucesso.")
     except Exception as e:
         print(f"❌ Erro ao enviar Telegram: {e}")
         traceback.print_exc()
@@ -273,4 +272,5 @@ if __name__ == "__main__":
     flask_thread.start()
     # run ws in main thread (principal)
     run_ws_forever()
+
 
