@@ -43,28 +43,29 @@ PRINT_TICK_SUMMARY_EVERY = 10  # mostra contagem a cada N ticks no buffer
 # ========================
 # AUXILIARES: indicadores, envio telegram, formatação
 # ========================
-import asyncio
-import time
+# limite máximo de envios simultâneos
+MAX_CONCURRENT_TELEGRAM = 2
+_telegram_semaphore = threading.Semaphore(MAX_CONCURRENT_TELEGRAM)
 
-def send_telegram(message, retries=3, delay=1):
+def send_telegram(message):
     """
-    Envia mensagem para o Telegram de forma síncrona.
-    Se houver falha, tenta até `retries` vezes com `delay` segundos entre tentativas.
+    Envia mensagem para o Telegram, limitando o número de envios simultâneos
+    para evitar saturar o pool HTTP.
     """
-    for attempt in range(1, retries + 1):
+    def _send():
         try:
-            print(f"Tentativa {attempt} de enviar Telegram: {message}")
-            asyncio.run(bot.send_message(chat_id=CHAT_ID, text=message))
-            print(f"✅ Telegram enviado com sucesso na tentativa {attempt}.")
-            break  # saiu do loop se enviado com sucesso
+            print(f"Tentando enviar Telegram: {message}")
+            bot.send_message(chat_id=CHAT_ID, text=message)
+            print("✅ Telegram enviado com sucesso.")
         except Exception as e:
-            print(f"❌ Erro ao enviar Telegram na tentativa {attempt}: {e}")
+            print(f"❌ Erro ao enviar Telegram: {e}")
             traceback.print_exc()
-            if attempt < retries:
-                print(f"Aguardando {delay}s antes da próxima tentativa...")
-                time.sleep(delay)
-            else:
-                print("❌ Falha ao enviar Telegram após todas as tentativas.")
+        finally:
+            _telegram_semaphore.release()
+
+    # aguarda se já estiver no limite de envios simultâneos
+    _telegram_semaphore.acquire()
+    threading.Thread(target=_send, daemon=True).start()
 
 def calculate_indicators(df):
     """
@@ -283,6 +284,7 @@ if __name__ == "__main__":
     flask_thread.start()
     # run ws in main thread (principal)
     run_ws_forever()
+
 
 
 
