@@ -241,7 +241,10 @@ def home():
     return "🚀 IndicadorTradingS1000 ativo e rodando!"
 
 def run_flask():
-    app.run(host="0.0.0.0", port=5000)
+    import os
+
+port = int(os.environ.get("PORT", 5000))
+app.run(host="0.0.0.0", port=port)
 
 # ========================
 # MAIN
@@ -251,3 +254,4 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     run_ws_forever()
+
