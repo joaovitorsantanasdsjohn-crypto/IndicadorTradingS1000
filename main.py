@@ -1,4 +1,3 @@
-# main.py
 import websocket
 import json
 import pandas as pd
@@ -16,7 +15,6 @@ from queue import PriorityQueue
 # ========================
 TELEGRAM_TOKEN = "7964245740:AAH7yN95r_NNQaq3OAJU43S4nagIAcgK2w0"
 CHAT_ID = "6370166264"
-
 DERIV_WEBSOCKET_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
 ativos = [
@@ -33,16 +31,14 @@ ml_filter = SignalFilter()
 candles_por_ativo = {ativo: [] for ativo in ativos}
 ticks_por_ativo = {ativo: [] for ativo in ativos}
 current_candle_time = {ativo: None for ativo in ativos}
-
 _lock = threading.Lock()
 
 PRINT_EVERY_TICK = True
 PRINT_TICK_SUMMARY_EVERY = 10
 
 # ========================
-# FILA PRIORITÁRIA DE MENSAGENS TELEGRAM
+# FILA TELEGRAM
 # ========================
-# Prioridade: COMPRA/VENDA = 1 (alta), NEUTRO = 2 (baixa)
 telegram_queue = PriorityQueue()
 MAX_CONCURRENT_TELEGRAM = 2
 _telegram_semaphore = threading.Semaphore(MAX_CONCURRENT_TELEGRAM)
@@ -60,24 +56,18 @@ def telegram_worker():
         finally:
             _telegram_semaphore.release()
             telegram_queue.task_done()
-        time.sleep(0.1)  # evita sobrecarga
+        time.sleep(0.1)
 
-# inicia threads do worker
 for _ in range(MAX_CONCURRENT_TELEGRAM):
     t = threading.Thread(target=telegram_worker, daemon=True)
     t.start()
 
 def send_telegram(message, priority=2):
-    """
-    Adiciona mensagem à fila de envio.
-    priority=1 => COMPRA/VENDA
-    priority=2 => NEUTRO
-    """
     telegram_queue.put((priority, message))
     print(f"Mensagem adicionada à fila (priority={priority})")
 
 # ========================
-# INDICADORES E ANÁLISE
+# INDICADORES
 # ========================
 def calculate_indicators(df):
     try:
@@ -137,8 +127,6 @@ def generate_and_notify(df, ativo):
     prob = ml_filter.predict(features)
     analysis_text, decision = create_analysis_text(last, prob, ativo)
     print("ANÁLISE =>\n", analysis_text)
-
-    # prioridade: COMPRA/VENDA = 1, NEUTRO = 2
     priority = 1 if decision in ["COMPRA", "VENDA"] else 2
     send_telegram(analysis_text, priority=priority)
 
@@ -188,14 +176,10 @@ def on_message(ws, message):
                         except Exception as e:
                             print("Erro ao calcular indicadores:", e)
                         generate_and_notify(df, ativo)
-                    else:
-                        print(f"[{ativo}] Sem ticks no período {current_candle_time[ativo]} ( candle vazio )")
                     ticks_por_ativo[ativo] = []
                     current_candle_time[ativo] += 300
 
             ticks_por_ativo[ativo].append(tick_price)
-            if len(ticks_por_ativo[ativo]) % PRINT_TICK_SUMMARY_EVERY == 0:
-                print(f"[{ativo}] ticks buffer: {len(ticks_por_ativo[ativo])} last={tick_price}")
 
     except Exception:
         print("Erro em on_message:\n", traceback.format_exc())
@@ -232,7 +216,7 @@ def run_ws_forever():
         backoff = min(backoff * 2, 60)
 
 # ========================
-# FLASK PARA UPTIME
+# FLASK + THREAD PRINCIPAL
 # ========================
 app = Flask(__name__)
 
@@ -240,19 +224,22 @@ app = Flask(__name__)
 def home():
     return "🚀 IndicadorTradingS1000 ativo e rodando!"
 
-def run_flask():
+def start_flask():
     import os
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
 
-# ========================
-# MAIN
-# ========================
-if __name__ == "__main__":
-    print("Iniciando servidor Flask + WebSocket Deriv (principal)")
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+def start_websocket():
     run_ws_forever()
 
+if __name__ == "__main__":
+    print("Iniciando servidor Flask + WebSocket (Render compatível)...")
+    flask_thread = threading.Thread(target=start_flask, daemon=True)
+    flask_thread.start()
 
+    # Loop bloqueante: mantém o processo ativo no Render
+    ws_thread = threading.Thread(target=start_websocket, daemon=True)
+    ws_thread.start()
 
+    while True:
+        time.sleep(60)
