@@ -1,3 +1,4 @@
+# main.py
 import websocket
 import json
 import pandas as pd
@@ -9,6 +10,7 @@ from flask import Flask
 from telegram import Bot
 from ml_model import SignalFilter
 from queue import PriorityQueue
+import os
 
 # ========================
 # CONFIGURAÇÕES
@@ -31,13 +33,14 @@ ml_filter = SignalFilter()
 candles_por_ativo = {ativo: [] for ativo in ativos}
 ticks_por_ativo = {ativo: [] for ativo in ativos}
 current_candle_time = {ativo: None for ativo in ativos}
+
 _lock = threading.Lock()
 
 PRINT_EVERY_TICK = True
 PRINT_TICK_SUMMARY_EVERY = 10
 
 # ========================
-# FILA TELEGRAM
+# FILA DE MENSAGENS TELEGRAM
 # ========================
 telegram_queue = PriorityQueue()
 MAX_CONCURRENT_TELEGRAM = 2
@@ -49,9 +52,9 @@ def telegram_worker():
         try:
             _telegram_semaphore.acquire()
             bot.send_message(chat_id=CHAT_ID, text=message)
-            print("✅ Telegram enviado com sucesso.")
+            print("✅ Telegram enviado:", message.split("\n")[0])
         except Exception as e:
-            print(f"❌ Erro ao enviar Telegram: {e}")
+            print(f"❌ Erro Telegram:", e)
             traceback.print_exc()
         finally:
             _telegram_semaphore.release()
@@ -67,16 +70,11 @@ def send_telegram(message, priority=2):
     print(f"Mensagem adicionada à fila (priority={priority})")
 
 # ========================
-# INDICADORES
+# INDICADORES E ANÁLISE
 # ========================
 def calculate_indicators(df):
-    try:
-        import ta
-    except Exception as e:
-        raise RuntimeError("Pacote 'ta' não encontrado. Adicione 'ta' no requirements.txt.") from e
-
-    if df.empty:
-        return df
+    import ta
+    if df.empty: return df
     df = df.sort_values("time").reset_index(drop=True)
     df['EMA_short'] = ta.trend.EMAIndicator(df['close'], window=5).ema_indicator()
     df['EMA_medium'] = ta.trend.EMAIndicator(df['close'], window=13).ema_indicator()
@@ -113,8 +111,7 @@ def create_analysis_text(last, prob, ativo):
     return txt, decision
 
 def generate_and_notify(df, ativo):
-    if df.empty:
-        return
+    if df.empty: return
     last = df.iloc[-1].to_dict()
     features = [
         float(last.get('EMA_short', np.nan)),
@@ -137,12 +134,10 @@ def on_message(ws, message):
     try:
         with _lock:
             data = json.loads(message)
-            if 'tick' not in data:
-                return
+            if 'tick' not in data: return
             tick = data['tick']
             ativo = tick.get('symbol')
-            if ativo not in ativos:
-                return
+            if ativo not in ativos: return
 
             tick_price = float(tick.get('quote'))
             tick_time = int(tick.get('epoch'))
@@ -171,15 +166,16 @@ def on_message(ws, message):
                             candles_por_ativo[ativo].pop(0)
                         print(f"[{ativo}] Candle fechado: O={candle['open']} H={candle['high']} L={candle['low']} C={candle['close']}")
                         df = pd.DataFrame(candles_por_ativo[ativo])
-                        try:
-                            df = calculate_indicators(df)
-                        except Exception as e:
-                            print("Erro ao calcular indicadores:", e)
+                        df = calculate_indicators(df)
                         generate_and_notify(df, ativo)
+                    else:
+                        print(f"[{ativo}] Sem ticks no período {current_candle_time[ativo]}")
                     ticks_por_ativo[ativo] = []
                     current_candle_time[ativo] += 300
 
             ticks_por_ativo[ativo].append(tick_price)
+            if len(ticks_por_ativo[ativo]) % PRINT_TICK_SUMMARY_EVERY == 0:
+                print(f"[{ativo}] ticks buffer: {len(ticks_por_ativo[ativo])} last={tick_price}")
 
     except Exception:
         print("Erro em on_message:\n", traceback.format_exc())
@@ -216,7 +212,7 @@ def run_ws_forever():
         backoff = min(backoff * 2, 60)
 
 # ========================
-# FLASK + THREAD PRINCIPAL
+# FLASK MÍNIMO PARA UPTIME
 # ========================
 app = Flask(__name__)
 
@@ -224,22 +220,13 @@ app = Flask(__name__)
 def home():
     return "🚀 IndicadorTradingS1000 ativo e rodando!"
 
-def start_flask():
-    import os
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, use_reloader=False)
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
-def start_websocket():
-    run_ws_forever()
-
+# ========================
+# MAIN
+# ========================
 if __name__ == "__main__":
-    print("Iniciando servidor Flask + WebSocket (Render compatível)...")
-    flask_thread = threading.Thread(target=start_flask, daemon=True)
-    flask_thread.start()
-
-    # Loop bloqueante: mantém o processo ativo no Render
-    ws_thread = threading.Thread(target=start_websocket, daemon=True)
-    ws_thread.start()
-
-    while True:
-        time.sleep(60)
+    threading.Thread(target=run_flask, daemon=True).start()
+    run_ws_forever()
