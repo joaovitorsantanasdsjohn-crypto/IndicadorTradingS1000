@@ -1,4 +1,4 @@
-# main.py
+# main.py (versão com diagnóstico extra)
 import websocket
 import json
 import pandas as pd
@@ -11,6 +11,7 @@ from telegram import Bot
 from ml_model import SignalFilter
 from queue import PriorityQueue
 import os
+import ssl
 
 # ========================
 # CONFIGURAÇÕES
@@ -138,23 +139,57 @@ def generate_and_notify(df, ativo):
     send_telegram(analysis_text, priority=priority)
 
 # ========================
-# WEBSOCKET DERIV
+# DIAGNÓSTICO / MONITOR
+# ========================
+connected_event = threading.Event()
+last_on_open_time = None
+last_tick_time_by_asset = {ativo: None for ativo in ativos}
+
+def status_monitor():
+    while True:
+        try:
+            qsize = telegram_queue.qsize()
+            connected = connected_event.is_set()
+            buf_summary = {a: len(ticks_por_ativo.get(a, [])) for a in ativos}
+            last_ticks = {a: last_tick_time_by_asset.get(a) for a in ativos}
+            print("==== STATUS MONITOR ====")
+            print("[STATUS] WebSocket conectado:", connected)
+            print("[STATUS] Telegram queue size:", qsize)
+            print("[STATUS] Tick buffers:", buf_summary)
+            print("[STATUS] Últimos tick times:", last_ticks)
+            print("========================")
+        except Exception:
+            print("[status_monitor] Erro:\n", traceback.format_exc())
+        time.sleep(30)
+
+threading.Thread(target=status_monitor, daemon=True).start()
+
+# ========================
+# WEBSOCKET DERIV (com trace e headers)
 # ========================
 def on_message(ws, message):
     try:
         with _lock:
             data = json.loads(message)
+            # Log mensagens não-tick para inspeção
             if 'tick' not in data:
+                # Pode ser resposta de subscrição ou erro
+                print(f"[on_message] Mensagem não-tick recebida: {data}")
                 return
+
             tick = data['tick']
             ativo = tick.get('symbol')
             if ativo not in ativos:
+                print(f"[on_message] Tick recebido para ativo não-monitorado: {ativo}")
                 return
 
             tick_price = float(tick.get('quote'))
             tick_time = int(tick.get('epoch'))
 
-            print(f"[on_message] Tick recebido: {ativo} price={tick_price} epoch={tick_time}")
+            last_tick_time_by_asset[ativo] = tick_time
+
+            if PRINT_EVERY_TICK:
+                print(f"[on_message] Tick recebido: {ativo} price={tick_price} epoch={tick_time}")
 
             if current_candle_time[ativo] is None:
                 current_candle_time[ativo] = tick_time - (tick_time % 300)
@@ -186,45 +221,71 @@ def on_message(ws, message):
                     current_candle_time[ativo] += 300
 
             ticks_por_ativo[ativo].append(tick_price)
+
             if len(ticks_por_ativo[ativo]) % PRINT_TICK_SUMMARY_EVERY == 0:
                 print(f"[on_message] {ativo} ticks buffer: {len(ticks_por_ativo[ativo])} last={tick_price}")
 
     except Exception:
         print("[on_message] Erro:\n", traceback.format_exc())
 
+def on_open(ws):
+    global last_on_open_time
+    last_on_open_time = time.time()
+    connected_event.set()
+    print("[on_open] WebSocket aberto em", time.ctime(last_on_open_time))
+    # enviar subscribe e logar resposta
+    for ativo in ativos:
+        try:
+            sub = {"ticks": ativo, "subscribe": 1}
+            ws.send(json.dumps(sub))
+            print(f"[on_open] Pedido de subscribe enviado para {ativo}")
+        except Exception:
+            print("[on_open] Erro ao enviar subscribe para", ativo)
+            traceback.print_exc()
+
 def on_error(ws, error):
     print("[on_error] Erro WebSocket:", error)
+    # não resetar connected_event aqui; on_close fará isso normalmente
 
 def on_close(ws, close_status_code, close_msg):
-    print(f"[on_close] Conexão fechada: {close_status_code} {close_msg}")
+    connected_event.clear()
+    print(f"[on_close] WebSocket fechado: code={close_status_code} msg={close_msg}")
 
-def on_open(ws):
-    print("[on_open] Conexão WebSocket aberta - assinando ativos...")
-    for ativo in ativos:
-        ws.send(json.dumps({"ticks": ativo, "subscribe": 1}))
-        print(f"[on_open] Inscrito em: {ativo}")
-
+# ========================
+# EXECUÇÃO / RECONNECT
+# ========================
 def run_ws_forever():
+    websocket.enableTrace(True)  # ativa trace detalhado do cliente websocket nos logs
     backoff = 1
     while True:
         try:
-            print("[run_ws_forever] Conectando ao WebSocket da Deriv...")
+            print("[run_ws_forever] Iniciando conexão com Deriv:", DERIV_WEBSOCKET_URL)
+            # alguns servidores esperam header Origin; ajustamos aqui
+            headers = ["Origin: https://binary.com"]
             ws = websocket.WebSocketApp(
                 DERIV_WEBSOCKET_URL,
+                header=headers,
                 on_open=on_open,
                 on_message=on_message,
                 on_error=on_error,
                 on_close=on_close
             )
-            ws.run_forever(ping_interval=30, ping_timeout=10)
+            # SSL options: se houver erro com verificação, descomente sslopt abaixo (não recomendado em produção)
+            sslopt = {"cert_reqs": ssl.CERT_REQUIRED}
+            # para diagnóstico inicial pode-se usar CERT_NONE (relaxa verificação)
+            # sslopt = {"cert_reqs": ssl.CERT_NONE}
+            print("[run_ws_forever] Chamando run_forever (ping_interval=30, ping_timeout=10)")
+            # run_forever bloqueia aqui enquanto websocket estiver conectado
+            ws.run_forever(ping_interval=30, ping_timeout=10, sslopt=sslopt)
         except Exception:
             print("[run_ws_forever] Exceção:\n", traceback.format_exc())
-        print(f"[run_ws_forever] Reconectando em {backoff}s...")
+        # se sair do run_forever (fechou), aguardar reconexão com backoff
+        print(f"[run_ws_forever] Desconectado — reconectando em {backoff}s...")
         time.sleep(backoff)
         backoff = min(backoff * 2, 60)
 
 # ========================
-# FLASK PARA UPTIME
+# FLASK PARA UPTIME (thread)
 # ========================
 app = Flask(__name__)
 
@@ -241,11 +302,11 @@ def run_flask():
 # MAIN
 # ========================
 if __name__ == "__main__":
-    print("Iniciando IndicadorTradingS1000 com WebSocket como processo principal...")
+    print("Iniciando IndicadorTradingS1000 (WebSocket principal) - PID:", os.getpid())
 
     # Flask em thread separada
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # WebSocket na thread principal
+    # WebSocket na thread/principal
     run_ws_forever()
