@@ -54,12 +54,12 @@ def telegram_worker():
             bot.send_message(chat_id=CHAT_ID, text=message)
             print("✅ Telegram enviado:", message.split("\n")[0])
         except Exception as e:
-            print(f"❌ Erro Telegram:", e)
+            print(f"❌ Erro ao enviar mensagem Telegram: {e}")
             traceback.print_exc()
         finally:
             _telegram_semaphore.release()
             telegram_queue.task_done()
-        time.sleep(0.1)
+        time.sleep(0.2)
 
 for _ in range(MAX_CONCURRENT_TELEGRAM):
     t = threading.Thread(target=telegram_worker, daemon=True)
@@ -74,7 +74,8 @@ def send_telegram(message, priority=2):
 # ========================
 def calculate_indicators(df):
     import ta
-    if df.empty: return df
+    if df.empty:
+        return df
     df = df.sort_values("time").reset_index(drop=True)
     df['EMA_short'] = ta.trend.EMAIndicator(df['close'], window=5).ema_indicator()
     df['EMA_medium'] = ta.trend.EMAIndicator(df['close'], window=13).ema_indicator()
@@ -123,7 +124,7 @@ def generate_and_notify(df, ativo):
     ]
     prob = ml_filter.predict(features)
     analysis_text, decision = create_analysis_text(last, prob, ativo)
-    print("ANÁLISE =>\n", analysis_text)
+    print("ANÁLISE =>", decision, ativo)
     priority = 1 if decision in ["COMPRA", "VENDA"] else 2
     send_telegram(analysis_text, priority=priority)
 
@@ -134,16 +135,18 @@ def on_message(ws, message):
     try:
         with _lock:
             data = json.loads(message)
-            if 'tick' not in data: return
+            if 'tick' not in data:
+                return
             tick = data['tick']
             ativo = tick.get('symbol')
-            if ativo not in ativos: return
+            if ativo not in ativos:
+                return
 
             tick_price = float(tick.get('quote'))
             tick_time = int(tick.get('epoch'))
 
             if PRINT_EVERY_TICK:
-                print(f"[TICK] {ativo} price={tick_price} epoch={tick_time}")
+                print(f"[TICK] {ativo} price={tick_price}")
 
             if current_candle_time[ativo] is None:
                 current_candle_time[ativo] = tick_time - (tick_time % 300)
@@ -164,18 +167,16 @@ def on_message(ws, message):
                         candles_por_ativo[ativo].append(candle)
                         if len(candles_por_ativo[ativo]) > 500:
                             candles_por_ativo[ativo].pop(0)
-                        print(f"[{ativo}] Candle fechado: O={candle['open']} H={candle['high']} L={candle['low']} C={candle['close']}")
+                        print(f"[{ativo}] Candle fechado: {candle}")
                         df = pd.DataFrame(candles_por_ativo[ativo])
                         df = calculate_indicators(df)
                         generate_and_notify(df, ativo)
-                    else:
-                        print(f"[{ativo}] Sem ticks no período {current_candle_time[ativo]}")
                     ticks_por_ativo[ativo] = []
                     current_candle_time[ativo] += 300
 
             ticks_por_ativo[ativo].append(tick_price)
             if len(ticks_por_ativo[ativo]) % PRINT_TICK_SUMMARY_EVERY == 0:
-                print(f"[{ativo}] ticks buffer: {len(ticks_por_ativo[ativo])} last={tick_price}")
+                print(f"[{ativo}] buffer={len(ticks_por_ativo[ativo])}")
 
     except Exception:
         print("Erro em on_message:\n", traceback.format_exc())
@@ -196,7 +197,7 @@ def run_ws_forever():
     backoff = 1
     while True:
         try:
-            print("Conectando ao WebSocket da Deriv...")
+            print("Conectando ao WebSocket Deriv...")
             ws = websocket.WebSocketApp(
                 DERIV_WEBSOCKET_URL,
                 on_open=on_open,
@@ -206,27 +207,29 @@ def run_ws_forever():
             )
             ws.run_forever(ping_interval=30, ping_timeout=10)
         except Exception:
-            print("Exceção em run_ws_forever:\n", traceback.format_exc())
-        print(f"Reconectando em {backoff}s...")
+            print("Erro WebSocket:\n", traceback.format_exc())
+        print(f"Tentando reconexão em {backoff}s...")
         time.sleep(backoff)
         backoff = min(backoff * 2, 60)
 
 # ========================
-# FLASK MÍNIMO PARA UPTIME
+# FLASK (BACKGROUND PARA RENDER)
 # ========================
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "🚀 IndicadorTradingS1000 ativo e rodando!"
+    return "🚀 IndicadorTradingS1000 ativo e rodando (WebSocket principal)."
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ========================
 # MAIN
 # ========================
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
+    print("Iniciando IndicadorTradingS1000 com WebSocket como processo principal...")
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     run_ws_forever()
