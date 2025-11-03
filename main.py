@@ -1,4 +1,4 @@
-# main.py (versão completa com limpeza e impressão contínua)
+# main.py (versão otimizada para Render gratuito)
 import websocket
 import json
 import pandas as pd
@@ -21,7 +21,8 @@ CHAT_ID = "6370166264"
 DERIV_WEBSOCKET_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
 ativos = [
-    "frxEURUSD", "frxUSDJPY", "frxUSDCHF"
+    "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD",
+    "frxUSDCAD", "frxEURJPY", "frxGBPJPY", "frxUSDCHF"
 ]
 
 # ========================
@@ -33,17 +34,19 @@ ml_filter = SignalFilter()
 candles_por_ativo = {ativo: [] for ativo in ativos}
 ticks_por_ativo = {ativo: [] for ativo in ativos}
 current_candle_time = {ativo: None for ativo in ativos}
-last_tick_time_by_asset = {ativo: None for ativo in ativos}
 
 _lock = threading.Lock()
 
 PRINT_EVERY_TICK = True
 PRINT_TICK_SUMMARY_EVERY = 10
 TICK_TIMEOUT = 60  # segundos para avisar se ticks pararem
-INACTIVITY_LIMIT = 120  # segundos sem ticks para considerar inativo
+INACTIVE_TIMEOUT = 180  # remove ticks de ativos inativos após 3 minutos
+
+# Logs persistentes
+LOG_FILE = "ticks_log.txt"
 
 # ========================
-# FILA PRIORITÁRIA DE MENSAGENS TELEGRAM
+# FILA PRIORITÁRIA DE TELEGRAM
 # ========================
 telegram_queue = PriorityQueue()
 MAX_CONCURRENT_TELEGRAM = 2
@@ -56,7 +59,7 @@ def telegram_worker():
             _telegram_semaphore.acquire()
             bot.send_message(chat_id=CHAT_ID, text=message)
         except Exception as e:
-            print(f"[Telegram Worker] ❌ Erro ao enviar Telegram: {e}")
+            print(f"[Telegram Worker] Erro: {e}")
             traceback.print_exc()
         finally:
             _telegram_semaphore.release()
@@ -69,17 +72,12 @@ for _ in range(MAX_CONCURRENT_TELEGRAM):
 
 def send_telegram(message, priority=2):
     telegram_queue.put((priority, message))
-    print(f"[send_telegram] Mensagem adicionada à fila (priority={priority})")
 
 # ========================
 # INDICADORES E ANÁLISE
 # ========================
 def calculate_indicators(df):
-    try:
-        import ta
-    except Exception as e:
-        raise RuntimeError("Pacote 'ta' não encontrado. Adicione 'ta' no requirements.txt.") from e
-
+    import ta
     if df.empty:
         return df
     df = df.sort_values("time").reset_index(drop=True)
@@ -131,8 +129,12 @@ def generate_and_notify(df, ativo):
     ]
     prob = ml_filter.predict(features)
     analysis_text, decision = create_analysis_text(last, prob, ativo)
+    print("[ANÁLISE]", analysis_text)
 
-    print("[generate_and_notify] ANÁLISE =>\n", analysis_text)
+    # Grava log persistente
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{time.ctime()} | {analysis_text}\n")
+
     priority = 1 if decision in ["COMPRA", "VENDA"] else 2
     send_telegram(analysis_text, priority=priority)
 
@@ -140,91 +142,32 @@ def generate_and_notify(df, ativo):
 # DIAGNÓSTICO / MONITOR
 # ========================
 connected_event = threading.Event()
+last_tick_time_by_asset = {ativo: None for ativo in ativos}
 
 def status_monitor():
     while True:
         try:
-            qsize = telegram_queue.qsize()
-            connected = connected_event.is_set()
             buf_summary = {a: len(ticks_por_ativo.get(a, [])) for a in ativos}
             last_ticks = {a: last_tick_time_by_asset.get(a) for a in ativos}
             print("==== STATUS MONITOR ====")
-            print("[STATUS] WebSocket conectado:", connected)
-            print("[STATUS] Telegram queue size:", qsize)
-            print("[STATUS] Tick buffers:", buf_summary)
-            print("[STATUS] Últimos tick times:", last_ticks)
+            print("[STATUS] WebSocket conectado:", connected_event.is_set())
+            print("[STATUS] Buffers:", buf_summary)
+            print("[STATUS] Últimos ticks:", last_ticks)
 
             now = time.time()
+            # Remove ativos inativos
             for a, t in last_tick_time_by_asset.items():
-                if t is not None and now - t > TICK_TIMEOUT:
-                    print(f"[status_monitor] ⚠️ Sem ticks de {a} nos últimos {TICK_TIMEOUT}s!")
+                if t is not None and now - t > INACTIVE_TIMEOUT:
+                    print(f"[status_monitor] ⚠️ {a} inativo há {INACTIVE_TIMEOUT}s. Limpando ticks.")
+                    with _lock:
+                        ticks_por_ativo[a] = []
+                    last_tick_time_by_asset[a] = None
 
-            print("========================")
         except Exception:
             print("[status_monitor] Erro:\n", traceback.format_exc())
         time.sleep(30)
 
 threading.Thread(target=status_monitor, daemon=True).start()
-
-# ========================
-# LIMPEZA DE SÍMBOLOS INATIVOS
-# ========================
-def limpar_simbolos_inativos():
-    while True:
-        time.sleep(10)
-        now = time.time()
-        with _lock:
-            inativos = [a for a, t in last_tick_time_by_asset.items() if t is not None and now - t > INACTIVITY_LIMIT]
-            for a in inativos:
-                ticks_por_ativo.pop(a, None)
-                candles_por_ativo.pop(a, None)
-                current_candle_time.pop(a, None)
-                last_tick_time_by_asset.pop(a, None)
-                if a in ativos:
-                    ativos.remove(a)
-                print(f"[limpar_simbolos_inativos] Símbolo removido por inatividade: {a}")
-
-threading.Thread(target=limpar_simbolos_inativos, daemon=True).start()
-
-# ========================
-# PROCESSAMENTO DE CANDLES
-# ========================
-def process_candle_if_needed(ativo):
-    try:
-        with _lock:
-            tick_time = last_tick_time_by_asset.get(ativo)
-            if tick_time is None:
-                return
-            while tick_time >= current_candle_time.get(ativo, 0) + 300:
-                candle_ticks = ticks_por_ativo.get(ativo, [])
-                if candle_ticks:
-                    candle = {
-                        'time': current_candle_time[ativo],
-                        'open': candle_ticks[0],
-                        'high': max(candle_ticks),
-                        'low': min(candle_ticks),
-                        'close': candle_ticks[-1]
-                    }
-                    if ativo not in candles_por_ativo:
-                        candles_por_ativo[ativo] = []
-                    candles_por_ativo[ativo].append(candle)
-                    if len(candles_por_ativo[ativo]) > 500:
-                        candles_por_ativo[ativo].pop(0)
-
-                    df = pd.DataFrame(candles_por_ativo[ativo])
-                    df = calculate_indicators(df)
-
-                    last = df.iloc[-1]
-                    print(f"[Indicadores] {ativo} | O={last['open']} H={last['high']} L={last['low']} C={last['close']}"
-                          f" EMA5={last['EMA_short']:.5f} EMA13={last['EMA_medium']:.5f} EMA21={last['EMA_long']:.5f}"
-                          f" RSI={last['RSI']:.2f} BBU={last['BB_upper']:.5f} BBL={last['BB_lower']:.5f}")
-
-                    generate_and_notify(df, ativo)
-
-                ticks_por_ativo[ativo] = []
-                current_candle_time[ativo] += 300
-    except Exception:
-        print("[process_candle_if_needed] Erro:\n", traceback.format_exc())
 
 # ========================
 # WEBSOCKET DERIV
@@ -242,35 +185,73 @@ def on_message(ws, message):
 
         tick_price = float(tick.get('quote'))
         tick_time = int(tick.get('epoch'))
+
         last_tick_time_by_asset[ativo] = tick_time
 
         if PRINT_EVERY_TICK:
-            print(f"[on_message] Tick: {ativo} price={tick_price} epoch={tick_time}")
+            print(f"[TICK] {ativo} price={tick_price} epoch={tick_time}")
 
+        # Atualiza ticks buffer
         with _lock:
-            ticks_por_ativo.setdefault(ativo, []).append(tick_price)
-            if current_candle_time.get(ativo) is None:
+            ticks_por_ativo[ativo].append(tick_price)
+            if current_candle_time[ativo] is None:
                 current_candle_time[ativo] = tick_time - (tick_time % 300)
 
         threading.Thread(target=process_candle_if_needed, args=(ativo,), daemon=True).start()
+
+        if len(ticks_por_ativo[ativo]) % PRINT_TICK_SUMMARY_EVERY == 0:
+            print(f"[on_message] {ativo} ticks buffer: {len(ticks_por_ativo[ativo])} last={tick_price}")
+
     except Exception:
         print("[on_message] Erro:\n", traceback.format_exc())
+
+def process_candle_if_needed(ativo):
+    try:
+        with _lock:
+            tick_time = last_tick_time_by_asset[ativo]
+            if tick_time is None:
+                return
+            while tick_time >= current_candle_time[ativo] + 300:
+                candle_ticks = ticks_por_ativo[ativo]
+                if candle_ticks:
+                    candle = {
+                        'time': current_candle_time[ativo],
+                        'open': candle_ticks[0],
+                        'high': max(candle_ticks),
+                        'low': min(candle_ticks),
+                        'close': candle_ticks[-1]
+                    }
+                    candles_por_ativo[ativo].append(candle)
+                    if len(candles_por_ativo[ativo]) > 500:
+                        candles_por_ativo[ativo].pop(0)
+                    df = pd.DataFrame(candles_por_ativo[ativo])
+                    try:
+                        df = calculate_indicators(df)
+                    except Exception as e:
+                        print("[process_candle_if_needed] Erro ao calcular indicadores:", e)
+                    generate_and_notify(df, ativo)
+                ticks_por_ativo[ativo] = []
+                current_candle_time[ativo] += 300
+    except Exception:
+        print("[process_candle_if_needed] Erro:\n", traceback.format_exc())
 
 def on_open(ws):
     connected_event.set()
     for ativo in ativos:
-        sub = {"ticks": ativo, "subscribe": 1}
-        ws.send(json.dumps(sub))
+        try:
+            ws.send(json.dumps({"ticks": ativo, "subscribe": 1}))
+        except Exception:
+            traceback.print_exc()
 
 def on_error(ws, error):
-    print("[on_error] Erro WebSocket:", error)
+    print("[on_error]", error)
 
 def on_close(ws, close_status_code, close_msg):
     connected_event.clear()
-    print(f"[on_close] WebSocket fechado: code={close_status_code} msg={close_msg}")
+    print(f"[on_close] code={close_status_code} msg={close_msg}")
 
 def on_pong(ws, message):
-    print("[on_pong] Pong recebido:", message)
+    print("[on_pong] Pong recebido")
 
 # ========================
 # EXECUÇÃO / RECONNECT
@@ -294,6 +275,7 @@ def run_ws_forever():
             ws.run_forever(ping_interval=30, ping_timeout=10, sslopt=sslopt)
         except Exception:
             print("[run_ws_forever] Exceção:\n", traceback.format_exc())
+        print(f"[run_ws_forever] Reconectando em {backoff}s...")
         time.sleep(backoff)
         backoff = min(backoff * 2, 60)
 
@@ -304,7 +286,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "🚀 IndicadorTradingS1000 ativo e rodando!"
+    return "🚀 Bot ativo e rodando!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
@@ -314,7 +296,6 @@ def run_flask():
 # MAIN
 # ========================
 if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    print("Iniciando bot - PID:", os.getpid())
+    threading.Thread(target=run_flask, daemon=True).start()
     run_ws_forever()
-
