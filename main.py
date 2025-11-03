@@ -21,8 +21,7 @@ CHAT_ID = "6370166264"
 DERIV_WEBSOCKET_URL = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
 ativos = [
-    "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD",
-    "frxUSDCAD", "frxEURJPY", "frxGBPJPY", "frxUSDCHF"
+    "frxEURUSD", "frxUSDJPY", "frxUSDCHF"
 ]
 
 # ========================
@@ -318,3 +317,4 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     run_ws_forever()
+
