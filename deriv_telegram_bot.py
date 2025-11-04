@@ -11,6 +11,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 import os
 import time
+from flask import Flask
+import threading
 
 load_dotenv()
 
@@ -122,8 +124,21 @@ async def monitor_symbol(symbol):
             print(f"🔄 Reconectando {symbol} depois de erro: {e}")
             time.sleep(5)  # Aguarda 5s antes de reconectar
 
+# --- Servidor Flask mínimo para Render ---
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "Bot ativo ✅"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
 # Função principal
 async def main():
+    # Inicia Flask em uma thread separada
+    threading.Thread(target=run_flask, daemon=True).start()
+    
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise!")
     for symbol in SYMBOLS:
         send_telegram(f"📊 Começando a monitorar **{symbol}**.")
