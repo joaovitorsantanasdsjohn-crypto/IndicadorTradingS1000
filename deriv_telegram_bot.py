@@ -1,17 +1,17 @@
 import os
 import asyncio
-import websockets
 import json
 import requests
-from datetime import datetime
-from dotenv import load_dotenv
 import pandas as pd
 import ta
-import threading
+import websockets
+from datetime import datetime
+from dotenv import load_dotenv
 from flask import Flask
+import threading
 
 # =======================
-# 🔧 Configuração
+# 🔧 Configurações
 # =======================
 load_dotenv()
 
@@ -20,10 +20,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DERIV_SYMBOL = os.getenv("DERIV_SYMBOL", "frxEURUSD")
 
 # =======================
-# 🧠 Funções auxiliares
+# 📤 Envio para Telegram
 # =======================
 def send_telegram_message(message: str):
-    """Envia mensagem formatada para o Telegram"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Token ou Chat ID do Telegram não configurados!")
         return
@@ -35,7 +34,7 @@ def send_telegram_message(message: str):
         print(f"Erro ao enviar mensagem: {e}")
 
 # =======================
-# 📊 Lógica do Bot
+# 🤖 Lógica principal do bot
 # =======================
 async def deriv_loop():
     url = "wss://ws.derivws.com/websockets/v3?app_id=1089"
@@ -43,8 +42,16 @@ async def deriv_loop():
 
     async for websocket in websockets.connect(url):
         try:
-            print("✅ Conectado ao WebSocket da Deriv!")
-            await websocket.send(json.dumps({"ticks_history": DERIV_SYMBOL, "adjust_start_time": 1, "count": 100, "end": "latest", "style": "candles", "granularity": 60}))
+            print(f"✅ Conectado ao WebSocket — símbolo: {DERIV_SYMBOL}")
+            await websocket.send(json.dumps({
+                "ticks_history": DERIV_SYMBOL,
+                "adjust_start_time": 1,
+                "count": 100,
+                "end": "latest",
+                "style": "candles",
+                "granularity": 300  # 5 minutos
+            }))
+
             last_signal = None
 
             while True:
@@ -67,25 +74,32 @@ async def deriv_loop():
                         send_telegram_message(f"📈 <b>SINAL CALL</b> — {DERIV_SYMBOL}\n🕐 {msg_time}\nRSI: {latest_rsi:.2f}")
                         last_signal = "CALL"
 
+                await asyncio.sleep(10)
+
         except Exception as e:
             print(f"⚠️ Erro no loop Deriv: {e}")
             await asyncio.sleep(5)
             continue
 
 # =======================
-# 🌐 Servidor Flask
+# 🌐 Servidor Flask (Render precisa disso)
 # =======================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🤖 Bot de Sinais Deriv Online ✅"
+    return "🤖 Bot Deriv está ativo e conectado!"
 
-def start_bot_thread():
-    asyncio.run(deriv_loop())
+def start_asyncio_loop():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(deriv_loop())
 
 if __name__ == "__main__":
-    # Inicia o bot em segundo plano
-    threading.Thread(target=start_bot_thread, daemon=True).start()
+    # Inicia o bot em segundo plano (não bloqueante)
+    threading.Thread(target=start_asyncio_loop, daemon=True).start()
+
     # Inicia o Flask (Render detecta essa porta)
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    print(f"🌐 Servidor Flask iniciado na porta {port}")
+    app.run(host="0.0.0.0", port=port)
