@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 import pandas as pd
@@ -17,9 +18,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID")
-
-# Lê os símbolos do Render, separados por vírgula
-SYMBOLS = os.getenv("SYMBOLS", "frxEURUSD").split(",")
+SYMBOLS = ["frxEURUSD", "frxEURJPY", "frxUSDCHF"]  # Lista de pares
 TIMEFRAME = 5  # candles de 5 minutos
 
 # ====== FUNÇÕES AUXILIARES ======
@@ -31,14 +30,16 @@ def enviar_telegram(msg):
     else:
         print("⚠️ Token ou Chat ID não configurados.")
 
+# ====== CONEXÃO COM DERIV ======
 async def conectar_deriv_para_simbolo(simbolo):
     url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-    print(f"🚀 Conectando ao WebSocket da Deriv para {simbolo}...")
-
-    # Envia mensagem ao Telegram avisando que o par está sendo monitorado
-    enviar_telegram(f"📊 Começando a monitorar <b>{simbolo}</b>.")
+    print(f"🚀 Tentando conectar ao WebSocket da Deriv para {simbolo}...")
 
     async with websockets.connect(url) as ws:
+        print(f"✅ WebSocket conectado para {simbolo}")
+        enviar_telegram(f"✅ Conexão ativa com WebSocket da Deriv para {simbolo}!")
+
+        # Enviar requisição inicial para ticks_history
         await ws.send(json.dumps({
             "ticks_history": simbolo,
             "adjust_start_time": 1,
@@ -47,6 +48,11 @@ async def conectar_deriv_para_simbolo(simbolo):
             "granularity": TIMEFRAME * 60,
             "style": "candles"
         }))
+
+        # Receber primeira resposta
+        resposta_inicial = await ws.recv()
+        print(f"📡 Primeira resposta recebida do WebSocket ({simbolo})")
+        enviar_telegram(f"📡 Primeira resposta de candles recebida do WebSocket ({simbolo})!")
 
         while True:
             response = await ws.recv()
@@ -108,6 +114,9 @@ def iniciar_bot():
     asyncio.run(main())
 
 if __name__ == "__main__":
-    enviar_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise!")
+    # Mensagem inicial com todos os símbolos
+    simbolos_texto = "\n".join([f"📊 Começando a monitorar **{sim}**." for sim in SYMBOLS])
+    enviar_telegram(f"✅ Bot iniciado com sucesso no Render e pronto para análise!\n{simbolos_texto}")
+    
     threading.Thread(target=iniciar_bot, daemon=True).start()
     app.run(host="0.0.0.0", port=10000)
