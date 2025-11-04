@@ -17,7 +17,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 CANDLE_INTERVAL = 5  # minutos
-symbols = ["frxEURUSD", "frxEURJPY", "frxUSDCHF"]
+SYMBOLS = ["frxEURUSD", "frxEURJPY", "frxUSDCHF"]
 
 # Função para enviar mensagens para Telegram
 def send_telegram(message):
