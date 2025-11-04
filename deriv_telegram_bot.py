@@ -10,8 +10,7 @@ import requests
 from datetime import datetime
 from dotenv import load_dotenv
 import os
-from flask import Flask
-import threading
+import time
 
 load_dotenv()
 
@@ -32,14 +31,20 @@ def send_telegram(message):
 
 # Indicadores
 def calcular_indicadores(df):
+    # EMAs
     df['ema_curta'] = EMAIndicator(df['close'], window=5).ema_indicator()
     df['ema_media'] = EMAIndicator(df['close'], window=10).ema_indicator()
     df['ema_longa'] = EMAIndicator(df['close'], window=20).ema_indicator()
+    
+    # RSI
     df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
+    
+    # Bandas de Bollinger
     bb = BollingerBands(df['close'], window=20, window_dev=2)
     df['bb_medio'] = bb.bollinger_mavg()
     df['bb_sup'] = bb.bollinger_hband()
     df['bb_inf'] = bb.bollinger_lband()
+    
     return df
 
 # Gerar sinal
@@ -60,51 +65,65 @@ def gerar_sinal(df):
     else:
         return None
 
-# Monitoramento WebSocket
+# Monitoramento WebSocket com reconexão
 async def monitor_symbol(symbol):
     url = f"wss://ws.binaryws.com/websockets/v3?app_id=1089"
     
-    try:
-        async with websockets.connect(url, ping_interval=20) as ws:
-            send_telegram(f"✅ Conexão ativa com WebSocket da Deriv para {symbol}!")
-            print(f"🚀 Conexão ativa com WebSocket da Deriv para {symbol}")
-            
-            req = {
-                "ticks_history": symbol,
-                "count": 100,
-                "granularity": CANDLE_INTERVAL*60,
-                "style": "candles"
-            }
-            await ws.send(json.dumps(req))
-            
-            while True:
-                response = await asyncio.wait_for(ws.recv(), timeout=30)
-                data = json.loads(response)
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20) as ws:
+                send_telegram(f"✅ Conexão ativa com WebSocket da Deriv para {symbol}!")
+                print(f"🚀 Conexão ativa com WebSocket da Deriv para {symbol}")
                 
-                if "history" in data:
-                    candles = data["history"]["candles"]
-                    df = pd.DataFrame(candles)
-                    df['close'] = df['close'].astype(float)
-                    df['open'] = df['open'].astype(float)
-                    df = calcular_indicadores(df)
-                    
-                    send_telegram(f"📡 Primeira resposta de candles recebida do WebSocket ({symbol})!")
-                    print(f"📡 Primeira resposta de candles recebida ({symbol})")
-                    
-                    sinal = gerar_sinal(df)
-                    if sinal:
-                        send_telegram(f"💹 Sinal {sinal} detectado para {symbol} (vela {CANDLE_INTERVAL} min)")
+                # Solicitar candles de 5 min
+                req = {
+                    "ticks_history": symbol,
+                    "count": 100,
+                    "granularity": CANDLE_INTERVAL*60,
+                    "style": "candles"
+                }
+                await ws.send(json.dumps(req))
                 
-                await asyncio.sleep(CANDLE_INTERVAL*60)
-    except asyncio.TimeoutError:
-        send_telegram(f"⚠️ Timeout: não foi possível receber dados do WebSocket para {symbol}")
-        print(f"⚠️ Timeout para {symbol}")
-    except Exception as e:
-        send_telegram(f"❌ Erro no WebSocket para {symbol}: {e}")
-        print(f"❌ Erro no WebSocket {symbol}: {e}")
+                first_response = True
+                while True:
+                    try:
+                        response = await ws.recv()
+                        data = json.loads(response)
+                        
+                        if "history" in data:
+                            candles = data["history"]["candles"]
+                            df = pd.DataFrame(candles)
+                            df['close'] = df['close'].astype(float)
+                            df['open'] = df['open'].astype(float)
+                            df = calcular_indicadores(df)
+                            
+                            if first_response:
+                                send_telegram(f"📡 Primeira resposta de candles recebida do WebSocket ({symbol})!")
+                                print(f"📡 Primeira resposta de candles recebida ({symbol})")
+                                first_response = False
+                            
+                            sinal = gerar_sinal(df)
+                            if sinal:
+                                send_telegram(f"💹 Sinal {sinal} detectado para {symbol} (vela {CANDLE_INTERVAL} min)")
+                    
+                    except asyncio.TimeoutError:
+                        send_telegram(f"⚠️ Timeout: não foi possível receber dados do WebSocket para {symbol}")
+                        print(f"⚠️ Timeout para {symbol}")
+                        break
+                    except Exception as e:
+                        send_telegram(f"❌ Erro no WebSocket para {symbol}: {e}")
+                        print(f"❌ Erro no WebSocket {symbol}: {e}")
+                        break
+                    
+                    await asyncio.sleep(CANDLE_INTERVAL*60)  # Espera próxima vela
+        
+        except Exception as e:
+            send_telegram(f"🔄 Tentando reconectar WebSocket para {symbol} após erro: {e}")
+            print(f"🔄 Reconectando {symbol} depois de erro: {e}")
+            time.sleep(5)  # Aguarda 5s antes de reconectar
 
-# Função principal do bot
-async def main_bot():
+# Função principal
+async def main():
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise!")
     for symbol in SYMBOLS:
         send_telegram(f"📊 Começando a monitorar **{symbol}**.")
@@ -112,19 +131,5 @@ async def main_bot():
     tasks = [monitor_symbol(symbol) for symbol in SYMBOLS]
     await asyncio.gather(*tasks)
 
-# --- Flask para manter porta aberta ---
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Bot Deriv rodando!"
-
-def run_flask():
-    app.run(host="0.0.0.0", port=10000)
-
-# Rodar Flask em thread separada
-threading.Thread(target=run_flask).start()
-
-# Rodar bot no asyncio
 if __name__ == "__main__":
-    asyncio.run(main_bot())
+    asyncio.run(main())
