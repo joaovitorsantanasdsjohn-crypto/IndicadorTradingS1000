@@ -17,7 +17,9 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID")
-SYMBOLS = ["frxEURUSD", "frxEURJPY", "frxUSDCHF"]  # Lista de pares
+
+# Lê os símbolos do Render, separados por vírgula
+SYMBOLS = os.getenv("SYMBOLS", "frxEURUSD").split(",")
 TIMEFRAME = 5  # candles de 5 minutos
 
 # ====== FUNÇÕES AUXILIARES ======
@@ -32,6 +34,9 @@ def enviar_telegram(msg):
 async def conectar_deriv_para_simbolo(simbolo):
     url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     print(f"🚀 Conectando ao WebSocket da Deriv para {simbolo}...")
+
+    # Envia mensagem ao Telegram avisando que o par está sendo monitorado
+    enviar_telegram(f"📊 Começando a monitorar <b>{simbolo}</b>.")
 
     async with websockets.connect(url) as ws:
         await ws.send(json.dumps({
@@ -97,7 +102,6 @@ def home():
 
 # ====== INÍCIO DO BOT ======
 def iniciar_bot():
-    """Cria tasks para cada símbolo"""
     async def main():
         tasks = [conectar_deriv_para_simbolo(sim) for sim in SYMBOLS]
         await asyncio.gather(*tasks)
