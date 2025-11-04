@@ -1,105 +1,114 @@
-import os
 import asyncio
 import json
-import requests
 import pandas as pd
-import ta
-import websockets
-from datetime import datetime
-from dotenv import load_dotenv
-from flask import Flask
+import requests
+import os
 import threading
+from datetime import datetime
+import websockets
+from ta.trend import EMAIndicator
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands
+from flask import Flask
+from dotenv import load_dotenv
 
-# =======================
-# 🔧 Configurações
-# =======================
+# ====== CONFIGURAÇÕES ======
 load_dotenv()
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DERIV_SYMBOL = os.getenv("DERIV_SYMBOL", "frxEURUSD")
+CHAT_ID = os.getenv("CHAT_ID")
+DERIV_APP_ID = os.getenv("DERIV_APP_ID")
+SYMBOL = "frxEURUSD"  # Par que estamos analisando
+TIMEFRAME = 5  # candles de 5 minutos
 
-# =======================
-# 📤 Envio para Telegram
-# =======================
-def send_telegram_message(message: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Token ou Chat ID do Telegram não configurados!")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-    try:
-        requests.post(url, data=payload)
-    except Exception as e:
-        print(f"Erro ao enviar mensagem: {e}")
+# ====== FUNÇÕES AUXILIARES ======
+def enviar_telegram(msg):
+    """Envia mensagens formatadas para o Telegram"""
+    if TELEGRAM_TOKEN and CHAT_ID:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.get(url, params={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"})
+        print(f"📤 Enviado para Telegram: {msg}")
+    else:
+        print("⚠️ Token ou Chat ID não configurados.")
 
-# =======================
-# 🤖 Lógica principal do bot
-# =======================
-async def deriv_loop():
-    url = "wss://ws.derivws.com/websockets/v3?app_id=1089"
+async def conectar_deriv():
+    """Conecta ao WebSocket da Deriv e analisa candles"""
+    url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     print("🚀 Conectando ao WebSocket da Deriv...")
 
-    async for websocket in websockets.connect(url):
-        try:
-            print(f"✅ Conectado ao WebSocket — símbolo: {DERIV_SYMBOL}")
-            await websocket.send(json.dumps({
-                "ticks_history": DERIV_SYMBOL,
-                "adjust_start_time": 1,
-                "count": 100,
-                "end": "latest",
-                "style": "candles",
-                "granularity": 300  # 5 minutos
-            }))
+    async with websockets.connect(url) as ws:
+        # Solicita o stream de candles
+        await ws.send(json.dumps({
+            "ticks_history": SYMBOL,
+            "adjust_start_time": 1,
+            "count": 200,
+            "end": "latest",
+            "granularity": TIMEFRAME * 60,
+            "style": "candles"
+        }))
 
-            last_signal = None
+        while True:
+            response = await ws.recv()
+            data = json.loads(response)
 
-            while True:
-                response = await websocket.recv()
-                data = json.loads(response)
+            if "candles" in data:
+                candles = pd.DataFrame(data["candles"])
+                candles["open"] = candles["open"].astype(float)
+                candles["high"] = candles["high"].astype(float)
+                candles["low"] = candles["low"].astype(float)
+                candles["close"] = candles["close"].astype(float)
 
-                if "candles" in data:
-                    df = pd.DataFrame(data["candles"])
-                    df["close"] = pd.to_numeric(df["close"])
-                    df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
+                # ====== INDICADORES ======
+                candles["EMA_curta"] = EMAIndicator(candles["close"], window=9).ema_indicator()
+                candles["EMA_media"] = EMAIndicator(candles["close"], window=21).ema_indicator()
+                candles["EMA_longa"] = EMAIndicator(candles["close"], window=50).ema_indicator()
+                candles["RSI"] = RSIIndicator(candles["close"], window=14).rsi()
 
-                    latest_rsi = df["rsi"].iloc[-1]
-                    msg_time = datetime.utcnow().strftime("%H:%M:%S")
+                bb = BollingerBands(candles["close"], window=20, window_dev=2)
+                candles["BB_upper"] = bb.bollinger_hband()
+                candles["BB_lower"] = bb.bollinger_lband()
 
-                    if latest_rsi > 70 and last_signal != "PUT":
-                        send_telegram_message(f"📉 <b>SINAL PUT</b> — {DERIV_SYMBOL}\n🕐 {msg_time}\nRSI: {latest_rsi:.2f}")
-                        last_signal = "PUT"
+                ultimo = candles.iloc[-1]
 
-                    elif latest_rsi < 30 and last_signal != "CALL":
-                        send_telegram_message(f"📈 <b>SINAL CALL</b> — {DERIV_SYMBOL}\n🕐 {msg_time}\nRSI: {latest_rsi:.2f}")
-                        last_signal = "CALL"
+                # ====== LÓGICA DE SINAL ======
+                ema_alinhadas_compra = ultimo["EMA_curta"] > ultimo["EMA_media"] > ultimo["EMA_longa"]
+                ema_alinhadas_venda = ultimo["EMA_curta"] < ultimo["EMA_media"] < ultimo["EMA_longa"]
+                rsi_compra = ultimo["RSI"] < 30
+                rsi_venda = ultimo["RSI"] > 70
+                perto_banda_inferior = ultimo["close"] <= ultimo["BB_lower"]
+                perto_banda_superior = ultimo["close"] >= ultimo["BB_upper"]
 
-                await asyncio.sleep(10)
+                msg_time = datetime.utcnow().strftime("%H:%M:%S")
 
-        except Exception as e:
-            print(f"⚠️ Erro no loop Deriv: {e}")
+                # COMPRA
+                if ema_alinhadas_compra and rsi_compra and perto_banda_inferior:
+                    msg = f"🟢 <b>SINAL DE COMPRA</b>\n⏰ {msg_time} UTC\n💱 Par: {SYMBOL}\n⏳ Candle: {TIMEFRAME}m"
+                    enviar_telegram(msg)
+
+                # VENDA
+                elif ema_alinhadas_venda and rsi_venda and perto_banda_superior:
+                    msg = f"🔴 <b>SINAL DE VENDA</b>\n⏰ {msg_time} UTC\n💱 Par: {SYMBOL}\n⏳ Candle: {TIMEFRAME}m"
+                    enviar_telegram(msg)
+
             await asyncio.sleep(5)
-            continue
 
-# =======================
-# 🌐 Servidor Flask (Render precisa disso)
-# =======================
+# ====== FLASK (Render mantém o serviço ativo) ======
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🤖 Bot Deriv está ativo e conectado!"
+    return "✅ Bot de Análise Deriv ativo no Render!"
 
-def start_asyncio_loop():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(deriv_loop())
+def iniciar_bot():
+    """Inicia o bot em thread separada"""
+    asyncio.run(conectar_deriv())
 
+# ====== MAIN ======
 if __name__ == "__main__":
-    # Inicia o bot em segundo plano (não bloqueante)
-    threading.Thread(target=start_asyncio_loop, daemon=True).start()
+    # Envia mensagem de confirmação
+    enviar_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise!")
 
-    # Inicia o Flask (Render detecta essa porta)
-    port = int(os.environ.get("PORT", 5000))
-    print(f"🌐 Servidor Flask iniciado na porta {port}")
-    app.run(host="0.0.0.0", port=port)
+    # Inicia o bot em paralelo
+    threading.Thread(target=iniciar_bot, daemon=True).start()
+
+    # Mantém o serviço online
+    app.run(host="0.0.0.0", port=10000)
