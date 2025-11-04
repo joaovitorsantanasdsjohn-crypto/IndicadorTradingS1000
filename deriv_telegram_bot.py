@@ -1,115 +1,91 @@
 import os
 import asyncio
-import json
-import time
-import requests
-import pandas as pd
-from ta.trend import EMAIndicator
-from ta.momentum import RSIIndicator
-from ta.volatility import BollingerBands
-from datetime import datetime, timezone
-from dotenv import load_dotenv
 import websockets
-from flask import Flask
+import json
+import requests
+from datetime import datetime
+from dotenv import load_dotenv
+import pandas as pd
+import ta
 import threading
+from flask import Flask
 
+# =======================
+# 🔧 Configuração
+# =======================
 load_dotenv()
 
-# ==============================
-# CONFIGURAÇÕES
-# ==============================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SYMBOL = "frxEURUSD"
-TIMEFRAME = 300  # 5 minutos (em segundos)
-CANDLES_QTD = 100
+DERIV_SYMBOL = os.getenv("DERIV_SYMBOL", "frxEURUSD")
 
-DERIV_API = "wss://ws.derivws.com/websockets/v3?app_id=1089"
-URL_TELEGRAM = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-# ==============================
-# FUNÇÃO PARA ENVIAR MENSAGEM TELEGRAM
-# ==============================
-def send_telegram_message(text):
+# =======================
+# 🧠 Funções auxiliares
+# =======================
+def send_telegram_message(message: str):
+    """Envia mensagem formatada para o Telegram"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Token ou Chat ID do Telegram não configurados!")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
-        requests.post(URL_TELEGRAM, data=payload)
+        requests.post(url, data=payload)
     except Exception as e:
-        print("Erro ao enviar mensagem Telegram:", e)
+        print(f"Erro ao enviar mensagem: {e}")
 
-# ==============================
-# ANÁLISE DE INDICADORES
-# ==============================
-def analisar_indicadores(df):
-    df["EMA_curta"] = EMAIndicator(df["close"], window=5).ema_indicator()
-    df["EMA_media"] = EMAIndicator(df["close"], window=20).ema_indicator()
-    df["EMA_longa"] = EMAIndicator(df["close"], window=50).ema_indicator()
-    df["RSI"] = RSIIndicator(df["close"], window=14).rsi()
-    bb = BollingerBands(df["close"], window=20, window_dev=2)
-    df["BB_high"] = bb.bollinger_hband()
-    df["BB_low"] = bb.bollinger_lband()
-
-    ema_c, ema_m, ema_l = df.iloc[-1][["EMA_curta", "EMA_media", "EMA_longa"]]
-    rsi = df.iloc[-1]["RSI"]
-    close = df.iloc[-1]["close"]
-    bb_high, bb_low = df.iloc[-1][["BB_high", "BB_low"]]
-
-    if ema_c > ema_m > ema_l and rsi < 70 and close > bb_low:
-        return "🟢 <b>SINAL DE COMPRA</b> - EUR/USD"
-    elif ema_c < ema_m < ema_l and rsi > 30 and close < bb_high:
-        return "🔴 <b>SINAL DE VENDA</b> - EUR/USD"
-    return None
-
-# ==============================
-# LOOP PRINCIPAL DO BOT
-# ==============================
+# =======================
+# 📊 Lógica do Bot
+# =======================
 async def deriv_loop():
-    async with websockets.connect(DERIV_API) as ws:
-        await ws.send(json.dumps({
-            "ticks_history": SYMBOL,
-            "adjust_start_time": 1,
-            "count": CANDLES_QTD,
-            "end": "latest",
-            "start": 1,
-            "style": "candles",
-            "granularity": TIMEFRAME
-        }))
+    url = "wss://ws.derivws.com/websockets/v3?app_id=1089"
+    print("🚀 Conectando ao WebSocket da Deriv...")
 
-        print("✅ Conectado ao WebSocket da Deriv!")
-        while True:
-            try:
-                msg = await ws.recv()
-                data = json.loads(msg)
+    async for websocket in websockets.connect(url):
+        try:
+            print("✅ Conectado ao WebSocket da Deriv!")
+            await websocket.send(json.dumps({"ticks_history": DERIV_SYMBOL, "adjust_start_time": 1, "count": 100, "end": "latest", "style": "candles", "granularity": 60}))
+            last_signal = None
+
+            while True:
+                response = await websocket.recv()
+                data = json.loads(response)
 
                 if "candles" in data:
                     df = pd.DataFrame(data["candles"])
-                    df["close"] = df["close"].astype(float)
-                    df["epoch"] = pd.to_datetime(df["epoch"], unit="s")
+                    df["close"] = pd.to_numeric(df["close"])
+                    df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
 
-                    sinal = analisar_indicadores(df)
-                    if sinal:
-                        send_telegram_message(sinal)
-                        print(datetime.now().strftime("%H:%M:%S"), "->", sinal)
-                    else:
-                        print(datetime.now().strftime("%H:%M:%S"), "-> Nenhum sinal.")
-                    
-                    await asyncio.sleep(TIMEFRAME)
-            except Exception as e:
-                print("Erro no loop:", e)
-                await asyncio.sleep(5)
+                    latest_rsi = df["rsi"].iloc[-1]
+                    msg_time = datetime.utcnow().strftime("%H:%M:%S")
 
-# ==============================
-# INICIAR FLASK (para Render gratuito)
-# ==============================
+                    if latest_rsi > 70 and last_signal != "PUT":
+                        send_telegram_message(f"📉 <b>SINAL PUT</b> — {DERIV_SYMBOL}\n🕐 {msg_time}\nRSI: {latest_rsi:.2f}")
+                        last_signal = "PUT"
+
+                    elif latest_rsi < 30 and last_signal != "CALL":
+                        send_telegram_message(f"📈 <b>SINAL CALL</b> — {DERIV_SYMBOL}\n🕐 {msg_time}\nRSI: {latest_rsi:.2f}")
+                        last_signal = "CALL"
+
+        except Exception as e:
+            print(f"⚠️ Erro no loop Deriv: {e}")
+            await asyncio.sleep(5)
+            continue
+
+# =======================
+# 🌐 Servidor Flask
+# =======================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "🤖 Bot de Sinais Deriv Online ✅"
 
-def start_bot():
+def start_bot_thread():
     asyncio.run(deriv_loop())
 
 if __name__ == "__main__":
-    threading.Thread(target=start_bot).start()
+    # Inicia o bot em segundo plano
+    threading.Thread(target=start_bot_thread, daemon=True).start()
+    # Inicia o Flask (Render detecta essa porta)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
