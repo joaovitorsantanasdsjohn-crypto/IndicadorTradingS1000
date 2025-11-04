@@ -50,13 +50,24 @@ The bot uses ticks from Deriv and aggregates 5-minute candles locally to keep in
 
 """
 
-import os import asyncio import json import time from collections import defaultdict, deque from datetime import datetime, timezone
+import os 
+import asyncio 
+import json 
+import time from collections 
+import defaultdict, deque from datetime 
+import datetime, timezone
 
-import pandas as pd import requests import websockets from dotenv import load_dotenv
+import pandas as pd 
+import requests 
+import websockets from dotenv 
+import load_dotenv
 
 Optional: technical analysis helpers from ta package
 
-from ta.trend import EMAIndicator from ta.momentum import RSIIndicator from ta.volatility import BollingerBands
+from ta.trend 
+import EMAIndicator from ta.momentum 
+import RSIIndicator from ta.volatility 
+import BollingerBands
 
 load_dotenv()
 
