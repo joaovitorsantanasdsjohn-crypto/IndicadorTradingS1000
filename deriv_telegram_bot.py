@@ -17,12 +17,11 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DERIV_APP_ID = os.getenv("DERIV_APP_ID")
-SYMBOL = "frxEURUSD"  # Par que estamos analisando
+SYMBOLS = ["frxEURUSD", "frxEURJPY", "frxUSDCHF"]  # Lista de pares
 TIMEFRAME = 5  # candles de 5 minutos
 
 # ====== FUNÇÕES AUXILIARES ======
 def enviar_telegram(msg):
-    """Envia mensagens formatadas para o Telegram"""
     if TELEGRAM_TOKEN and CHAT_ID:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         requests.get(url, params={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"})
@@ -30,15 +29,13 @@ def enviar_telegram(msg):
     else:
         print("⚠️ Token ou Chat ID não configurados.")
 
-async def conectar_deriv():
-    """Conecta ao WebSocket da Deriv e analisa candles"""
+async def conectar_deriv_para_simbolo(simbolo):
     url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-    print("🚀 Conectando ao WebSocket da Deriv...")
+    print(f"🚀 Conectando ao WebSocket da Deriv para {simbolo}...")
 
     async with websockets.connect(url) as ws:
-        # Solicita o stream de candles
         await ws.send(json.dumps({
-            "ticks_history": SYMBOL,
+            "ticks_history": simbolo,
             "adjust_start_time": 1,
             "count": 200,
             "end": "latest",
@@ -81,12 +78,12 @@ async def conectar_deriv():
 
                 # COMPRA
                 if ema_alinhadas_compra and rsi_compra and perto_banda_inferior:
-                    msg = f"🟢 <b>SINAL DE COMPRA</b>\n⏰ {msg_time} UTC\n💱 Par: {SYMBOL}\n⏳ Candle: {TIMEFRAME}m"
+                    msg = f"🟢 <b>SINAL DE COMPRA</b>\n⏰ {msg_time} UTC\n💱 Par: {simbolo}\n⏳ Candle: {TIMEFRAME}m"
                     enviar_telegram(msg)
 
                 # VENDA
                 elif ema_alinhadas_venda and rsi_venda and perto_banda_superior:
-                    msg = f"🔴 <b>SINAL DE VENDA</b>\n⏰ {msg_time} UTC\n💱 Par: {SYMBOL}\n⏳ Candle: {TIMEFRAME}m"
+                    msg = f"🔴 <b>SINAL DE VENDA</b>\n⏰ {msg_time} UTC\n💱 Par: {simbolo}\n⏳ Candle: {TIMEFRAME}m"
                     enviar_telegram(msg)
 
             await asyncio.sleep(5)
@@ -98,17 +95,15 @@ app = Flask(__name__)
 def home():
     return "✅ Bot de Análise Deriv ativo no Render!"
 
+# ====== INÍCIO DO BOT ======
 def iniciar_bot():
-    """Inicia o bot em thread separada"""
-    asyncio.run(conectar_deriv())
+    """Cria tasks para cada símbolo"""
+    async def main():
+        tasks = [conectar_deriv_para_simbolo(sim) for sim in SYMBOLS]
+        await asyncio.gather(*tasks)
+    asyncio.run(main())
 
-# ====== MAIN ======
 if __name__ == "__main__":
-    # Envia mensagem de confirmação
     enviar_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise!")
-
-    # Inicia o bot em paralelo
     threading.Thread(target=iniciar_bot, daemon=True).start()
-
-    # Mantém o serviço online
     app.run(host="0.0.0.0", port=10000)
