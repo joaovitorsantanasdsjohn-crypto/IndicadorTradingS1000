@@ -5,7 +5,6 @@ import pandas as pd
 import numpy as np
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
-from ta.volatility import BollingerBands
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
@@ -24,30 +23,13 @@ CANDLE_INTERVAL = 5  # minutos
 SYMBOLS = os.getenv("SYMBOLS", "").split(",")
 
 if not SYMBOLS or SYMBOLS == [""]:
-    # Lista padrão com 20 pares Forex mais populares e lucrativos
     SYMBOLS = [
-        "frxEURUSD",
-        "frxUSDJPY",
-        "frxGBPUSD",
-        "frxUSDCHF",
-        "frxAUDUSD",
-        "frxUSDCAD",
-        "frxNZDUSD",
-        "frxEURJPY",
-        "frxGBPJPY",
-        "frxEURGBP",
-        "frxEURAUD",
-        "frxAUDJPY",
-        "frxCHFJPY",
-        "frxCADJPY",
-        "frxGBPAUD",
-        "frxGBPCAD",
-        "frxAUDNZD",
-        "frxEURCAD",
-        "frxUSDNOK",
-        "frxUSDSEK",
+        "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
+        "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
+        "frxEURAUD", "frxAUDJPY", "frxCHFJPY", "frxCADJPY", "frxGBPAUD",
+        "frxGBPCAD", "frxAUDNZD", "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
     ]
-    
+
 # ---------------- Função Telegram ----------------
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -63,10 +45,6 @@ def calcular_indicadores(df):
     df['ema_media'] = EMAIndicator(df['close'], window=10).ema_indicator()
     df['ema_longa'] = EMAIndicator(df['close'], window=20).ema_indicator()
     df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
-    bb = BollingerBands(df['close'], window=20, window_dev=2)
-    df['bb_medio'] = bb.bollinger_mavg()
-    df['bb_sup'] = bb.bollinger_hband()
-    df['bb_inf'] = bb.bollinger_lband()
     return df
 
 # ---------------- Gerar Sinal ----------------
@@ -75,13 +53,11 @@ def gerar_sinal(df):
     if (
         ultima['close'] > ultima['ema_curta'] > ultima['ema_media'] > ultima['ema_longa']
         and ultima['rsi'] > 50
-        and ultima['close'] > ultima['bb_medio']
     ):
         return "COMPRA"
     elif (
         ultima['close'] < ultima['ema_curta'] < ultima['ema_media'] < ultima['ema_longa']
         and ultima['rsi'] < 50
-        and ultima['close'] < ultima['bb_medio']
     ):
         return "VENDA"
     else:
@@ -100,7 +76,7 @@ async def monitor_symbol(symbol):
                 req = {
                     "ticks_history": symbol,
                     "count": 100,
-                    "granularity": CANDLE_INTERVAL*60,
+                    "granularity": CANDLE_INTERVAL * 60,
                     "style": "candles"
                 }
                 await ws.send(json.dumps(req))
@@ -130,7 +106,7 @@ async def monitor_symbol(symbol):
                         send_telegram(f"❌ Erro no WebSocket para {symbol}: {e}")
                         break
 
-                    await asyncio.sleep(CANDLE_INTERVAL*60)
+                    await asyncio.sleep(CANDLE_INTERVAL * 60)
 
         except Exception as e:
             send_telegram(f"🔄 Tentando reconectar WebSocket para {symbol} após erro: {e}")
@@ -150,7 +126,6 @@ def run_flask():
 
 # ---------------- Função Principal ----------------
 async def main():
-    # Inicia Flask em thread separada
     threading.Thread(target=run_flask, daemon=True).start()
 
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise!")
