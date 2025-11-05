@@ -20,20 +20,34 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 CANDLE_INTERVAL = 5  # minutos
 
-# Lista ampliada de pares Forex (10 pares mais líquidos)
-SYMBOLS = [
-    "frxEURUSD",  # Euro / Dólar
-    "frxUSDJPY",  # Dólar / Iene
-    "frxGBPUSD",  # Libra / Dólar
-    "frxUSDCHF",  # Dólar / Franco Suíço
-    "frxAUDUSD",  # Dólar Australiano / Dólar
-    "frxUSDCAD",  # Dólar / Dólar Canadense
-    "frxEURJPY",  # Euro / Iene
-    "frxEURGBP",  # Euro / Libra
-    "frxEURAUD",  # Euro / Dólar Australiano
-    "frxNZDUSD"   # Dólar Neozelandês / Dólar
-]
+# Lê os pares da variável de ambiente SYMBOLS
+SYMBOLS = os.getenv("SYMBOLS", "").split(",")
 
+if not SYMBOLS or SYMBOLS == [""]:
+    # Lista padrão com 20 pares Forex mais populares e lucrativos
+    SYMBOLS = [
+        "frxEURUSD",
+        "frxUSDJPY",
+        "frxGBPUSD",
+        "frxUSDCHF",
+        "frxAUDUSD",
+        "frxUSDCAD",
+        "frxNZDUSD",
+        "frxEURJPY",
+        "frxGBPJPY",
+        "frxEURGBP",
+        "frxEURAUD",
+        "frxAUDJPY",
+        "frxCHFJPY",
+        "frxCADJPY",
+        "frxGBPAUD",
+        "frxGBPCAD",
+        "frxAUDNZD",
+        "frxEURCAD",
+        "frxUSDNOK",
+        "frxUSDSEK",
+    ]
+    
 # ---------------- Função Telegram ----------------
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
