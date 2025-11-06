@@ -4,7 +4,6 @@ import json
 import pandas as pd
 import numpy as np
 from ta.trend import EMAIndicator
-from ta.momentum import RSIIndicator
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
@@ -42,23 +41,15 @@ def send_telegram(message):
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df):
     df['ema_curta'] = EMAIndicator(df['close'], window=5).ema_indicator()
-    df['ema_media'] = EMAIndicator(df['close'], window=10).ema_indicator()
     df['ema_longa'] = EMAIndicator(df['close'], window=20).ema_indicator()
-    df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
     return df
 
 # ---------------- Gerar Sinal ----------------
 def gerar_sinal(df):
     ultima = df.iloc[-1]
-    if (
-        ultima['close'] > ultima['ema_curta'] > ultima['ema_media'] > ultima['ema_longa']
-        and ultima['rsi'] > 50
-    ):
+    if ultima['ema_curta'] > ultima['ema_longa']:
         return "COMPRA"
-    elif (
-        ultima['close'] < ultima['ema_curta'] < ultima['ema_media'] < ultima['ema_longa']
-        and ultima['rsi'] < 50
-    ):
+    elif ultima['ema_curta'] < ultima['ema_longa']:
         return "VENDA"
     else:
         return None
