@@ -3,6 +3,7 @@ import websockets
 import json
 import pandas as pd
 import numpy as np
+from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
 import requests
@@ -35,40 +36,49 @@ def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        requests.post(url, data=payload)
+        requests.post(url, data=payload, timeout=10)
     except Exception as e:
+        # Não falhar por causa de Telegram; logamos
         print(f"Erro ao enviar Telegram: {e}")
 
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df):
+    df['ema_curta'] = EMAIndicator(df['close'], window=5).ema_indicator()
+    df['ema_media'] = EMAIndicator(df['close'], window=10).ema_indicator()
+    df['ema_longa'] = EMAIndicator(df['close'], window=20).ema_indicator()
     df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
     bb = BollingerBands(df['close'], window=20, window_dev=2)
-    df['bb_high'] = bb.bollinger_hband()
-    df['bb_low'] = bb.bollinger_lband()
+    df['bb_medio'] = bb.bollinger_mavg()
+    df['bb_sup'] = bb.bollinger_hband()
+    df['bb_inf'] = bb.bollinger_lband()
     return df
 
 # ---------------- Gerar Sinal ----------------
 def gerar_sinal(df):
     ultima = df.iloc[-1]
-
-    condicao_compra = ultima['close'] <= ultima['bb_low'] and ultima['rsi'] < 30
-    condicao_venda = ultima['close'] >= ultima['bb_high'] and ultima['rsi'] > 70
-
-    if condicao_compra:
+    if (
+        ultima['close'] > ultima['ema_curta'] > ultima['ema_media'] > ultima['ema_longa']
+        and ultima['rsi'] > 50
+        and ultima['close'] > ultima['bb_medio']
+    ):
         return "COMPRA"
-    elif condicao_venda:
+    elif (
+        ultima['close'] < ultima['ema_curta'] < ultima['ema_media'] < ultima['ema_longa']
+        and ultima['rsi'] < 50
+        and ultima['close'] < ultima['bb_medio']
+    ):
         return "VENDA"
     else:
         return None
 
 # ---------------- Monitoramento WebSocket ----------------
 async def monitor_symbol(symbol):
-    url = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+    url = f"wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
     while True:
         try:
             async with websockets.connect(url, ping_interval=20) as ws:
-                send_telegram(f"✅ Conexão ativa com WebSocket da Deriv para {symbol}!")
+                send_telegram(f"✅ Conexão ativa com WebSocket da Deriv para *{symbol}*!")
                 print(f"🚀 Conexão ativa com WebSocket da Deriv para {symbol}")
 
                 req = {
@@ -85,35 +95,43 @@ async def monitor_symbol(symbol):
                         response = await ws.recv()
                         data = json.loads(response)
 
-                        # --- 🔧 Correção da Opção 1: detecta candles em ambos formatos ---
-                        if "candles" in data or "candles" in data.get("history", {}):
-                            candles = (
-                                data["candles"]
-                                if "candles" in data
-                                else data["history"]["candles"]
-                            )
-
+                        if "history" in data:
+                            candles = data["history"]["candles"]
                             df = pd.DataFrame(candles)
                             df['close'] = df['close'].astype(float)
                             df['open'] = df['open'].astype(float)
+                            # calcula indicadores
                             df = calcular_indicadores(df)
 
                             if first_response:
-                                send_telegram(f"📡 Primeira resposta de candles recebida do WebSocket ({symbol})!")
+                                # confirmação concreta: quantidade de candles + último fechamento
+                                n_candles = len(df)
+                                last_close = df['close'].iloc[-1]
+                                msg = (
+                                    f"📡 Primeira resposta de candles recebida do WebSocket ({symbol})!\n"
+                                    f"✅ *{n_candles}* candles baixados\n"
+                                    f"🔹 Último fechamento: `{last_close}`"
+                                )
+                                send_telegram(msg)
+                                # também imprime nos logs do Render
+                                print(f"[{symbol}] Primeira resposta: {n_candles} candles, last_close={last_close}")
                                 first_response = False
 
                             sinal = gerar_sinal(df)
                             if sinal:
-                                send_telegram(f"💹 Sinal {sinal} detectado para {symbol} (vela {CANDLE_INTERVAL} min)")
+                                send_telegram(f"💹 Sinal *{sinal}* detectado para *{symbol}* (vela {CANDLE_INTERVAL} min)")
+                                print(f"[{symbol}] Sinal {sinal} detectado")
 
                     except Exception as e:
-                        send_telegram(f"❌ Erro no WebSocket para {symbol}: {e}")
+                        send_telegram(f"❌ Erro no WebSocket para *{symbol}*: {e}")
+                        print(f"❌ Erro no WebSocket {symbol}: {e}")
                         break
 
+                    # espera próxima vela completa
                     await asyncio.sleep(CANDLE_INTERVAL * 60)
 
         except Exception as e:
-            send_telegram(f"🔄 Tentando reconectar WebSocket para {symbol} após erro: {e}")
+            send_telegram(f"🔄 Tentando reconectar WebSocket para *{symbol}* após erro: {e}")
             print(f"🔄 Reconectando {symbol} depois de erro: {e}")
             await asyncio.sleep(5)
 
@@ -126,10 +144,12 @@ def index():
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    # enable threaded=True para aceitar múltiplos HEADs do UptimeRobot sem travar
+    app.run(host="0.0.0.0", port=port, threaded=True)
 
 # ---------------- Função Principal ----------------
 async def main():
+    # Inicia Flask em thread separada
     threading.Thread(target=run_flask, daemon=True).start()
 
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise!")
