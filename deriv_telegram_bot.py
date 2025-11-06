@@ -2,9 +2,11 @@ import asyncio
 import websockets
 import json
 import pandas as pd
+import numpy as np
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
 import requests
+from datetime import datetime
 from dotenv import load_dotenv
 import os
 import threading
@@ -39,56 +41,39 @@ def send_telegram(message):
 
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df):
-    # RSI
-    rsi = RSIIndicator(df['close'], window=14)
-    df['rsi'] = rsi.rsi()
-
-    # Bandas de Bollinger
+    df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
     bb = BollingerBands(df['close'], window=20, window_dev=2)
-    df['bb_medio'] = bb.bollinger_mavg()
-    df['bb_sup'] = bb.bollinger_hband()
-    df['bb_inf'] = bb.bollinger_lband()
-
+    df['bb_high'] = bb.bollinger_hband()
+    df['bb_low'] = bb.bollinger_lband()
     return df
 
 # ---------------- Gerar Sinal ----------------
 def gerar_sinal(df):
     ultima = df.iloc[-1]
 
-    sinal_rsi = None
-    sinal_bb = None
+    condicao_compra = ultima['close'] <= ultima['bb_low'] and ultima['rsi'] < 30
+    condicao_venda = ultima['close'] >= ultima['bb_high'] and ultima['rsi'] > 70
 
-    # Critério RSI
-    if ultima['rsi'] < 30:
-        sinal_rsi = "COMPRA"
-    elif ultima['rsi'] > 70:
-        sinal_rsi = "VENDA"
-
-    # Critério Bandas de Bollinger
-    if ultima['close'] < ultima['bb_inf']:
-        sinal_bb = "COMPRA"
-    elif ultima['close'] > ultima['bb_sup']:
-        sinal_bb = "VENDA"
-
-    # Só envia sinal se os dois indicadores concordarem
-    if sinal_rsi == sinal_bb and sinal_rsi is not None:
-        return sinal_rsi
+    if condicao_compra:
+        return "COMPRA"
+    elif condicao_venda:
+        return "VENDA"
     else:
         return None
 
 # ---------------- Monitoramento WebSocket ----------------
 async def monitor_symbol(symbol):
-    url = f"wss://ws.binaryws.com/websockets/v3?app_id=1089"
+    url = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
 
     while True:
         try:
             async with websockets.connect(url, ping_interval=20) as ws:
-                print(f"[{symbol}] ✅ WebSocket conectado com sucesso!")
                 send_telegram(f"✅ Conexão ativa com WebSocket da Deriv para {symbol}!")
+                print(f"🚀 Conexão ativa com WebSocket da Deriv para {symbol}")
 
                 req = {
                     "ticks_history": symbol,
-                    "count": 300,
+                    "count": 100,
                     "granularity": CANDLE_INTERVAL * 60,
                     "style": "candles"
                 }
@@ -100,13 +85,17 @@ async def monitor_symbol(symbol):
                         response = await ws.recv()
                         data = json.loads(response)
 
-                        if "history" in data:
-                            candles = data["history"]["candles"]
-                            print(f"[{symbol}] 🔹 Recebidos {len(candles)} candles.")
+                        # --- 🔧 Correção da Opção 1: detecta candles em ambos formatos ---
+                        if "candles" in data or "candles" in data.get("history", {}):
+                            candles = (
+                                data["candles"]
+                                if "candles" in data
+                                else data["history"]["candles"]
+                            )
+
                             df = pd.DataFrame(candles)
                             df['close'] = df['close'].astype(float)
                             df['open'] = df['open'].astype(float)
-
                             df = calcular_indicadores(df)
 
                             if first_response:
@@ -115,26 +104,17 @@ async def monitor_symbol(symbol):
 
                             sinal = gerar_sinal(df)
                             if sinal:
-                                send_telegram(
-                                    f"💹 *Sinal {sinal}* detectado para *{symbol}* "
-                                    f"(vela {CANDLE_INTERVAL} min)\n"
-                                    f"RSI: {df.iloc[-1]['rsi']:.2f}\n"
-                                    f"Fechamento: {df.iloc[-1]['close']:.5f}"
-                                )
-                                print(f"[{symbol}] 💹 Sinal {sinal} confirmado pelos dois indicadores.")
-                            else:
-                                print(f"[{symbol}] ⚙️ Nenhum sinal de consenso no momento.")
+                                send_telegram(f"💹 Sinal {sinal} detectado para {symbol} (vela {CANDLE_INTERVAL} min)")
 
                     except Exception as e:
-                        print(f"[{symbol}] ⚠️ Erro interno no WebSocket: {e}")
                         send_telegram(f"❌ Erro no WebSocket para {symbol}: {e}")
                         break
 
                     await asyncio.sleep(CANDLE_INTERVAL * 60)
 
         except Exception as e:
-            print(f"[{symbol}] 🔄 Tentando reconectar após erro: {e}")
             send_telegram(f"🔄 Tentando reconectar WebSocket para {symbol} após erro: {e}")
+            print(f"🔄 Reconectando {symbol} depois de erro: {e}")
             await asyncio.sleep(5)
 
 # ---------------- Flask Web Service ----------------
@@ -156,12 +136,7 @@ async def main():
     for symbol in SYMBOLS:
         send_telegram(f"📊 Começando a monitorar **{symbol}**.")
 
-    tasks = []
-    for symbol in SYMBOLS:
-        task = asyncio.create_task(monitor_symbol(symbol))
-        tasks.append(task)
-        await asyncio.sleep(2)
-
+    tasks = [monitor_symbol(symbol) for symbol in SYMBOLS]
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
