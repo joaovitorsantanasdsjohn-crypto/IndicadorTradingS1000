@@ -19,7 +19,7 @@ load_dotenv()
 # ---------------- Configurações ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # minutos
+CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))
 APP_ID = os.getenv("DERIV_APP_ID", "1089")
 
 # Lista de pares
@@ -39,14 +39,20 @@ DATA_DIR.mkdir(exist_ok=True)
 # ---------------- Telegram ----------------
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Telegram não configurado. Mensagem:", message)
+        print("⚠️ Telegram não configurado. Mensagem:", message)
         return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+
     try:
-        requests.post(url, data=payload, timeout=10)
+        response = requests.post(url, data=payload, timeout=10)
+        if response.status_code == 200:
+            print(f"📨 Mensagem enviada ao Telegram: {message[:60]}...")
+        else:
+            print(f"❌ Falha ao enviar para Telegram (HTTP {response.status_code}): {response.text}")
     except Exception as e:
-        print(f"Erro ao enviar Telegram: {e}")
+        print(f"❌ Erro ao enviar Telegram: {e}")
 
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
@@ -71,10 +77,8 @@ def gerar_sinal(df: pd.DataFrame):
     if rsi is None or bb_low is None or bb_up is None:
         return None
 
-    # Compra: preço ≤ banda inferior E RSI ≤ 30
     if close <= bb_low and rsi <= 30:
         return "COMPRA"
-    # Venda: preço ≥ banda superior E RSI ≥ 70
     if close >= bb_up and rsi >= 70:
         return "VENDA"
 
@@ -148,12 +152,12 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                         save_last_candles(df_ind, symbol, max_rows=200)
 
                         if not first_received:
-                            send_telegram(f"📡 [{symbol}] Candles recebidos e armazenados. Último fechamento: {df_ind.iloc[-1]['close']:.5f}")
+                            send_telegram(f"📡 [{symbol}] Candles recebidos. Último fechamento: {df_ind.iloc[-1]['close']:.5f}")
                             first_received = True
 
                         sinal = gerar_sinal(df_ind)
                         if sinal:
-                            send_telegram(f"💹 Sinal {sinal} detectado para {symbol} (vela {CANDLE_INTERVAL} min)")
+                            send_telegram(f"💹 Sinal {sinal} detectado para {symbol} ({CANDLE_INTERVAL} min)")
 
                     else:
                         err_msg = data.get("error", {}).get("message", "sem detalhes")
@@ -186,9 +190,12 @@ async def main():
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise!")
     print("Iniciando monitoramento dos símbolos:", SYMBOLS)
 
+    # Mensagem de teste de conexão com o Telegram
+    send_telegram("🔍 Teste de conexão Telegram: se você recebeu esta mensagem, o bot está OK ✅")
+
     tasks = []
     for i, sym in enumerate(SYMBOLS):
-        delay = i * 5  # atraso de 5 segundos entre cada símbolo
+        delay = i * 5
         tasks.append(asyncio.create_task(monitor_symbol(sym, start_delay=delay)))
 
     await asyncio.gather(*tasks)
