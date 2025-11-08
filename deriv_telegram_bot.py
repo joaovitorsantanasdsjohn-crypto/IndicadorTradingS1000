@@ -19,9 +19,16 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
-APP_ID = os.getenv("DERIV_APP_ID", "1089")  # padrão público
+APP_ID = os.getenv("DERIV_APP_ID", "1089")  # app_id público
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "1"))  # minutos
-SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "").split(",") if s.strip()] or ["frxEURUSD"]
+
+# Lista completa de pares
+SYMBOLS = [
+    "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
+    "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
+    "frxEURAUD", "frxAUDJPY", "frxCHFJPY", "frxCADJPY", "frxGBPAUD",
+    "frxGBPCAD", "frxAUDNZD", "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
+]
 
 DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -31,9 +38,10 @@ ws_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
 
 # ---------------- FLASK PARA UPTIME ----------------
 app = Flask(__name__)
+
 @app.route('/')
 def home():
-    return "✅ Bot Deriv ativo e rodando"
+    return "✅ Bot Deriv ativo e rodando normalmente"
 
 def run_flask():
     app.run(host="0.0.0.0", port=10000)
@@ -73,7 +81,6 @@ def gerar_sinal(df: pd.DataFrame):
     bb_low = ultima["bb_lower"]
     bb_up = ultima["bb_upper"]
 
-    # Condições combinadas RSI + Bollinger
     if close <= bb_low and rsi <= 30:
         return "📈 *SINAL DE COMPRA* — RSI e Bandas concordam"
     if close >= bb_up and rsi >= 70:
@@ -158,15 +165,14 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
             print(f"⚠️ Conexão perdida em {symbol}: {e}")
             send_telegram(f"⚠️ Reconectando {symbol} em {retry_delay}s...")
             await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 120)  # aumenta até 2 min
-
+            retry_delay = min(retry_delay * 2, 120)
 
 # ---------------- INICIALIZAÇÃO ----------------
 async def main():
-    send_telegram("🤖 Bot Deriv iniciado com sucesso e pronto para análise!")
+    send_telegram("🤖 Bot Deriv iniciado com sucesso e pronto para análise dos 20 pares!")
     tasks = []
     for i, sym in enumerate(SYMBOLS):
-        tasks.append(asyncio.create_task(monitor_symbol(sym, start_delay=i * 3)))
+        tasks.append(asyncio.create_task(monitor_symbol(sym, start_delay=i * 5)))
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
