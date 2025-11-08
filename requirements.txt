@@ -1,6 +1,8 @@
-pandas
-websockets
-requests
-ta
-python-dotenv
-flask
+pandas==2.3.3
+numpy==2.3.4
+requests==2.32.5
+websockets==15.0.1
+python-dotenv==1.2.1
+flask==3.1.2
+ta==0.11.0
+pyTelegramBotAPI==4.13.0
