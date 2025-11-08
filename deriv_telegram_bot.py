@@ -24,7 +24,7 @@ DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # TOKEN API DERIV
 APP_ID = os.getenv("DERIV_APP_ID", "1089")
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # minutos
 
-# Lista de pares
+# Lista de pares de moedas
 SYMBOLS = [
     "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
     "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
@@ -32,7 +32,7 @@ SYMBOLS = [
     "frxGBPCAD", "frxAUDNZD", "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
 ]
 
-# Diretório para candles
+# Diretório para salvar candles
 DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -41,11 +41,12 @@ MAX_CONCURRENT_WS = 3
 ws_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
 
 # Controle de mensagens para evitar flood
-last_connection_notify = {}
-last_signal_sent = {}
+last_connection_notify = {}  # armazena última notificação de conexão
+last_signal_sent = {}        # armazena última notificação de sinal
 
 # ---------------- FUNÇÃO TELEGRAM ----------------
 def send_telegram(message: str):
+    """Envia mensagem no Telegram."""
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("⚠️ Telegram não configurado. Mensagem:", message)
         return
@@ -59,6 +60,7 @@ def send_telegram(message: str):
 
 # ---------------- INDICADORES ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula RSI e Bandas de Bollinger."""
     if len(df) < 20:
         return df
     df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
@@ -70,6 +72,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------- GERAR SINAL ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
+    """Gera sinal apenas se RSI e Bollinger concordarem."""
     if len(df) < 20:
         return None
     ultima = df.iloc[-1]
@@ -88,8 +91,9 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         return "VENDA"
     return None
 
-# ---------------- MONTAGEM DE CANDLE ----------------
+# ---------------- GERAR CANDLE ----------------
 def add_tick_to_candles(candles, tick, interval_sec):
+    """Atualiza a lista de candles com o novo tick."""
     epoch = int(tick["epoch"])
     price = float(tick["quote"])
     candle_time = epoch - (epoch % interval_sec)
@@ -101,16 +105,19 @@ def add_tick_to_candles(candles, tick, interval_sec):
         c["high"] = max(c["high"], price)
         c["low"] = min(c["low"], price)
         c["close"] = price
-    return candles[-200:]  # mantém últimas 200 velas
+
+    return candles[-200:]  # mantém as últimas 200 velas
 
 # ---------------- SALVAR CANDLES ----------------
 def save_last_candles(df: pd.DataFrame, symbol: str):
+    """Salva as velas localmente."""
     path = DATA_DIR / f"candles_{symbol}.csv"
     df.to_csv(path, index=False)
     print(f"[{symbol}] {len(df)} velas salvas em {path}")
 
-# ---------------- WEBSOCKET (tick a tick) ----------------
+# ---------------- WEBSOCKET ----------------
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
+    """Mantém conexão com WebSocket da Deriv para um par."""
     await asyncio.sleep(start_delay)
     interval_sec = CANDLE_INTERVAL * 60
     candles = []
@@ -121,7 +128,7 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
             try:
                 url = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
                 async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
-                    # Autoriza com token
+                    # Autoriza token
                     await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                     auth_resp = json.loads(await ws.recv())
                     if "error" in auth_resp:
@@ -133,6 +140,7 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                     await ws.send(json.dumps({"ticks_subscribe": symbol}))
 
                     now = time.time()
+                    # Só envia mensagem de conexão se for primeira vez ou passou 10 minutos
                     if symbol not in last_connection_notify or now - last_connection_notify[symbol] > 600:
                         send_telegram(f"✅ Conexão WebSocket ativa para {symbol}")
                         last_connection_notify[symbol] = now
@@ -140,6 +148,7 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                     print(f"[{symbol}] WebSocket ativo.")
                     retry_delay = 5
 
+                    # Loop principal de recepção
                     while True:
                         msg = await ws.recv()
                         data = json.loads(msg)
@@ -162,7 +171,11 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
 
             except Exception as e:
                 print(f"⚠️ {symbol} desconectado: {e}")
-                send_telegram(f"⚠️ Reconectando {symbol} em {retry_delay}s...")
+                now = time.time()
+                # só envia mensagem de reconexão se passou 10 min da última
+                if symbol not in last_connection_notify or now - last_connection_notify[symbol] > 600:
+                    send_telegram(f"⚠️ Reconectando {symbol} em {retry_delay}s...")
+                    last_connection_notify[symbol] = now
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 120)
 
@@ -180,13 +193,12 @@ def run_flask():
 # ---------------- MAIN ----------------
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
-
     send_telegram("✅ Bot iniciado no Render e pronto para análise!")
     print("Monitorando pares:", SYMBOLS)
 
     tasks = []
     for i, sym in enumerate(SYMBOLS):
-        delay = (i // MAX_CONCURRENT_WS) * 10
+        delay = (i // MAX_CONCURRENT_WS) * 10  # espaça as conexões
         tasks.append(asyncio.create_task(monitor_symbol(sym, start_delay=delay)))
 
     await asyncio.gather(*tasks)
