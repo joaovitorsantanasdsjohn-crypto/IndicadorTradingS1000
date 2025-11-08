@@ -1,0 +1,94 @@
+# ================================
+# GERAL
+# ================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.so
+*.dll
+*.log
+*.tmp
+*.swp
+*.bak
+*.old
+
+# ================================
+# AMBIENTE VIRTUAL
+# ================================
+venv/
+env/
+ENV/
+.venv/
+.python-version
+Pipfile
+Pipfile.lock
+poetry.lock
+
+# ================================
+# CONFIGURAÇÕES E SEGREDOS
+# ================================
+.env
+.env.*
+*.env.local
+secrets.json
+config.json
+
+# ================================
+# CACHES / COMPILAÇÃO
+# ================================
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+develop-eggs/
+.installed.cfg
+MANIFEST
+
+# ================================
+# NOTEBOOKS / SAÍDAS
+# ================================
+.ipynb_checkpoints
+*.ipynb
+*.nbconvert.ipynb
+
+# ================================
+# SISTEMA / IDEs
+# ================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# ================================
+# RENDER / DEPLOY
+# ================================
+render.yaml
+*.db
+*.sqlite3
+logs/
+nohup.out
+
+# ================================
+# DADOS DO BOT
+# ================================
+candles_data/
+*.csv
+*.json
+*.txt
+
+# ================================
+# BACKUPS / TEMPORÁRIOS
+# ================================
+*.tar
+*.gz
+*.zip
+*.7z
+*.rar
+*.bak
+*.tmp
+*.backup
