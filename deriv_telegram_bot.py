@@ -1,117 +1,195 @@
-import os
-import json
-import time
-import threading
+# deriv_telegram_bot.py
 import asyncio
 import websockets
-import numpy as np
+import json
 import pandas as pd
-import telebot
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands
+import requests
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+import os
+import threading
 from flask import Flask
-from datetime import datetime, timedelta
+from pathlib import Path
+import time
 
-# ==========================================
-# CONFIGURAÇÕES
-# ==========================================
-DERIV_TOKEN = os.getenv("DERIV_TOKEN")
+load_dotenv()
+
+# ---------------- Configurações ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID = os.getenv("CHAT_ID")  # ✅ corrigido conforme solicitado
+CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # ✅ padrão 5 minutos
+APP_ID = os.getenv("DERIV_APP_ID", "1089")  # ✅ APP_ID explícito configurável
 
-app = Flask(__name__)
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
-PAIRS = [
-    "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxAUDUSD", "frxUSDCAD",
-    "frxUSDCHF", "frxNZDUSD", "frxEURAUD", "frxEURGBP", "frxEURJPY",
-    "frxGBPJPY", "frxAUDJPY", "frxCADJPY", "frxCHFJPY", "frxGBPCAD",
-    "frxGBPAUD", "frxAUDNZD", "frxUSDNOK", "frxUSDSEK", "frxEURCAD"
+# Lista de 20 pares
+SYMBOLS = [
+    "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
+    "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
+    "frxEURAUD", "frxAUDJPY", "frxCHFJPY", "frxCADJPY", "frxGBPAUD",
+    "frxGBPCAD", "frxAUDNZD", "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
 ]
 
-RECONNECT_COOLDOWN = 600  # 10 minutos
-last_reconnect_notification = {}
+# Diretório para salvar candles
+DATA_DIR = Path("./candles_data")
+DATA_DIR.mkdir(exist_ok=True)
 
-# ==========================================
-# FUNÇÕES DE ANÁLISE (RSI + BOLLINGER)
-# ==========================================
-def rsi(prices, period=14):
-    delta = np.diff(prices)
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(window=period).mean()
-    avg_loss = pd.Series(loss).rolling(window=period).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+# Limite de conexões simultâneas (3)
+MAX_CONCURRENT_WS = 3
+ws_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
 
-def bollinger_bands(prices, period=20, std_dev=2):
-    series = pd.Series(prices)
-    sma = series.rolling(window=period).mean()
-    std = series.rolling(window=period).std()
-    upper_band = sma + (std * std_dev)
-    lower_band = sma - (std * std_dev)
-    return upper_band, lower_band
+# Dicionário para controle de mensagens (limite 1 por 10min por par)
+last_notify_time = {}
 
-# ==========================================
-# FUNÇÃO PRINCIPAL DE CONEXÃO
-# ==========================================
-async def connect_to_deriv(symbol):
-    url = f"wss://ws.derivws.com/websockets/v3?app_id=1089&l=EN"
-    headers = [("Authorization", f"Bearer {DERIV_TOKEN}")]
-    candles = []
+# ---------------- Telegram ----------------
+def send_telegram(message: str, symbol: str = None):
+    now = time.time()
+    if symbol:
+        last_time = last_notify_time.get(symbol, 0)
+        if now - last_time < 600:  # 10 minutos
+            return
+        last_notify_time[symbol] = now
+
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("⚠️ Telegram não configurado. Mensagem:", message)
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+
+    try:
+        response = requests.post(url, data=payload, timeout=10)
+        if response.status_code == 200:
+            print("📨 Telegram:", message[:100])
+        else:
+            print(f"❌ Erro Telegram {response.status_code}: {response.text}")
+    except Exception as e:
+        print(f"❌ Erro ao enviar Telegram: {e}")
+
+# ---------------- Indicadores ----------------
+def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values('epoch').reset_index(drop=True)
+    df['close'] = df['close'].astype(float)
+    df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
+    bb = BollingerBands(df['close'], window=20, window_dev=2)
+    df['bb_mavg'] = bb.bollinger_mavg()
+    df['bb_upper'] = bb.bollinger_hband()
+    df['bb_lower'] = bb.bollinger_lband()
+    return df
+
+# ---------------- Sinais ----------------
+def gerar_sinal(df: pd.DataFrame):
+    ultima = df.iloc[-1]
+    close = float(ultima['close'])
+    rsi = ultima['rsi']
+    bb_low = ultima['bb_lower']
+    bb_up = ultima['bb_upper']
+
+    if pd.isna(rsi) or pd.isna(bb_low) or pd.isna(bb_up):
+        return None
+
+    if close <= bb_low and rsi <= 30:
+        return "COMPRA"
+    elif close >= bb_up and rsi >= 70:
+        return "VENDA"
+    return None
+
+# ---------------- Candles ----------------
+def save_last_candles(df: pd.DataFrame, symbol: str):
+    path = DATA_DIR / f"candles_{symbol}.csv"
+    df.tail(200).to_csv(path, index=False)
+    print(f"[{symbol}] Salvou {len(df)} candles.")
+
+# ---------------- Utilitários ----------------
+def seconds_to_next_candle(interval_minutes: int):
+    now = datetime.now(timezone.utc)
+    total_seconds = int(now.timestamp())
+    period = interval_minutes * 60
+    return (period - (total_seconds % period)) or period
+
+# ---------------- WebSocket ----------------
+async def monitor_symbol(symbol: str, start_delay: float = 0.0):
+    await asyncio.sleep(start_delay)
+    url = f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
+    backoff_seconds = 5
+    connected_once = False
 
     while True:
+        await ws_semaphore.acquire()
         try:
-            async with websockets.connect(url, extra_headers=headers) as ws:
-                await ws.send(json.dumps({"ticks_history": symbol, "adjust_start_time": 1, "count": 1000, "end": "latest", "granularity": 60}))
-                await ws.send(json.dumps({"ticks": symbol, "subscribe": 1}))
-                await bot.send_message(CHAT_ID, f"✅ Conexão ativa com WebSocket da Deriv para {symbol}")
+            async with websockets.connect(url) as ws:
+                if not connected_once:
+                    send_telegram(f"✅ Conexão ativa com WebSocket da Deriv para {symbol}", symbol)
+                    connected_once = True
 
-                async for msg in ws:
-                    data = json.loads(msg)
-                    if "tick" in data:
-                        tick_time = datetime.utcfromtimestamp(data["tick"]["epoch"])
-                        tick_price = float(data["tick"]["quote"])
-                        candles.append({"time": tick_time, "price": tick_price})
+                print(f"[{symbol}] Conectado.")
+                first_received = False
 
-                        df = pd.DataFrame(candles[-100:])
-                        if len(df) > 20:
-                            rsi_value = rsi(df["price"].values)[-1]
-                            upper, lower = bollinger_bands(df["price"].values)
-                            last_price = df["price"].iloc[-1]
+                while True:
+                    wait = seconds_to_next_candle(CANDLE_INTERVAL)
+                    await asyncio.sleep(wait + 1)
 
-                            if rsi_value < 30 and last_price < lower.iloc[-1]:
-                                await bot.send_message(CHAT_ID, f"📉 VENDA detectada em {symbol} — RSI={rsi_value:.2f}")
-                            elif rsi_value > 70 and last_price > upper.iloc[-1]:
-                                await bot.send_message(CHAT_ID, f"📈 COMPRA detectada em {symbol} — RSI={rsi_value:.2f}")
+                    req = {
+                        "ticks_history": symbol,
+                        "count": 500,
+                        "end": "latest",
+                        "granularity": CANDLE_INTERVAL * 60,
+                        "style": "candles"
+                    }
+                    await ws.send(json.dumps(req))
+                    try:
+                        data = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+                    except asyncio.TimeoutError:
+                        send_telegram(f"⚠️ Timeout para {symbol}", symbol)
+                        break
 
+                    if "history" in data and "candles" in data["history"]:
+                        df = pd.DataFrame(data["history"]["candles"])
+                        df['close'] = df['close'].astype(float)
+                        df_ind = calcular_indicadores(df)
+                        save_last_candles(df_ind, symbol)
+
+                        if not first_received:
+                            send_telegram(f"📡 [{symbol}] Último fechamento: {df_ind.iloc[-1]['close']:.5f}", symbol)
+                            first_received = True
+
+                        sinal = gerar_sinal(df_ind)
+                        if sinal:
+                            send_telegram(f"💹 Sinal {sinal} detectado para {symbol} ({CANDLE_INTERVAL} min)", symbol)
+                    else:
+                        send_telegram(f"⚠️ Erro ao obter dados de {symbol}", symbol)
+                        break
         except Exception as e:
-            now = time.time()
-            last_time = last_reconnect_notification.get(symbol, 0)
-            if now - last_time >= RECONNECT_COOLDOWN:
-                await bot.send_message(CHAT_ID, f"⚠️ Reconectando {symbol}: {e}")
-                last_reconnect_notification[symbol] = now
-            await asyncio.sleep(5)
+            send_telegram(f"⚠️ Erro ou desconexão no WebSocket de {symbol}: {e}", symbol)
+        finally:
+            ws_semaphore.release()
+            await asyncio.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, 120)
 
-# ==========================================
-# LOOP PRINCIPAL DO BOT
-# ==========================================
+# ---------------- Flask ----------------
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "Bot ativo ✅"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+# ---------------- Principal ----------------
 async def main():
-    await bot.send_message(CHAT_ID, "✅ Bot iniciado com sucesso no Render e pronto para análise!")
-    tasks = [asyncio.create_task(connect_to_deriv(symbol)) for symbol in PAIRS]
+    threading.Thread(target=run_flask, daemon=True).start()
+    send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise!")
+    send_telegram("🔍 Teste de conexão Telegram: se você recebeu esta mensagem, o bot está OK ✅")
+
+    tasks = []
+    for i, sym in enumerate(SYMBOLS):
+        tasks.append(asyncio.create_task(monitor_symbol(sym, start_delay=i * 5)))
     await asyncio.gather(*tasks)
 
-# ==========================================
-# SERVIDOR FLASK (para manter Render ativo)
-# ==========================================
-@app.route("/")
-def home():
-    return "IndicadorTradingS1000 rodando ✅"
-
-def start_flask():
-    app.run(host="0.0.0.0", port=10000)
-
-# ==========================================
-# INÍCIO
-# ==========================================
 if __name__ == "__main__":
-    threading.Thread(target=start_flask, daemon=True).start()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Encerrando.")
