@@ -22,6 +22,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # minutos
 APP_ID = os.getenv("DERIV_APP_ID", "1089")
+DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 
 # Lista de pares (puxa de env SYMBOLS ou usa lista padrão)
 SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "").split(",") if s.strip()]
@@ -62,7 +63,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     if 'epoch' in df.columns:
         df = df.sort_values('epoch').reset_index(drop=True)
     df['close'] = df['close'].astype(float)
-    # RSI + BollingerBands (conforme pedido)
+    # RSI + BollingerBands
     df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
     bb = BollingerBands(df['close'], window=20, window_dev=2)
     df['bb_mavg'] = bb.bollinger_mavg()
@@ -110,88 +111,58 @@ def seconds_to_next_candle(interval_minutes: int):
     seconds_passed = total_seconds % period
     return (period - seconds_passed) if seconds_passed != 0 else 0
 
-# ---------------- Monitoramento WebSocket (com semaphore para 3 conexões) ----------------
+# ---------------- Monitoramento WebSocket (com token + limitações) ----------------
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     await asyncio.sleep(start_delay)
-
     url = f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
     backoff_seconds = 5
 
     while True:
         await ws_semaphore.acquire()
         try:
-            try:
-                async with websockets.connect(
-                    url,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    open_timeout=15
-                ) as ws:
-                    send_telegram(f"✅ Conexão ativa com WebSocket da Deriv para {symbol}")
-                    print(f"[{symbol}] WebSocket conectado. (slot reservado)")
+            async with websockets.connect(
+                url,
+                ping_interval=20,
+                ping_timeout=10,
+                open_timeout=15
+            ) as ws:
+                # Autenticação com token, se fornecido
+                if DERIV_TOKEN:
+                    await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+                    auth_resp = await ws.recv()
+                    print(f"[{symbol}] Autorizado: {auth_resp}")
 
-                    first_received = False
+                send_telegram(f"✅ Conexão ativa com WebSocket da Deriv para {symbol}")
+                print(f"[{symbol}] WebSocket conectado. (slot reservado)")
 
-                    while True:
-                        wait = seconds_to_next_candle(CANDLE_INTERVAL)
-                        print(f"[{symbol}] Aguardando {wait + 1}s até fechamento da próxima vela.")
-                        if wait > 0:
-                            await asyncio.sleep(wait + 1)
+                first_received = False
 
-                        # tentativas para history (retries)
-                        history_attempts = 0
-                        history_success = False
-                        history_data = None
-                        while history_attempts < 3 and not history_success:
-                            history_attempts += 1
-                            req = {
-                                "ticks_history": symbol,
-                                "count": 500,
-                                "end": "latest",
-                                "granularity": CANDLE_INTERVAL * 60,
-                                "style": "candles"
-                            }
-                            try:
-                                await ws.send(json.dumps(req))
-                            except Exception as e:
-                                print(f"[{symbol}] Erro ao enviar req history (tentativa {history_attempts}): {e}")
-                                await asyncio.sleep(1)
-                                continue
+                while True:
+                    wait = seconds_to_next_candle(CANDLE_INTERVAL)
+                    print(f"[{symbol}] Aguardando {wait + 1}s até fechamento da próxima vela.")
+                    if wait > 0:
+                        await asyncio.sleep(wait + 1)
 
-                            try:
-                                response = await asyncio.wait_for(ws.recv(), timeout=30)
-                            except asyncio.TimeoutError:
-                                print(f"[{symbol}] Timeout aguardando resposta (history) (tentativa {history_attempts}).")
-                                await asyncio.sleep(1)
-                                continue
-                            except Exception as e:
-                                print(f"[{symbol}] Erro recv (history) (tentativa {history_attempts}): {e}")
-                                await asyncio.sleep(1)
-                                continue
+                    # Solicitar histórico de velas
+                    req = {
+                        "ticks_history": symbol,
+                        "count": 500,
+                        "end": "latest",
+                        "granularity": CANDLE_INTERVAL * 60,
+                        "style": "candles"
+                    }
+                    await ws.send(json.dumps(req))
 
-                            try:
-                                data = json.loads(response)
-                            except Exception as e:
-                                print(f"[{symbol}] Resposta inválida JSON (tentativa {history_attempts}): {e}")
-                                await asyncio.sleep(1)
-                                continue
+                    try:
+                        response = await asyncio.wait_for(ws.recv(), timeout=30)
+                    except asyncio.TimeoutError:
+                        send_telegram(f"⚠️ Timeout sem receber dados do WebSocket para {symbol}")
+                        print(f"[{symbol}] Timeout aguardando resposta.")
+                        break
 
-                            if "history" in data and "candles" in data["history"]:
-                                history_success = True
-                                history_data = data
-                            else:
-                                # mensagem de erro no history (ex.: Input validation failed)
-                                err_msg = data.get("error", {}).get("message", "sem detalhes")
-                                print(f"[{symbol}] history retornou erro (tentativa {history_attempts}): {err_msg}")
-                                await asyncio.sleep(1)
-
-                        if not history_success:
-                            send_telegram(f"⚠️ Falha ao obter candles para {symbol} após 3 tentativas")
-                            print(f"[{symbol}] Falha history após 3 tentativas.")
-                            break  # sai do loop interno para reconectar (vai para exceção externa)
-
-                        # processar candles
-                        candles = history_data["history"]["candles"]
+                    data = json.loads(response)
+                    if "history" in data and "candles" in data["history"]:
+                        candles = data["history"]["candles"]
                         df = pd.DataFrame(candles)
                         if 'close' in df.columns:
                             df['close'] = df['close'].astype(float)
@@ -217,10 +188,15 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                         if sinal:
                             send_telegram(f"💹 Sinal {sinal} detectado para {symbol} ({CANDLE_INTERVAL} min)")
 
-                        # próxima vela (loop volta e aguarda próximo fechamento)
-            except Exception as e:
-                send_telegram(f"⚠️ Erro ou desconexão no WebSocket para {symbol}: {e}")
-                print(f"[{symbol}] Exceção no WS: {e}")
+                    else:
+                        err_msg = data.get("error", {}).get("message", "sem detalhes")
+                        send_telegram(f"❌ Erro (history) do WS para {symbol}: {err_msg}")
+                        print(f"[{symbol}] Erro history: {data}")
+                        break
+
+        except Exception as e:
+            send_telegram(f"⚠️ Erro ou desconexão no WebSocket para {symbol}: {e}")
+            print(f"[{symbol}] Exceção no WS {symbol}: {e}")
         finally:
             ws_semaphore.release()
             print(f"[{symbol}] Slot liberado. Reconectando em {backoff_seconds}s …")
@@ -236,14 +212,11 @@ def index():
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    # Note: Render executa o Flask development server aqui; é suficiente para o worker web.
     app.run(host="0.0.0.0", port=port)
 
 # ---------------- Principal ----------------
 async def main():
-    # Inicia web endpoint para manter serviço ativo no Render
     threading.Thread(target=run_flask, daemon=True).start()
-
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise!")
     print("Iniciando monitoramento dos símbolos:", SYMBOLS)
 
