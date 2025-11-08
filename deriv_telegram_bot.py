@@ -18,9 +18,10 @@ load_dotenv()
 
 # ---------------- Configurações ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # ✅ corrigido conforme solicitado
-CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # ✅ padrão 5 minutos
-APP_ID = os.getenv("DERIV_APP_ID", "1089")  # ✅ APP_ID explícito configurável
+CHAT_ID = os.getenv("CHAT_ID")  # ✅ Chat ID do Telegram
+CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # ✅ 5 minutos
+APP_ID = os.getenv("DERIV_APP_ID", "1089")  # ✅ App ID da Deriv
+DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # ✅ Token da Deriv
 
 # Lista de 20 pares
 SYMBOLS = [
@@ -110,7 +111,11 @@ def seconds_to_next_candle(interval_minutes: int):
 # ---------------- WebSocket ----------------
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     await asyncio.sleep(start_delay)
-    url = f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
+    if not DERIV_TOKEN:
+        send_telegram(f"❌ DERIV_TOKEN não configurado. Abortando monitoramento de {symbol}.", symbol)
+        return
+
+    url = f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}&l=EN&brand=deriv"
     backoff_seconds = 5
     connected_once = False
 
@@ -118,11 +123,19 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
         await ws_semaphore.acquire()
         try:
             async with websockets.connect(url) as ws:
+                # Autenticação com token
+                auth_req = {"authorize": DERIV_TOKEN}
+                await ws.send(json.dumps(auth_req))
+                auth_resp = json.loads(await ws.recv())
+                if "error" in auth_resp:
+                    send_telegram(f"❌ Erro de autenticação no WebSocket para {symbol}: {auth_resp['error']}", symbol)
+                    break
+
                 if not connected_once:
                     send_telegram(f"✅ Conexão ativa com WebSocket da Deriv para {symbol}", symbol)
                     connected_once = True
 
-                print(f"[{symbol}] Conectado.")
+                print(f"[{symbol}] Conectado e autorizado.")
                 first_received = False
 
                 while True:
