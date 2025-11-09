@@ -20,7 +20,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")  # ✅ Chat ID do Telegram
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # ✅ 5 minutos
-APP_ID = os.getenv("DERIV_APP_ID", "1089")  # ✅ App ID da Deriv
+APP_ID = os.getenv("DERIV_APP_ID", "111022")  # ✅ App ID da Deriv
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # ✅ Token da Deriv
 
 # Lista de 20 pares
