@@ -23,7 +23,7 @@ CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # ✅ 5 minutos
 APP_ID = os.getenv("DERIV_APP_ID", "111022")  # ✅ App ID da Deriv
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # ✅ Token da Deriv
 
-# Lista de 20 pares
+# Lista de 20 pares + Bitcoin
 SYMBOLS = [
     "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
     "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
@@ -39,7 +39,7 @@ DATA_DIR.mkdir(exist_ok=True)
 MAX_CONCURRENT_WS = 3
 ws_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
 
-# Dicionário para controle de mensagens (limite 1 por 10min por par)
+# Controle de mensagens no Telegram (1 por 10min por par)
 last_notify_time = {}
 
 # ---------------- Telegram ----------------
@@ -123,7 +123,7 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
         await ws_semaphore.acquire()
         try:
             async with websockets.connect(url) as ws:
-                # Autenticação com token
+                # Autenticação
                 auth_req = {"authorize": DERIV_TOKEN}
                 await ws.send(json.dumps(auth_req))
                 auth_resp = json.loads(await ws.recv())
@@ -196,10 +196,26 @@ async def main():
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise!")
     send_telegram("🔍 Teste de conexão Telegram: se você recebeu esta mensagem, o bot está OK ✅")
 
-    tasks = []
-    for i, sym in enumerate(SYMBOLS):
-        tasks.append(asyncio.create_task(monitor_symbol(sym, start_delay=i * 5)))
-    await asyncio.gather(*tasks)
+    group_size = 2  # ✅ processar 2 pares por vez
+    delay_between_groups = 30  # ✅ aguarda 30s entre os grupos
+
+    # Divide os símbolos em grupos de 2
+    groups = [SYMBOLS[i:i + group_size] for i in range(0, len(SYMBOLS), group_size)]
+
+    for group_index, group in enumerate(groups):
+        send_telegram(f"⏳ Iniciando grupo {group_index + 1}/{len(groups)}: {', '.join(group)}")
+
+        tasks = []
+        for i, sym in enumerate(group):
+            # delay de 5s entre pares do mesmo grupo
+            tasks.append(asyncio.create_task(monitor_symbol(sym, start_delay=i * 5)))
+
+        await asyncio.gather(*tasks)
+
+        # aguarda antes de iniciar o próximo grupo
+        if group_index < len(groups) - 1:
+            send_telegram(f"🕐 Aguardando {delay_between_groups}s para iniciar o próximo grupo...")
+            await asyncio.sleep(delay_between_groups)
 
 if __name__ == "__main__":
     try:
