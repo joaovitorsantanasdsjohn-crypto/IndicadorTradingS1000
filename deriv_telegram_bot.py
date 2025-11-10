@@ -24,8 +24,9 @@ CHAT_ID = os.getenv("CHAT_ID")
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # minutos
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
 
-# WebSocket da Deriv com app_id
-WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+# URLs base
+WS_URL_DEMO = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}&server=demo"
+WS_URL_REAL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 # ✅ Lista enxuta com os 7 pares principais
 SYMBOLS = [
@@ -46,6 +47,7 @@ DATA_DIR.mkdir(exist_ok=True)
 MAX_CONCURRENT_WS = 3
 ws_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
 last_notify_time = {}
+symbol_active_ws_url = {}  # armazena se o símbolo está usando demo ou real
 
 # ---------------- Funções auxiliares ----------------
 def send_telegram(message: str, symbol: str = None):
@@ -73,7 +75,6 @@ def send_telegram(message: str, symbol: str = None):
         print(f"❌ Erro ao enviar Telegram: {e}")
 
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
-    """Calcula RSI e Bandas de Bollinger."""
     df = df.sort_values('epoch').reset_index(drop=True)
     df['close'] = df['close'].astype(float)
     df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
@@ -84,16 +85,13 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def gerar_sinal(df: pd.DataFrame):
-    """Gera sinal de compra ou venda com base no RSI + Bollinger."""
     ultima = df.iloc[-1]
     close = float(ultima['close'])
     rsi = ultima['rsi']
     bb_low = ultima['bb_lower']
     bb_up = ultima['bb_upper']
-
     if pd.isna(rsi) or pd.isna(bb_low) or pd.isna(bb_up):
         return None
-
     if close <= bb_low and rsi <= 30:
         return "COMPRA"
     elif close >= bb_up and rsi >= 70:
@@ -101,13 +99,11 @@ def gerar_sinal(df: pd.DataFrame):
     return None
 
 def save_last_candles(df: pd.DataFrame, symbol: str):
-    """Salva últimos candles em CSV (máx 200 linhas)."""
     path = DATA_DIR / f"candles_{symbol}.csv"
     df.tail(200).to_csv(path, index=False)
     print(f"[{symbol}] ✅ {len(df)} candles salvos.")
 
 def seconds_to_next_candle(interval_minutes: int):
-    """Calcula tempo restante até o próximo candle."""
     now = datetime.now(timezone.utc)
     total_seconds = int(now.timestamp())
     period = interval_minutes * 60
@@ -124,37 +120,55 @@ async def fetch_candles(ws, symbol: str, granularity: int):
         "style": "candles",
         "adjust_start_time": 1
     }
-
     await ws.send(json.dumps(req))
     data = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
     candles = data.get("history", {}).get("candles")
-
     if not candles and granularity != 60:
         print(f"[{symbol}] ⚠️ Nenhum candle com granularity={granularity}, tentando 60s.")
         return await fetch_candles(ws, symbol, 60)
-
-    print(f"[DEBUG] {symbol}: resposta -> {data}")
     return candles
 
+async def test_ws_connection(symbol: str):
+    """Testa conexão demo e real, e retorna a primeira que responder candles."""
+    for url in [WS_URL_DEMO, WS_URL_REAL]:
+        try:
+            async with websockets.connect(url) as ws:
+                candles = await fetch_candles(ws, symbol, 300)
+                if candles:
+                    print(f"[{symbol}] 🌐 Ambiente selecionado: {'DEMO' if 'demo' in url else 'REAL'}")
+                    return url
+        except Exception as e:
+            print(f"[{symbol}] ⚠️ Falha ao testar {url}: {e}")
+    return None
+
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
-    """Monitora continuamente um ativo da Deriv."""
     await asyncio.sleep(start_delay)
     connected_once = False
+
+    # Seleciona ambiente (demo/real) apenas uma vez por símbolo
+    if symbol not in symbol_active_ws_url:
+        selected_url = await test_ws_connection(symbol)
+        if not selected_url:
+            send_telegram(f"⚠️ Não foi possível determinar ambiente para {symbol}.", symbol)
+            return
+        symbol_active_ws_url[symbol] = selected_url
+
+    WS_URL = symbol_active_ws_url[symbol]
 
     while True:
         await ws_semaphore.acquire()
         try:
             async with websockets.connect(WS_URL) as ws:
                 if not connected_once:
-                    send_telegram(f"✅ Conexão WebSocket aberta para {symbol}", symbol)
+                    ambiente = "DEMO" if "demo" in WS_URL else "REAL"
+                    send_telegram(f"✅ Conexão WebSocket aberta para {symbol} ({ambiente})", symbol)
                     connected_once = True
 
-                print(f"[{symbol}] 🔌 Conectado à Deriv.")
+                print(f"[{symbol}] 🔌 Conectado à Deriv ({'demo' if 'demo' in WS_URL else 'real'}).")
 
                 while True:
                     wait = seconds_to_next_candle(CANDLE_INTERVAL)
                     await asyncio.sleep(wait + 1)
-
                     try:
                         candles = await fetch_candles(ws, symbol, CANDLE_INTERVAL * 60)
                     except asyncio.TimeoutError:
@@ -205,19 +219,12 @@ async def main():
 
     group_size = 2
     delay_between_groups = 30
-
     groups = [SYMBOLS[i:i + group_size] for i in range(0, len(SYMBOLS), group_size)]
 
     for index, group in enumerate(groups):
         send_telegram(f"⏳ Iniciando grupo {index + 1}/{len(groups)}: {', '.join(group)}")
-
-        tasks = [
-            asyncio.create_task(monitor_symbol(sym, start_delay=i * 5))
-            for i, sym in enumerate(group)
-        ]
-
+        tasks = [asyncio.create_task(monitor_symbol(sym, start_delay=i * 5)) for i, sym in enumerate(group)]
         await asyncio.gather(*tasks)
-
         if index < len(groups) - 1:
             send_telegram(f"🕐 Aguardando {delay_between_groups}s antes do próximo grupo...")
             await asyncio.sleep(delay_between_groups)
