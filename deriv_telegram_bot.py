@@ -118,29 +118,33 @@ async def authorize_deriv(ws):
         print(f"❌ Erro ao autorizar: {e}")
         return False
 
-async def fetch_candles(ws, symbol: str, granularity: int):
-    """Obtém candles e mostra erros detalhados."""
+
+async def fetch_history(ws, symbol: str, granularity: int):
+    """Baixa o histórico inicial de candles sem subscribe."""
     req = {
         "ticks_history": symbol,
-        "count": 500,
-        "end": int(datetime.now(timezone.utc).timestamp()),  # ⏰ Força timestamp UTC
+        "count": 200,
+        "end": "latest",
         "granularity": granularity,
-        "style": "candles",
-        "subscribe": 0,
-        "adjust_start_time": 1
+        "style": "candles"
     }
     await ws.send(json.dumps(req))
-    data = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
-
+    data = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
     if "error" in data:
         print(f"[{symbol}] ❌ Erro Deriv: {data['error'].get('message')} ({data['error'].get('code')})")
         return None
+    return data.get("candles")
 
-    candles = data.get("candles")
-    if not candles:
-        print(f"[{symbol}] ⚠️ Nenhum candle retornado. Resposta bruta:")
-        print(json.dumps(data, indent=2))
-    return candles
+
+async def subscribe_candles(ws, symbol: str, granularity: int):
+    """Abre assinatura em tempo real para candles."""
+    req = {
+        "candles": symbol,
+        "subscribe": 1,
+        "granularity": granularity
+    }
+    await ws.send(json.dumps(req))
+
 
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     await asyncio.sleep(start_delay)
@@ -157,42 +161,56 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                 if not connected_once:
                     send_telegram(f"✅ Conexão WebSocket aberta para {symbol} (REAL).", symbol)
                     connected_once = True
-
                 print(f"[{symbol}] 🔌 Conectado à Deriv (real).")
 
-                wait = seconds_to_next_candle(CANDLE_INTERVAL)
-                await asyncio.sleep(wait + 1)
-
-                try:
-                    candles = await fetch_candles(ws, symbol, CANDLE_INTERVAL * 60)
-                except asyncio.TimeoutError:
-                    print(f"[{symbol}] ⏱ Timeout ao receber dados.")
-                    break
-                except Exception as e:
-                    print(f"[{symbol}] ❌ Erro inesperado: {e}")
+                # Histórico inicial
+                candles = await fetch_history(ws, symbol, CANDLE_INTERVAL * 60)
+                if not candles:
+                    send_telegram(f"⚠️ Nenhum candle inicial retornado para {symbol}", symbol)
                     break
 
-                if candles:
-                    df = pd.DataFrame(candles)
-                    df['close'] = df['close'].astype(float)
-                    df_ind = calcular_indicadores(df)
-                    save_last_candles(df_ind, symbol)
+                df = pd.DataFrame(candles)
+                df['close'] = df['close'].astype(float)
+                df_ind = calcular_indicadores(df)
+                save_last_candles(df_ind, symbol)
 
-                    close_price = df_ind.iloc[-1]['close']
-                    send_telegram(f"📊 [{symbol}] Último fechamento: {close_price:.5f}", symbol)
+                last_epoch = df_ind.iloc[-1]['epoch']
+                send_telegram(f"📊 [{symbol}] Histórico inicial carregado ({len(df)} candles). Último close: {df_ind.iloc[-1]['close']:.5f}", symbol)
 
-                    sinal = gerar_sinal(df_ind)
-                    if sinal:
-                        send_telegram(f"💹 *Sinal {sinal}* detectado em {symbol} ({CANDLE_INTERVAL} min)", symbol)
-                else:
-                    send_telegram(f"⚠️ Não foi possível obter candles para {symbol}", symbol)
-                    break
+                # Assina novos candles em tempo real
+                await subscribe_candles(ws, symbol, CANDLE_INTERVAL * 60)
+                print(f"[{symbol}] 🔔 Assinatura de candles iniciada ({CANDLE_INTERVAL}m).")
 
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=180)
+                        data = json.loads(msg)
+                        if "error" in data:
+                            print(f"[{symbol}] ⚠️ Erro Deriv: {data['error']}")
+                            break
+
+                        candle = data.get("candles") or data.get("candle")
+                        if candle:
+                            epoch = candle.get("epoch")
+                            if epoch and epoch != last_epoch:
+                                last_epoch = epoch
+                                close = float(candle["close"])
+                                df.loc[len(df)] = candle
+                                df_ind = calcular_indicadores(df)
+                                sinal = gerar_sinal(df_ind)
+                                msg = f"🕐 [{symbol}] Novo candle {datetime.utcfromtimestamp(epoch).strftime('%H:%M:%S')} — Close: {close:.5f}"
+                                if sinal:
+                                    msg += f"\n💹 *Sinal {sinal}* detectado!"
+                                send_telegram(msg, symbol)
+                    except asyncio.TimeoutError:
+                        print(f"[{symbol}] ⏳ Timeout aguardando novo candle.")
+                        break
         except Exception as e:
             print(f"[{symbol}] ⚠️ Erro WebSocket: {e}")
         finally:
             ws_semaphore.release()
-            await asyncio.sleep(random.randint(15, 45))
+            await asyncio.sleep(random.randint(20, 45))
+
 
 # ---------------- Flask ----------------
 app = Flask(__name__)
