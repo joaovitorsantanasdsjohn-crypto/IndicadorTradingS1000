@@ -13,6 +13,7 @@ import threading
 from flask import Flask
 from pathlib import Path
 import time
+import random
 
 # ---------------- Inicialização ----------------
 load_dotenv()
@@ -20,21 +21,21 @@ load_dotenv()
 # ---------------- Configurações ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # 5 minutos
+CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # minutos
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
 
 # WebSocket da Deriv com app_id
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# ✅ Lista enxuta com os 7 pares mais líquidos e lucrativos
+# ✅ Lista enxuta com os 7 pares principais
 SYMBOLS = [
-    "frxEURUSD",  # Euro / Dólar
-    "frxGBPUSD",  # Libra / Dólar
-    "frxUSDJPY",  # Dólar / Iene
-    "frxUSDCHF",  # Dólar / Franco Suíço
-    "frxAUDUSD",  # Dólar Australiano / Dólar
-    "frxUSDCAD",  # Dólar / Dólar Canadense
-    "CRYBTCUSD"   # Bitcoin / Dólar
+    "frxEURUSD",
+    "frxGBPUSD",
+    "frxUSDJPY",
+    "frxUSDCHF",
+    "frxAUDUSD",
+    "frxUSDCAD",
+    "CRYBTCUSD"
 ]
 
 # ---------------- Estrutura de diretórios ----------------
@@ -52,7 +53,7 @@ def send_telegram(message: str, symbol: str = None):
     now = time.time()
     if symbol:
         last_time = last_notify_time.get(symbol, 0)
-        if now - last_time < 600:  # 10 minutos
+        if now - last_time < 300:  # 5 min por símbolo
             return
         last_notify_time[symbol] = now
 
@@ -113,10 +114,31 @@ def seconds_to_next_candle(interval_minutes: int):
     return (period - (total_seconds % period)) or period
 
 # ---------------- WebSocket ----------------
+async def fetch_candles(ws, symbol: str, granularity: int):
+    """Obtém candles do ativo (tenta granulação diferente se vier vazio)."""
+    req = {
+        "ticks_history": symbol,
+        "count": 500,
+        "end": "latest",
+        "granularity": granularity,
+        "style": "candles",
+        "adjust_start_time": 1
+    }
+
+    await ws.send(json.dumps(req))
+    data = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+    candles = data.get("history", {}).get("candles")
+
+    if not candles and granularity != 60:
+        print(f"[{symbol}] ⚠️ Nenhum candle com granularity={granularity}, tentando 60s.")
+        return await fetch_candles(ws, symbol, 60)
+
+    print(f"[DEBUG] {symbol}: resposta -> {data}")
+    return candles
+
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     """Monitora continuamente um ativo da Deriv."""
     await asyncio.sleep(start_delay)
-    backoff_seconds = 5
     connected_once = False
 
     while True:
@@ -127,28 +149,21 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                     send_telegram(f"✅ Conexão WebSocket aberta para {symbol}", symbol)
                     connected_once = True
 
-                print(f"[{symbol}] 🔌 Conectado à Deriv (sem token).")
+                print(f"[{symbol}] 🔌 Conectado à Deriv.")
 
                 while True:
                     wait = seconds_to_next_candle(CANDLE_INTERVAL)
                     await asyncio.sleep(wait + 1)
 
-                    req = {
-                        "ticks_history": symbol,
-                        "count": 500,
-                        "end": "latest",
-                        "granularity": CANDLE_INTERVAL * 60,
-                        "style": "candles"
-                    }
-                    await ws.send(json.dumps(req))
-
                     try:
-                        data = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+                        candles = await fetch_candles(ws, symbol, CANDLE_INTERVAL * 60)
                     except asyncio.TimeoutError:
                         send_telegram(f"⚠️ Timeout ao receber dados de {symbol}", symbol)
                         break
+                    except Exception as e:
+                        send_telegram(f"⚠️ Erro ao obter dados de {symbol}: {e}", symbol)
+                        break
 
-                    candles = data.get("history", {}).get("candles")
                     if candles:
                         df = pd.DataFrame(candles)
                         df['close'] = df['close'].astype(float)
@@ -162,15 +177,14 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                         if sinal:
                             send_telegram(f"💹 *Sinal {sinal}* detectado em {symbol} ({CANDLE_INTERVAL} min)", symbol)
                     else:
-                        send_telegram(f"⚠️ Erro ao obter candles de {symbol}", symbol)
+                        send_telegram(f"⚠️ Nenhum dado retornado para {symbol}", symbol)
                         break
 
         except Exception as e:
             send_telegram(f"⚠️ Erro WebSocket {symbol}: {e}", symbol)
         finally:
             ws_semaphore.release()
-            await asyncio.sleep(backoff_seconds)
-            backoff_seconds = min(backoff_seconds * 2, 120)
+            await asyncio.sleep(random.randint(15, 60))
 
 # ---------------- Flask (mantém Render ativo) ----------------
 app = Flask(__name__)
