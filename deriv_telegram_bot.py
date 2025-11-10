@@ -21,13 +21,12 @@ load_dotenv()
 # ---------------- Configurações ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # 🔑 Token Deriv
+DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # 🔑 Token Deriv (real)
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # minutos
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
 
-# URLs base
-WS_URL_DEMO = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}&server=demo"
-WS_URL_REAL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+# ✅ Ambiente REAL apenas
+WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 # ✅ Lista enxuta com os 7 pares principais
 SYMBOLS = [
@@ -48,7 +47,6 @@ DATA_DIR.mkdir(exist_ok=True)
 MAX_CONCURRENT_WS = 3
 ws_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
 last_notify_time = {}
-symbol_active_ws_url = {}  # Armazena se o símbolo está usando demo ou real
 
 # ---------------- Funções auxiliares ----------------
 def send_telegram(message: str, symbol: str = None):
@@ -147,34 +145,9 @@ async def fetch_candles(ws, symbol: str, granularity: int):
         return await fetch_candles(ws, symbol, 60)
     return candles
 
-async def test_ws_connection(symbol: str):
-    """Testa conexão demo e real, e retorna a primeira que responder candles."""
-    for url in [WS_URL_DEMO, WS_URL_REAL]:
-        try:
-            async with websockets.connect(url) as ws:
-                if not await authorize_deriv(ws):
-                    continue
-                candles = await fetch_candles(ws, symbol, 300)
-                if candles:
-                    print(f"[{symbol}] 🌐 Ambiente selecionado: {'DEMO' if 'demo' in url else 'REAL'}")
-                    return url
-        except Exception as e:
-            print(f"[{symbol}] ⚠️ Falha ao testar {url}: {e}")
-    return None
-
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     await asyncio.sleep(start_delay)
     connected_once = False
-
-    # Seleciona ambiente (demo/real) apenas uma vez por símbolo
-    if symbol not in symbol_active_ws_url:
-        selected_url = await test_ws_connection(symbol)
-        if not selected_url:
-            send_telegram(f"⚠️ Não foi possível determinar ambiente para {symbol}.", symbol)
-            return
-        symbol_active_ws_url[symbol] = selected_url
-
-    WS_URL = symbol_active_ws_url[symbol]
 
     while True:
         await ws_semaphore.acquire()
@@ -185,11 +158,10 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                     break
 
                 if not connected_once:
-                    ambiente = "DEMO" if "demo" in WS_URL else "REAL"
-                    send_telegram(f"✅ Conexão WebSocket aberta para {symbol} ({ambiente})", symbol)
+                    send_telegram(f"✅ Conexão WebSocket aberta para {symbol} (REAL)", symbol)
                     connected_once = True
 
-                print(f"[{symbol}] 🔌 Conectado à Deriv ({'demo' if 'demo' in WS_URL else 'real'}).")
+                print(f"[{symbol}] 🔌 Conectado à Deriv (real).")
 
                 while True:
                     wait = seconds_to_next_candle(CANDLE_INTERVAL)
