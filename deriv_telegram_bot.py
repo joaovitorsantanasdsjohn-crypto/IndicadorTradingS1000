@@ -21,6 +21,7 @@ load_dotenv()
 # ---------------- Configurações ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # 🔑 Token Deriv
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # minutos
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
 
@@ -47,7 +48,7 @@ DATA_DIR.mkdir(exist_ok=True)
 MAX_CONCURRENT_WS = 3
 ws_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
 last_notify_time = {}
-symbol_active_ws_url = {}  # armazena se o símbolo está usando demo ou real
+symbol_active_ws_url = {}  # Armazena se o símbolo está usando demo ou real
 
 # ---------------- Funções auxiliares ----------------
 def send_telegram(message: str, symbol: str = None):
@@ -55,7 +56,7 @@ def send_telegram(message: str, symbol: str = None):
     now = time.time()
     if symbol:
         last_time = last_notify_time.get(symbol, 0)
-        if now - last_time < 300:  # 5 min por símbolo
+        if now - last_time < 300:  # 5 minutos por símbolo
             return
         last_notify_time[symbol] = now
 
@@ -110,6 +111,24 @@ def seconds_to_next_candle(interval_minutes: int):
     return (period - (total_seconds % period)) or period
 
 # ---------------- WebSocket ----------------
+async def authorize_deriv(ws):
+    """Autoriza o WebSocket com o token Deriv."""
+    if not DERIV_TOKEN:
+        print("⚠️ DERIV_TOKEN não configurado no ambiente!")
+        return False
+    try:
+        await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+        response = json.loads(await ws.recv())
+        if response.get("authorize"):
+            print(f"🔐 Autorizado como {response['authorize'].get('loginid', 'desconhecido')}")
+            return True
+        else:
+            print(f"❌ Falha na autorização: {response}")
+            return False
+    except Exception as e:
+        print(f"❌ Erro ao autorizar: {e}")
+        return False
+
 async def fetch_candles(ws, symbol: str, granularity: int):
     """Obtém candles do ativo (tenta granulação diferente se vier vazio)."""
     req = {
@@ -133,6 +152,8 @@ async def test_ws_connection(symbol: str):
     for url in [WS_URL_DEMO, WS_URL_REAL]:
         try:
             async with websockets.connect(url) as ws:
+                if not await authorize_deriv(ws):
+                    continue
                 candles = await fetch_candles(ws, symbol, 300)
                 if candles:
                     print(f"[{symbol}] 🌐 Ambiente selecionado: {'DEMO' if 'demo' in url else 'REAL'}")
@@ -159,6 +180,10 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
         await ws_semaphore.acquire()
         try:
             async with websockets.connect(WS_URL) as ws:
+                if not await authorize_deriv(ws):
+                    send_telegram(f"❌ Falha na autorização Deriv para {symbol}", symbol)
+                    break
+
                 if not connected_once:
                     ambiente = "DEMO" if "demo" in WS_URL else "REAL"
                     send_telegram(f"✅ Conexão WebSocket aberta para {symbol} ({ambiente})", symbol)
