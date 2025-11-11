@@ -29,10 +29,10 @@ APP_ID = os.getenv("DERIV_APP_ID", "111022")
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 SYMBOLS = [
-"frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
-"frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
-"frxEURAUD", "frxAUDJPY", "frxCHFJPY", "frxCADJPY", "frxGBPAUD",
-"frxGBPCAD", "frxAUDNZD", "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
+    "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
+    "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
+    "frxEURAUD", "frxAUDJPY", "frxCHFJPY", "frxCADJPY", "frxGBPAUD",
+    "frxGBPCAD", "frxAUDNZD", "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
 ]
 
 DATA_DIR = Path("./candles_data")
@@ -62,20 +62,45 @@ def send_telegram(message: str, symbol: str = None):
     except Exception as e:
         print(f"❌ Erro ao enviar Telegram: {e}")
 
+# ---------------- Controle de horário Forex ----------------
+def is_forex_open() -> bool:
+    """
+    Retorna True se o mercado Forex estiver aberto.
+    Horário global Forex:
+    - Abre: Domingo 22:00 UTC
+    - Fecha: Sexta 21:00 UTC
+    """
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()  # 0=segunda ... 6=domingo
+    hour = now.hour
+    minute = now.minute
+
+    # Domingo antes das 22:00 UTC → fechado
+    if weekday == 6 and (hour < 22):
+        return False
+    # Sexta após 21:00 UTC → fechado
+    if weekday == 4 and (hour >= 21):
+        return False
+    # Sábado inteiro → fechado
+    if weekday == 5:
+        return False
+    # Domingo antes das 22h → fechado
+    if weekday == 6 and hour < 22:
+        return False
+
+    # Caso contrário → aberto
+    return True
+
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values('epoch').reset_index(drop=True)
     df['close'] = df['close'].astype(float)
 
-    # RSI
     df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
-
-    # EMAs (setup 9/55/200)
     df['ema9'] = EMAIndicator(df['close'], window=9).ema_indicator()
     df['ema55'] = EMAIndicator(df['close'], window=55).ema_indicator()
     df['ema200'] = EMAIndicator(df['close'], window=200).ema_indicator()
 
-    # Bollinger (mantida, usada apenas para referência de volatilidade)
     bb = BollingerBands(df['close'], window=20, window_dev=2)
     df['bb_mavg'] = bb.bollinger_mavg()
     df['bb_upper'] = bb.bollinger_hband()
@@ -92,7 +117,6 @@ def gerar_sinal(df: pd.DataFrame):
     if pd.isna(ema9) or pd.isna(ema55) or pd.isna(ema200) or pd.isna(rsi):
         return None
 
-    # Setup EMA + RSI
     if ema9 > ema55 > ema200 and rsi > 52:
         return "COMPRA"
     elif ema9 < ema55 < ema200 and rsi < 48:
@@ -103,12 +127,6 @@ def save_last_candles(df: pd.DataFrame, symbol: str):
     path = DATA_DIR / f"candles_{symbol}.csv"
     df.tail(200).to_csv(path, index=False)
     print(f"[{symbol}] ✅ {len(df)} candles salvos.")
-
-def seconds_to_next_candle(interval_minutes: int):
-    now = datetime.now(timezone.utc)
-    total_seconds = int(now.timestamp())
-    period = interval_minutes * 60
-    return (period - (total_seconds % period)) or period
 
 # ---------------- WebSocket ----------------
 async def authorize_deriv(ws):
@@ -128,7 +146,6 @@ async def authorize_deriv(ws):
         print(f"❌ Erro ao autorizar: {e}")
         return False
 
-
 async def fetch_history(ws, symbol: str, granularity: int):
     req = {
         "ticks_history": symbol,
@@ -144,17 +161,21 @@ async def fetch_history(ws, symbol: str, granularity: int):
         return None
     return data.get("candles")
 
-
 async def subscribe_candles(ws, symbol: str, granularity: int):
     req = {"candles": symbol, "subscribe": 1, "granularity": granularity}
     await ws.send(json.dumps(req))
-
 
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     await asyncio.sleep(start_delay)
     connected_once = False
 
     while True:
+        # ✅ Verifica se o Forex está aberto
+        if not is_forex_open():
+            print(f"[{symbol}] 🌙 Mercado Forex fechado — aguardando abertura...")
+            await asyncio.sleep(600)  # aguarda 10 minutos antes de checar de novo
+            continue
+
         await ws_semaphore.acquire()
         try:
             async with websockets.connect(WS_URL) as ws:
@@ -184,6 +205,12 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                 print(f"[{symbol}] 🔔 Assinatura de candles iniciada ({CANDLE_INTERVAL}m).")
 
                 while True:
+                    # Se o mercado fechar durante a execução → parar o loop
+                    if not is_forex_open():
+                        print(f"[{symbol}] ⚠️ Mercado fechou durante execução — pausa.")
+                        send_telegram(f"🌙 Mercado Forex fechado — pausando análise de {symbol}.", symbol)
+                        break
+
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=180)
                         data = json.loads(msg)
@@ -212,7 +239,6 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
         finally:
             ws_semaphore.release()
             await asyncio.sleep(random.randint(20, 45))
-
 
 # ---------------- Flask ----------------
 app = Flask(__name__)
