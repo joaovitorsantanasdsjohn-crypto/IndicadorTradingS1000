@@ -4,6 +4,7 @@ import websockets
 import json
 import pandas as pd
 from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator
 from ta.volatility import BollingerBands
 import requests
 from datetime import datetime, timezone
@@ -65,7 +66,16 @@ def send_telegram(message: str, symbol: str = None):
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values('epoch').reset_index(drop=True)
     df['close'] = df['close'].astype(float)
+
+    # RSI
     df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
+
+    # EMAs (setup 9/55/200)
+    df['ema9'] = EMAIndicator(df['close'], window=9).ema_indicator()
+    df['ema55'] = EMAIndicator(df['close'], window=55).ema_indicator()
+    df['ema200'] = EMAIndicator(df['close'], window=200).ema_indicator()
+
+    # Bollinger (mantida, usada apenas para referência de volatilidade)
     bb = BollingerBands(df['close'], window=20, window_dev=2)
     df['bb_mavg'] = bb.bollinger_mavg()
     df['bb_upper'] = bb.bollinger_hband()
@@ -74,15 +84,18 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 def gerar_sinal(df: pd.DataFrame):
     ultima = df.iloc[-1]
-    close = float(ultima['close'])
+    ema9 = ultima['ema9']
+    ema55 = ultima['ema55']
+    ema200 = ultima['ema200']
     rsi = ultima['rsi']
-    bb_low = ultima['bb_lower']
-    bb_up = ultima['bb_upper']
-    if pd.isna(rsi) or pd.isna(bb_low) or pd.isna(bb_up):
+
+    if pd.isna(ema9) or pd.isna(ema55) or pd.isna(ema200) or pd.isna(rsi):
         return None
-    if close <= bb_low and rsi <= 30:
+
+    # Setup EMA + RSI
+    if ema9 > ema55 > ema200 and rsi > 52:
         return "COMPRA"
-    elif close >= bb_up and rsi >= 70:
+    elif ema9 < ema55 < ema200 and rsi < 48:
         return "VENDA"
     return None
 
@@ -117,7 +130,6 @@ async def authorize_deriv(ws):
 
 
 async def fetch_history(ws, symbol: str, granularity: int):
-    """Baixa o histórico inicial de candles sem subscribe."""
     req = {
         "ticks_history": symbol,
         "count": 200,
@@ -134,12 +146,7 @@ async def fetch_history(ws, symbol: str, granularity: int):
 
 
 async def subscribe_candles(ws, symbol: str, granularity: int):
-    """Abre assinatura em tempo real para candles."""
-    req = {
-        "candles": symbol,
-        "subscribe": 1,
-        "granularity": granularity
-    }
+    req = {"candles": symbol, "subscribe": 1, "granularity": granularity}
     await ws.send(json.dumps(req))
 
 
@@ -160,7 +167,6 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                     connected_once = True
                 print(f"[{symbol}] 🔌 Conectado à Deriv (real).")
 
-                # Histórico inicial
                 candles = await fetch_history(ws, symbol, CANDLE_INTERVAL * 60)
                 if not candles:
                     send_telegram(f"⚠️ Nenhum candle inicial retornado para {symbol}", symbol)
@@ -174,7 +180,6 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                 last_epoch = df_ind.iloc[-1]['epoch']
                 send_telegram(f"📊 [{symbol}] Histórico inicial carregado ({len(df)} candles). Último close: {df_ind.iloc[-1]['close']:.5f}", symbol)
 
-                # Assina novos candles em tempo real
                 await subscribe_candles(ws, symbol, CANDLE_INTERVAL * 60)
                 print(f"[{symbol}] 🔔 Assinatura de candles iniciada ({CANDLE_INTERVAL}m).")
 
