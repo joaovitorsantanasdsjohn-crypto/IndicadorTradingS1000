@@ -142,7 +142,6 @@ async def subscribe_candles(ws, symbol: str, granularity: int):
 
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     await asyncio.sleep(start_delay)
-    connected_once = False
     sent_download_message[symbol] = False
 
     while True:
@@ -184,8 +183,14 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                         if "error" in data:
                             break
 
-                        candle = data.get("candles") or data.get("candle")
-                        if candle:
+                        # ---------------- Correção de candle (list ou dict) ----------------
+                        candle_data = data.get("candles") or data.get("candle")
+                        if candle_data:
+                            if isinstance(candle_data, list):
+                                candle = candle_data[-1]
+                            else:
+                                candle = candle_data
+
                             epoch = candle.get("epoch")
                             if epoch and epoch != last_epoch:
                                 last_epoch = epoch
