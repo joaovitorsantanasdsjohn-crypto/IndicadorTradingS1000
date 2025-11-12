@@ -161,8 +161,19 @@ async def fetch_history(ws, symbol: str, granularity: int):
         return None
     return data.get("candles")
 
+# ✅ Correção aplicada aqui
 async def subscribe_candles(ws, symbol: str, granularity: int):
-    req = {"candles": symbol, "subscribe": 1, "granularity": granularity}
+    """
+    Corrigido: uso de 'ticks_history' + style=candles + subscribe=1,
+    conforme a API atual da Deriv.
+    """
+    req = {
+        "ticks_history": symbol,
+        "style": "candles",
+        "granularity": granularity,
+        "end": "latest",
+        "subscribe": 1
+    }
     await ws.send(json.dumps(req))
 
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
@@ -170,10 +181,9 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     connected_once = False
 
     while True:
-        # ✅ Verifica se o Forex está aberto
         if not is_forex_open():
             print(f"[{symbol}] 🌙 Mercado Forex fechado — aguardando abertura...")
-            await asyncio.sleep(600)  # aguarda 10 minutos antes de checar de novo
+            await asyncio.sleep(600)
             continue
 
         await ws_semaphore.acquire()
@@ -205,7 +215,6 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                 print(f"[{symbol}] 🔔 Assinatura de candles iniciada ({CANDLE_INTERVAL}m).")
 
                 while True:
-                    # Se o mercado fechar durante a execução → parar o loop
                     if not is_forex_open():
                         print(f"[{symbol}] ⚠️ Mercado fechou durante execução — pausa.")
                         send_telegram(f"🌙 Mercado Forex fechado — pausando análise de {symbol}.", symbol)
