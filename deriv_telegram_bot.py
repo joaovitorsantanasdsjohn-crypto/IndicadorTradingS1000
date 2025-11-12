@@ -64,12 +64,6 @@ def send_telegram(message: str, symbol: str = None):
 
 # ---------------- Controle de horário Forex ----------------
 def is_forex_open() -> bool:
-    """
-    Retorna True se o mercado Forex estiver aberto.
-    Horário global Forex:
-    - Abre: Domingo 22:00 UTC
-    - Fecha: Sexta 21:00 UTC
-    """
     now = datetime.now(timezone.utc)
     weekday = now.weekday()  # 0=segunda ... 6=domingo
     hour = now.hour
@@ -90,13 +84,11 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values('epoch').reset_index(drop=True)
     df['close'] = df['close'].astype(float)
 
-    # Indicadores principais
     df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
     df['ema9'] = EMAIndicator(df['close'], window=9).ema_indicator()
     df['ema21'] = EMAIndicator(df['close'], window=21).ema_indicator()
     df['ema55'] = EMAIndicator(df['close'], window=55).ema_indicator()
 
-    # Bollinger Bands
     bb = BollingerBands(df['close'], window=20, window_dev=2)
     df['bb_mavg'] = bb.bollinger_mavg()
     df['bb_upper'] = bb.bollinger_hband()
@@ -105,13 +97,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def gerar_sinal(df: pd.DataFrame):
-    """
-    Setup 3 - Confluência de Tendência + Reversão RSI/Bollinger
-    CALL: EMA9>EMA21>EMA55, RSI entre 30–45, close <= banda inferior
-    PUT:  EMA9<EMA21<EMA55, RSI entre 55–70, close >= banda superior
-    """
     ultima = df.iloc[-1]
-
     ema9 = ultima['ema9']
     ema21 = ultima['ema21']
     ema55 = ultima['ema55']
@@ -123,14 +109,10 @@ def gerar_sinal(df: pd.DataFrame):
     if pd.isna(ema9) or pd.isna(ema21) or pd.isna(ema55) or pd.isna(rsi):
         return None
 
-    # --- Condição de COMPRA (CALL)
     if ema9 > ema21 > ema55 and 30 <= rsi <= 45 and close <= bb_lower:
         return "COMPRA"
-
-    # --- Condição de VENDA (PUT)
     elif ema9 < ema21 < ema55 and 55 <= rsi <= 70 and close >= bb_upper:
         return "VENDA"
-
     return None
 
 def save_last_candles(df: pd.DataFrame, symbol: str):
@@ -181,6 +163,7 @@ async def subscribe_candles(ws, symbol: str, granularity: int):
     }
     await ws.send(json.dumps(req))
 
+# ----------- MODIFICADO: monitor_symbol COM DEBUG -----------
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     await asyncio.sleep(start_delay)
     connected_once = False
@@ -241,10 +224,13 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                                 df.loc[len(df)] = candle
                                 df_ind = calcular_indicadores(df)
                                 sinal = gerar_sinal(df_ind)
-                                msg = f"🕐 [{symbol}] Novo candle {datetime.utcfromtimestamp(epoch).strftime('%H:%M:%S')} — Close: {close:.5f}"
+
+                                ultima = df_ind.iloc[-1]
+                                print(f"[{symbol}] 🔍 DEBUG — EMA9:{ultima['ema9']:.5f}, EMA21:{ultima['ema21']:.5f}, EMA55:{ultima['ema55']:.5f}, RSI:{ultima['rsi']:.2f}, Close:{ultima['close']:.5f}, BB_low:{ultima['bb_lower']:.5f}, BB_up:{ultima['bb_upper']:.5f}")
+
                                 if sinal:
-                                    msg += f"\n💹 *Sinal {sinal}* detectado!"
-                                send_telegram(msg, symbol)
+                                    msg = f"💹 *Sinal {sinal}* detectado em {symbol}!\nRSI:{ultima['rsi']:.2f}\nClose:{ultima['close']:.5f}"
+                                    send_telegram(msg, symbol)
                     except asyncio.TimeoutError:
                         print(f"[{symbol}] ⏳ Timeout aguardando novo candle.")
                         break
