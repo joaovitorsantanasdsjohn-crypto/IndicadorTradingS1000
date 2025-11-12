@@ -198,6 +198,20 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                                 df.loc[len(df)] = candle
                                 df_ind = calcular_indicadores(df)
                                 sinal = gerar_sinal(df_ind)
+
+                                # 🔍 LOG DETALHADO APENAS NO CONSOLE (Render)
+                                try:
+                                    ultima = df_ind.iloc[-1]
+                                    print(
+                                        f"[{symbol}] 🧩 Candle avaliado — Close: {ultima['close']:.5f}, "
+                                        f"RSI: {ultima['rsi']:.2f}, EMA9: {ultima['ema9']:.5f}, "
+                                        f"EMA21: {ultima['ema21']:.5f}, EMA55: {ultima['ema55']:.5f}, "
+                                        f"BB Upper: {ultima['bb_upper']:.5f}, BB Lower: {ultima['bb_lower']:.5f}, "
+                                        f"Sinal: {sinal or 'Nenhum'}"
+                                    )
+                                except Exception as e:
+                                    print(f"[{symbol}] ⚠️ Erro ao imprimir debug: {e}")
+
                                 if sinal:
                                     send_telegram(f"💹 [{symbol}] *Sinal {sinal}* detectado!", symbol)
                     except asyncio.TimeoutError:
