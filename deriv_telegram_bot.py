@@ -41,7 +41,9 @@ DATA_DIR.mkdir(exist_ok=True)
 MAX_CONCURRENT_WS = 3
 ws_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
 last_notify_time = {}
-sent_download_message = {}
+
+# Inicializa controle de mensagens de download para todos os pares
+sent_download_message = {s: False for s in SYMBOLS}
 
 # ---------------- Telegram ----------------
 def send_telegram(message: str, symbol: str = None):
@@ -53,6 +55,7 @@ def send_telegram(message: str, symbol: str = None):
         last_notify_time[symbol] = now
 
     if not TELEGRAM_TOKEN or not CHAT_ID:
+        # apenas log no console se não estiver configurado
         print("⚠️ Telegram não configurado. Mensagem:", message)
         return
 
@@ -132,8 +135,9 @@ async def fetch_history(ws, symbol: str, granularity: int):
     await ws.send(json.dumps(req))
     data = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
     if "error" in data:
-        print(f"[{symbol}] ❌ Erro Deriv: {data['error'].get('message')} ({data['error'].get('code')})")
+        print(f"[{symbol}] ❌ Erro Deriv (history): {data['error'].get('message')} ({data['error'].get('code')})")
         return None
+    # data may include 'candles' key
     return data.get("candles")
 
 async def subscribe_candles(ws, symbol: str, granularity: int):
@@ -142,7 +146,7 @@ async def subscribe_candles(ws, symbol: str, granularity: int):
 
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     await asyncio.sleep(start_delay)
-    sent_download_message[symbol] = False
+    print(f"[{symbol}] ▶ Monitor starting (start_delay={start_delay}s)")
 
     while True:
         if not is_forex_open():
@@ -154,21 +158,37 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
         try:
             async with websockets.connect(WS_URL) as ws:
                 if not await authorize_deriv(ws):
-                    break
+                    print(f"[{symbol}] ❌ autorização falhou, tentando novamente em 30s")
+                    await asyncio.sleep(30)
+                    continue
+
                 print(f"[{symbol}] 🔌 Conectado à Deriv (real).")
 
-                candles = await fetch_history(ws, symbol, CANDLE_INTERVAL * 60)
+                candles = None
+                # tenta obter histórico algumas vezes antes de desistir temporariamente
+                for attempt in range(3):
+                    candles = await fetch_history(ws, symbol, CANDLE_INTERVAL * 60)
+                    if candles:
+                        break
+                    print(f"[{symbol}] ⚠️ fetch_history retornou vazio (attempt {attempt+1}/3).")
+                    await asyncio.sleep(3)
+
                 if not candles:
-                    break
+                    # se não obteve o histórico, libera o semáforo e re-tenta depois
+                    print(f"[{symbol}] ❌ Não foi possível baixar histórico depois de tentativas — re-tentando em 30s")
+                    await ws.close()
+                    continue
 
                 df = pd.DataFrame(candles)
                 df['close'] = df['close'].astype(float)
                 df_ind = calcular_indicadores(df)
                 save_last_candles(df_ind, symbol)
 
-                if not sent_download_message[symbol]:
+                # Envia apenas uma vez a confirmação de download por símbolo
+                if not sent_download_message.get(symbol, False):
                     send_telegram(f"📥 [{symbol}] Download de velas executado com sucesso ({len(df)} candles).", symbol)
                     sent_download_message[symbol] = True
+                    print(f"[{symbol}] 📥 Mensagem de download enviada.")
 
                 last_epoch = df_ind.iloc[-1]['epoch']
                 await subscribe_candles(ws, symbol, CANDLE_INTERVAL * 60)
@@ -176,45 +196,63 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
 
                 while True:
                     if not is_forex_open():
+                        print(f"[{symbol}] 🌙 Mercado fechou durante execução — saindo para aguardar abertura.")
                         break
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=180)
                         data = json.loads(msg)
                         if "error" in data:
+                            print(f"[{symbol}] ⚠️ Erro recebido do WS: {data['error']}")
                             break
 
-                        # ---------------- Correção de candle (list ou dict) ----------------
+                        # trata tanto o caso 'candles' (lista) quanto 'candle' (dict)
                         candle_data = data.get("candles") or data.get("candle")
-                        if candle_data:
-                            if isinstance(candle_data, list):
-                                candle = candle_data[-1]
-                            else:
-                                candle = candle_data
+                        if not candle_data:
+                            continue
 
-                            epoch = candle.get("epoch")
-                            if epoch and epoch != last_epoch:
-                                last_epoch = epoch
-                                df.loc[len(df)] = candle
-                                df_ind = calcular_indicadores(df)
-                                sinal = gerar_sinal(df_ind)
+                        if isinstance(candle_data, list):
+                            candle = candle_data[-1]
+                        else:
+                            candle = candle_data
 
-                                ultima = df_ind.iloc[-1]
-                                print(
-                                    f"[{symbol}] 🧩 Avaliação: Close={ultima['close']:.5f}, "
-                                    f"RSI={ultima['rsi']:.2f}, EMA9={ultima['ema9']:.5f}, "
-                                    f"EMA21={ultima['ema21']:.5f}, EMA55={ultima['ema55']:.5f}, "
-                                    f"Sinal={sinal or 'Nenhum'}"
-                                )
+                        epoch = candle.get("epoch")
+                        if not epoch:
+                            continue
 
-                                if sinal:
-                                    send_telegram(f"💹 [{symbol}] *Sinal {sinal}* detectado!", symbol)
+                        if epoch != last_epoch:
+                            last_epoch = epoch
+                            # adiciona novo candle
+                            df.loc[len(df)] = candle
+                            df_ind = calcular_indicadores(df)
+                            sinal = gerar_sinal(df_ind)
+
+                            ultima = df_ind.iloc[-1]
+                            # LOG detalhado só no console
+                            print(
+                                f"[{symbol}] 🧩 Avaliação: Close={ultima['close']:.5f}, "
+                                f"RSI={ultima['rsi']:.2f}, EMA9={ultima['ema9']:.5f}, "
+                                f"EMA21={ultima['ema21']:.5f}, EMA55={ultima['ema55']:.5f}, "
+                                f"BB_up={ultima['bb_upper']:.5f}, BB_low={ultima['bb_lower']:.5f}, "
+                                f"Sinal={sinal or 'Nenhum'}"
+                            )
+
+                            if sinal:
+                                send_telegram(f"💹 [{symbol}] *Sinal {sinal}* detectado!", symbol)
                     except asyncio.TimeoutError:
-                        break
+                        # sem novas mensagens dentro do timeout: apenas reinicia a espera do recv
+                        # isso permite sair do inner loop e re-subscrever se necessário
+                        # (mas aqui apenas repetimos a espera)
+                        # print(f"[{symbol}] ⏳ Timeout aguardando novo candle.")
+                        continue
         except Exception as e:
-            print(f"[{symbol}] ⚠️ Erro WebSocket: {e}")
+            print(f"[{symbol}] ⚠️ Erro WebSocket geral: {e}")
         finally:
-            ws_semaphore.release()
-            await asyncio.sleep(random.randint(20, 45))
+            try:
+                ws_semaphore.release()
+            except Exception:
+                pass
+            # pequeno delay aleatório antes de tentar reconectar ao próximo ciclo
+            await asyncio.sleep(random.randint(5, 15))
 
 # ---------------- Flask ----------------
 app = Flask(__name__)
@@ -229,11 +267,13 @@ def run_flask():
 
 # ---------------- Execução principal ----------------
 async def main():
+    # start flask in background
     threading.Thread(target=run_flask, daemon=True).start()
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise! 🔍 (conta REAL)")
+    print("▶ Main started - iniciando monitores para todos os símbolos.")
 
     # Executa todos os símbolos em paralelo (respeitando o limite do semáforo)
-    tasks = [asyncio.create_task(monitor_symbol(sym, start_delay=i * 4)) for i, sym in enumerate(SYMBOLS)]
+    tasks = [asyncio.create_task(monitor_symbol(sym, start_delay=i * 2)) for i, sym in enumerate(SYMBOLS)]
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
