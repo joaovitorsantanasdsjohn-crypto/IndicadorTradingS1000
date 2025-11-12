@@ -41,7 +41,7 @@ DATA_DIR.mkdir(exist_ok=True)
 MAX_CONCURRENT_WS = 3
 ws_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
 last_notify_time = {}
-sent_download_message = {}  # <--- controla se já avisou o download do par
+sent_download_message = {}
 
 # ---------------- Telegram ----------------
 def send_telegram(message: str, symbol: str = None):
@@ -68,13 +68,11 @@ def is_forex_open() -> bool:
     now = datetime.now(timezone.utc)
     weekday = now.weekday()
     hour = now.hour
-    if weekday == 6 and (hour < 22):
+    if weekday == 6 and hour < 22:
         return False
-    if weekday == 4 and (hour >= 21):
+    if weekday == 4 and hour >= 21:
         return False
     if weekday == 5:
-        return False
-    if weekday == 6 and hour < 22:
         return False
     return True
 
@@ -145,7 +143,7 @@ async def subscribe_candles(ws, symbol: str, granularity: int):
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     await asyncio.sleep(start_delay)
     connected_once = False
-    sent_download_message[symbol] = False  # inicializa controle
+    sent_download_message[symbol] = False
 
     while True:
         if not is_forex_open():
@@ -158,9 +156,6 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
             async with websockets.connect(WS_URL) as ws:
                 if not await authorize_deriv(ws):
                     break
-
-                if not connected_once:
-                    connected_once = True
                 print(f"[{symbol}] 🔌 Conectado à Deriv (real).")
 
                 candles = await fetch_history(ws, symbol, CANDLE_INTERVAL * 60)
@@ -172,7 +167,6 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                 df_ind = calcular_indicadores(df)
                 save_last_candles(df_ind, symbol)
 
-                # Envia apenas uma vez a confirmação de download
                 if not sent_download_message[symbol]:
                     send_telegram(f"📥 [{symbol}] Download de velas executado com sucesso ({len(df)} candles).", symbol)
                     sent_download_message[symbol] = True
@@ -199,18 +193,13 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                                 df_ind = calcular_indicadores(df)
                                 sinal = gerar_sinal(df_ind)
 
-                                # 🔍 LOG DETALHADO APENAS NO CONSOLE (Render)
-                                try:
-                                    ultima = df_ind.iloc[-1]
-                                    print(
-                                        f"[{symbol}] 🧩 Candle avaliado — Close: {ultima['close']:.5f}, "
-                                        f"RSI: {ultima['rsi']:.2f}, EMA9: {ultima['ema9']:.5f}, "
-                                        f"EMA21: {ultima['ema21']:.5f}, EMA55: {ultima['ema55']:.5f}, "
-                                        f"BB Upper: {ultima['bb_upper']:.5f}, BB Lower: {ultima['bb_lower']:.5f}, "
-                                        f"Sinal: {sinal or 'Nenhum'}"
-                                    )
-                                except Exception as e:
-                                    print(f"[{symbol}] ⚠️ Erro ao imprimir debug: {e}")
+                                ultima = df_ind.iloc[-1]
+                                print(
+                                    f"[{symbol}] 🧩 Avaliação: Close={ultima['close']:.5f}, "
+                                    f"RSI={ultima['rsi']:.2f}, EMA9={ultima['ema9']:.5f}, "
+                                    f"EMA21={ultima['ema21']:.5f}, EMA55={ultima['ema55']:.5f}, "
+                                    f"Sinal={sinal or 'Nenhum'}"
+                                )
 
                                 if sinal:
                                     send_telegram(f"💹 [{symbol}] *Sinal {sinal}* detectado!", symbol)
@@ -238,16 +227,9 @@ async def main():
     threading.Thread(target=run_flask, daemon=True).start()
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise! 🔍 (conta REAL)")
 
-    group_size = 2
-    delay_between_groups = 30
-    groups = [SYMBOLS[i:i + group_size] for i in range(0, len(SYMBOLS), group_size)]
-
-    for index, group in enumerate(groups):
-        send_telegram(f"⏳ Iniciando grupo {index + 1}/{len(groups)}: {', '.join(group)}")
-        tasks = [asyncio.create_task(monitor_symbol(sym, start_delay=i * 5)) for i, sym in enumerate(group)]
-        await asyncio.gather(*tasks)
-        if index < len(groups) - 1:
-            await asyncio.sleep(delay_between_groups)
+    # Executa todos os símbolos em paralelo (respeitando o limite do semáforo)
+    tasks = [asyncio.create_task(monitor_symbol(sym, start_delay=i * 4)) for i, sym in enumerate(SYMBOLS)]
+    await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     try:
