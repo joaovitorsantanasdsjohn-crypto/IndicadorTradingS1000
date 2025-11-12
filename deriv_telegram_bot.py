@@ -73,54 +73,64 @@ def is_forex_open() -> bool:
     now = datetime.now(timezone.utc)
     weekday = now.weekday()  # 0=segunda ... 6=domingo
     hour = now.hour
-    minute = now.minute
 
-    # Domingo antes das 22:00 UTC → fechado
     if weekday == 6 and (hour < 22):
         return False
-    # Sexta após 21:00 UTC → fechado
     if weekday == 4 and (hour >= 21):
         return False
-    # Sábado inteiro → fechado
     if weekday == 5:
         return False
-    # Domingo antes das 22h → fechado
     if weekday == 6 and hour < 22:
         return False
 
-    # Caso contrário → aberto
     return True
 
-# ---------------- Indicadores ----------------
+# ---------------- Indicadores (Setup Avançado sem EMA200) ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values('epoch').reset_index(drop=True)
     df['close'] = df['close'].astype(float)
 
+    # Indicadores principais
     df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
     df['ema9'] = EMAIndicator(df['close'], window=9).ema_indicator()
+    df['ema21'] = EMAIndicator(df['close'], window=21).ema_indicator()
     df['ema55'] = EMAIndicator(df['close'], window=55).ema_indicator()
-    df['ema200'] = EMAIndicator(df['close'], window=200).ema_indicator()
 
+    # Bollinger Bands
     bb = BollingerBands(df['close'], window=20, window_dev=2)
     df['bb_mavg'] = bb.bollinger_mavg()
     df['bb_upper'] = bb.bollinger_hband()
     df['bb_lower'] = bb.bollinger_lband()
+
     return df
 
 def gerar_sinal(df: pd.DataFrame):
+    """
+    Setup 3 - Confluência de Tendência + Reversão RSI/Bollinger
+    CALL: EMA9>EMA21>EMA55, RSI entre 30–45, close <= banda inferior
+    PUT:  EMA9<EMA21<EMA55, RSI entre 55–70, close >= banda superior
+    """
     ultima = df.iloc[-1]
-    ema9 = ultima['ema9']
-    ema55 = ultima['ema55']
-    ema200 = ultima['ema200']
-    rsi = ultima['rsi']
 
-    if pd.isna(ema9) or pd.isna(ema55) or pd.isna(ema200) or pd.isna(rsi):
+    ema9 = ultima['ema9']
+    ema21 = ultima['ema21']
+    ema55 = ultima['ema55']
+    rsi = ultima['rsi']
+    close = ultima['close']
+    bb_upper = ultima['bb_upper']
+    bb_lower = ultima['bb_lower']
+
+    if pd.isna(ema9) or pd.isna(ema21) or pd.isna(ema55) or pd.isna(rsi):
         return None
 
-    if ema9 > ema55 > ema200 and rsi > 52:
+    # --- Condição de COMPRA (CALL)
+    if ema9 > ema21 > ema55 and 30 <= rsi <= 45 and close <= bb_lower:
         return "COMPRA"
-    elif ema9 < ema55 < ema200 and rsi < 48:
+
+    # --- Condição de VENDA (PUT)
+    elif ema9 < ema21 < ema55 and 55 <= rsi <= 70 and close >= bb_upper:
         return "VENDA"
+
     return None
 
 def save_last_candles(df: pd.DataFrame, symbol: str):
@@ -161,12 +171,7 @@ async def fetch_history(ws, symbol: str, granularity: int):
         return None
     return data.get("candles")
 
-# ✅ Correção aplicada aqui
 async def subscribe_candles(ws, symbol: str, granularity: int):
-    """
-    Corrigido: uso de 'ticks_history' + style=candles + subscribe=1,
-    conforme a API atual da Deriv.
-    """
     req = {
         "ticks_history": symbol,
         "style": "candles",
