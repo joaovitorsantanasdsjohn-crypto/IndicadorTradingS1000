@@ -41,13 +41,14 @@ DATA_DIR.mkdir(exist_ok=True)
 MAX_CONCURRENT_WS = 3
 ws_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WS)
 last_notify_time = {}
+sent_download_message = {}  # <--- controla se já avisou o download do par
 
 # ---------------- Telegram ----------------
 def send_telegram(message: str, symbol: str = None):
     now = time.time()
     if symbol:
         last_time = last_notify_time.get(symbol, 0)
-        if now - last_time < 300:
+        if now - last_time < 3:
             return
         last_notify_time[symbol] = now
 
@@ -65,9 +66,8 @@ def send_telegram(message: str, symbol: str = None):
 # ---------------- Controle de horário Forex ----------------
 def is_forex_open() -> bool:
     now = datetime.now(timezone.utc)
-    weekday = now.weekday()  # 0=segunda ... 6=domingo
+    weekday = now.weekday()
     hour = now.hour
-
     if weekday == 6 and (hour < 22):
         return False
     if weekday == 4 and (hour >= 21):
@@ -76,39 +76,30 @@ def is_forex_open() -> bool:
         return False
     if weekday == 6 and hour < 22:
         return False
-
     return True
 
-# ---------------- Indicadores (Setup Avançado sem EMA200) ----------------
+# ---------------- Indicadores ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values('epoch').reset_index(drop=True)
     df['close'] = df['close'].astype(float)
-
     df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
     df['ema9'] = EMAIndicator(df['close'], window=9).ema_indicator()
     df['ema21'] = EMAIndicator(df['close'], window=21).ema_indicator()
     df['ema55'] = EMAIndicator(df['close'], window=55).ema_indicator()
-
     bb = BollingerBands(df['close'], window=20, window_dev=2)
     df['bb_mavg'] = bb.bollinger_mavg()
     df['bb_upper'] = bb.bollinger_hband()
     df['bb_lower'] = bb.bollinger_lband()
-
     return df
 
 def gerar_sinal(df: pd.DataFrame):
     ultima = df.iloc[-1]
-    ema9 = ultima['ema9']
-    ema21 = ultima['ema21']
-    ema55 = ultima['ema55']
-    rsi = ultima['rsi']
-    close = ultima['close']
-    bb_upper = ultima['bb_upper']
-    bb_lower = ultima['bb_lower']
+    ema9, ema21, ema55 = ultima['ema9'], ultima['ema21'], ultima['ema55']
+    rsi, close = ultima['rsi'], ultima['close']
+    bb_upper, bb_lower = ultima['bb_upper'], ultima['bb_lower']
 
     if pd.isna(ema9) or pd.isna(ema21) or pd.isna(ema55) or pd.isna(rsi):
         return None
-
     if ema9 > ema21 > ema55 and 30 <= rsi <= 45 and close <= bb_lower:
         return "COMPRA"
     elif ema9 < ema21 < ema55 and 55 <= rsi <= 70 and close >= bb_upper:
@@ -139,13 +130,7 @@ async def authorize_deriv(ws):
         return False
 
 async def fetch_history(ws, symbol: str, granularity: int):
-    req = {
-        "ticks_history": symbol,
-        "count": 200,
-        "end": "latest",
-        "granularity": granularity,
-        "style": "candles"
-    }
+    req = {"ticks_history": symbol, "count": 200, "end": "latest", "granularity": granularity, "style": "candles"}
     await ws.send(json.dumps(req))
     data = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
     if "error" in data:
@@ -154,19 +139,13 @@ async def fetch_history(ws, symbol: str, granularity: int):
     return data.get("candles")
 
 async def subscribe_candles(ws, symbol: str, granularity: int):
-    req = {
-        "ticks_history": symbol,
-        "style": "candles",
-        "granularity": granularity,
-        "end": "latest",
-        "subscribe": 1
-    }
+    req = {"ticks_history": symbol, "style": "candles", "granularity": granularity, "end": "latest", "subscribe": 1}
     await ws.send(json.dumps(req))
 
-# ----------- MODIFICADO: monitor_symbol COM DEBUG -----------
 async def monitor_symbol(symbol: str, start_delay: float = 0.0):
     await asyncio.sleep(start_delay)
     connected_once = False
+    sent_download_message[symbol] = False  # inicializa controle
 
     while True:
         if not is_forex_open():
@@ -178,17 +157,14 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
         try:
             async with websockets.connect(WS_URL) as ws:
                 if not await authorize_deriv(ws):
-                    send_telegram(f"❌ Falha na autorização Deriv para {symbol}", symbol)
                     break
 
                 if not connected_once:
-                    send_telegram(f"✅ Conexão WebSocket aberta para {symbol} (REAL).", symbol)
                     connected_once = True
                 print(f"[{symbol}] 🔌 Conectado à Deriv (real).")
 
                 candles = await fetch_history(ws, symbol, CANDLE_INTERVAL * 60)
                 if not candles:
-                    send_telegram(f"⚠️ Nenhum candle inicial retornado para {symbol}", symbol)
                     break
 
                 df = pd.DataFrame(candles)
@@ -196,23 +172,22 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                 df_ind = calcular_indicadores(df)
                 save_last_candles(df_ind, symbol)
 
-                last_epoch = df_ind.iloc[-1]['epoch']
-                send_telegram(f"📊 [{symbol}] Histórico inicial carregado ({len(df)} candles). Último close: {df_ind.iloc[-1]['close']:.5f}", symbol)
+                # Envia apenas uma vez a confirmação de download
+                if not sent_download_message[symbol]:
+                    send_telegram(f"📥 [{symbol}] Download de velas executado com sucesso ({len(df)} candles).", symbol)
+                    sent_download_message[symbol] = True
 
+                last_epoch = df_ind.iloc[-1]['epoch']
                 await subscribe_candles(ws, symbol, CANDLE_INTERVAL * 60)
                 print(f"[{symbol}] 🔔 Assinatura de candles iniciada ({CANDLE_INTERVAL}m).")
 
                 while True:
                     if not is_forex_open():
-                        print(f"[{symbol}] ⚠️ Mercado fechou durante execução — pausa.")
-                        send_telegram(f"🌙 Mercado Forex fechado — pausando análise de {symbol}.", symbol)
                         break
-
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=180)
                         data = json.loads(msg)
                         if "error" in data:
-                            print(f"[{symbol}] ⚠️ Erro Deriv: {data['error']}")
                             break
 
                         candle = data.get("candles") or data.get("candle")
@@ -220,19 +195,12 @@ async def monitor_symbol(symbol: str, start_delay: float = 0.0):
                             epoch = candle.get("epoch")
                             if epoch and epoch != last_epoch:
                                 last_epoch = epoch
-                                close = float(candle["close"])
                                 df.loc[len(df)] = candle
                                 df_ind = calcular_indicadores(df)
                                 sinal = gerar_sinal(df_ind)
-
-                                ultima = df_ind.iloc[-1]
-                                print(f"[{symbol}] 🔍 DEBUG — EMA9:{ultima['ema9']:.5f}, EMA21:{ultima['ema21']:.5f}, EMA55:{ultima['ema55']:.5f}, RSI:{ultima['rsi']:.2f}, Close:{ultima['close']:.5f}, BB_low:{ultima['bb_lower']:.5f}, BB_up:{ultima['bb_upper']:.5f}")
-
                                 if sinal:
-                                    msg = f"💹 *Sinal {sinal}* detectado em {symbol}!\nRSI:{ultima['rsi']:.2f}\nClose:{ultima['close']:.5f}"
-                                    send_telegram(msg, symbol)
+                                    send_telegram(f"💹 [{symbol}] *Sinal {sinal}* detectado!", symbol)
                     except asyncio.TimeoutError:
-                        print(f"[{symbol}] ⏳ Timeout aguardando novo candle.")
                         break
         except Exception as e:
             print(f"[{symbol}] ⚠️ Erro WebSocket: {e}")
@@ -254,7 +222,7 @@ def run_flask():
 # ---------------- Execução principal ----------------
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
-    send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise! 🔍 (LER: usa conta REAL)")
+    send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise! 🔍 (conta REAL)")
 
     group_size = 2
     delay_between_groups = 30
