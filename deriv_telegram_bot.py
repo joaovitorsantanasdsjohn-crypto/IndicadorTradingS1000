@@ -82,7 +82,6 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
     rsi, close = ultima['rsi'], ultima['close']
     bb_upper, bb_lower = ultima['bb_upper'], ultima['bb_lower']
 
-    # DEBUG: Log de cálculo
     print(f"\n🧮 [{symbol}] Indicadores calculados:")
     print(f"   RSI={rsi:.2f} | EMA9={ema9:.5f} | EMA21={ema21:.5f} | EMA55={ema55:.5f}")
     print(f"   Bollinger: lower={bb_lower:.5f} | upper={bb_upper:.5f} | close={close:.5f}")
@@ -91,7 +90,6 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         print(f"⚠️ [{symbol}] Indicadores incompletos — aguardando mais dados...")
         return None
 
-    # Condições com logs de decisão
     if ema9 > ema21 > ema55 and 30 <= rsi <= 45 and close <= bb_lower:
         print(f"✅ [{symbol}] Condição de *COMPRA* atendida!")
         return "COMPRA"
@@ -159,7 +157,6 @@ async def monitor_symbol(symbol: str):
                     if not candle:
                         continue
 
-                    # DEBUG: log do candle recebido
                     candle_time = datetime.utcfromtimestamp(candle['epoch']).strftime('%H:%M:%S')
                     print(f"📊 [{symbol}] Novo candle recebido às {candle_time} UTC | close={candle['close']}")
 
@@ -177,6 +174,27 @@ async def monitor_symbol(symbol: str):
             print(f"⚠️ [{symbol}] erro WebSocket: {e}")
             await asyncio.sleep(random.uniform(3, 7))
 
+# ---------------- Verificação de pares existentes ----------------
+async def verificar_pares_existentes():
+    print("🔍 Verificando pares disponíveis na Deriv...")
+    async with websockets.connect(WS_URL, ping_interval=None) as ws:
+        await ws.send(json.dumps({"active_symbols": "brief", "product_type": "basic"}))
+        response = json.loads(await ws.recv())
+        ativos = [s["symbol"] for s in response.get("active_symbols", [])]
+
+        pares_invalidos = [s for s in SYMBOLS if s not in ativos]
+        pares_validos = [s for s in SYMBOLS if s in ativos]
+
+        msg = f"📊 Verificação de pares concluída:\n"
+        msg += f"✅ {len(pares_validos)} pares válidos\n"
+        if pares_invalidos:
+            msg += f"⚠️ {len(pares_invalidos)} inválidos:\n" + ", ".join(pares_invalidos)
+        else:
+            msg += "🟢 Todos os pares são válidos!"
+
+        print(msg)
+        send_telegram(msg)
+
 # ---------------- Flask ----------------
 app = Flask(__name__)
 
@@ -193,6 +211,8 @@ async def main():
     threading.Thread(target=run_flask, daemon=True).start()
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise! 🔍 (conta REAL)")
     print("▶ Iniciando monitoramento paralelo por par (modo debug detalhado)...")
+
+    await verificar_pares_existentes()  # <<< NOVO BLOCO ADICIONADO
 
     tasks = [monitor_symbol(symbol) for symbol in SYMBOLS]
     await asyncio.gather(*tasks)
