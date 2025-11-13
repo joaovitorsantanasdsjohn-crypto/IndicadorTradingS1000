@@ -31,7 +31,8 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 SYMBOLS = [
     "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
     "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
-    "frxEURAUD", "frxAUDJPY", "frxGBPAUD","frxGBPCAD", "frxAUDNZD", "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
+    "frxEURAUD", "frxAUDJPY", "frxGBPAUD","frxGBPCAD", "frxAUDNZD",
+    "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
 ]
 
 DATA_DIR = Path("./candles_data")
@@ -141,6 +142,10 @@ async def monitor_symbol(symbol: str):
                 df = pd.DataFrame(data["candles"])
                 df = calcular_indicadores(df)
                 save_last_candles(df, symbol)
+
+                # 🔹 ADIÇÃO: Forçar log e cálculo imediato na inicialização
+                print(f"\n🔍 [{symbol}] Exibindo cálculo inicial dos indicadores após o primeiro download...")
+                gerar_sinal(df, symbol)
 
                 if not sent_download_message[symbol]:
                     send_telegram(f"📥 [{symbol}] Download de velas executado com sucesso ({len(df)} candles).", symbol)
