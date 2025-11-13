@@ -117,7 +117,9 @@ async def monitor_all_symbols():
         if not auth_resp.get("authorize"):
             print("❌ Falha na autorização:", auth_resp)
             return
+
         print("🔐 Autorizado na Deriv.")
+        send_telegram("🔌 Conexão WebSocket estabelecida com sucesso e autorizada na Deriv! ✅")
 
         # Histórico inicial
         for symbol in SYMBOLS:
