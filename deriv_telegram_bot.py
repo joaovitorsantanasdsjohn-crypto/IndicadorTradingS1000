@@ -174,33 +174,60 @@ async def monitor_symbol(symbol: str):
             print(f"⚠️ [{symbol}] erro WebSocket: {e}")
             await asyncio.sleep(random.uniform(3, 7))
 
-# ---------------- Verificação de pares existentes ----------------
-async def verificar_pares_existentes():
-    print("🔍 Verificando pares disponíveis na Deriv...")
+# ---------------- Verificação de pares e candles ----------------
+async def verificar_pares_e_candles():
+    print("🔍 Verificando pares e dados de candles na Deriv...")
+    pares_validos = []
+    pares_invalidos = []
+    pares_sem_dados = []
+
     async with websockets.connect(WS_URL, ping_interval=None) as ws:
         await ws.send(json.dumps({"active_symbols": "brief", "product_type": "basic"}))
         response = json.loads(await ws.recv())
         ativos = [s["symbol"] for s in response.get("active_symbols", [])]
 
-        pares_invalidos = [s for s in SYMBOLS if s not in ativos]
-        pares_validos = [s for s in SYMBOLS if s in ativos]
+        # Etapa 1 — validar símbolos existentes
+        for s in SYMBOLS:
+            if s in ativos:
+                pares_validos.append(s)
+            else:
+                pares_invalidos.append(s)
 
-        msg = f"📊 Verificação de pares concluída:\n"
-        msg += f"✅ {len(pares_validos)} pares válidos\n"
-        if pares_invalidos:
-            msg += f"⚠️ {len(pares_invalidos)} inválidos:\n" + ", ".join(pares_invalidos)
-        else:
-            msg += "🟢 Todos os pares são válidos!"
+        # Etapa 2 — testar candles dos pares válidos
+        for s in pares_validos.copy():
+            try:
+                req_hist = {"ticks_history": s, "count": 10, "end": "latest",
+                            "granularity": CANDLE_INTERVAL * 60, "style": "candles"}
+                await ws.send(json.dumps(req_hist))
+                data = json.loads(await ws.recv())
+                if "candles" not in data or len(data["candles"]) == 0:
+                    pares_sem_dados.append(s)
+                    pares_validos.remove(s)
+                    print(f"⚠️ [{s}] Não retornou dados de candles — removido da lista de monitoramento.")
+            except Exception as e:
+                print(f"❌ Erro ao testar candles de {s}: {e}")
+                pares_validos.remove(s)
+                pares_sem_dados.append(s)
 
-        print(msg)
-        send_telegram(msg)
+    msg = f"📊 Verificação de pares concluída:\n"
+    msg += f"✅ {len(pares_validos)} pares válidos com dados\n"
+    if pares_invalidos:
+        msg += f"⚠️ {len(pares_invalidos)} inválidos (não existem):\n" + ", ".join(pares_invalidos) + "\n"
+    if pares_sem_dados:
+        msg += f"❌ {len(pares_sem_dados)} sem candles disponíveis:\n" + ", ".join(pares_sem_dados)
+    else:
+        msg += "🟢 Todos os pares válidos têm candles!"
+
+    print(msg)
+    send_telegram(msg)
+    return pares_validos
 
 # ---------------- Flask ----------------
 app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Bot ativo ✅ (versão multi-conexão com debug detalhado)"
+    return "Bot ativo ✅ (verificação automática de pares e candles)"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -210,11 +237,16 @@ def run_flask():
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise! 🔍 (conta REAL)")
-    print("▶ Iniciando monitoramento paralelo por par (modo debug detalhado)...")
+    print("▶ Iniciando validação completa de pares antes do monitoramento...")
 
-    await verificar_pares_existentes()  # <<< NOVO BLOCO ADICIONADO
+    pares_validos = await verificar_pares_e_candles()
+    if not pares_validos:
+        send_telegram("🚫 Nenhum par válido encontrado — encerrando execução.")
+        print("🚫 Nenhum par válido — encerrando.")
+        return
 
-    tasks = [monitor_symbol(symbol) for symbol in SYMBOLS]
+    print(f"▶ Iniciando monitoramento de {len(pares_validos)} pares válidos.")
+    tasks = [monitor_symbol(symbol) for symbol in pares_validos]
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
