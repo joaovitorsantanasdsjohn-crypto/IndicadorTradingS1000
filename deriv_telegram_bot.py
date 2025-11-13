@@ -38,7 +38,6 @@ SYMBOLS = [
 DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# Controle de mensagens
 last_notify_time = {}
 sent_download_message = {s: False for s in SYMBOLS}
 
@@ -62,19 +61,6 @@ def send_telegram(message: str, symbol: str = None):
     except Exception as e:
         print(f"❌ Erro ao enviar Telegram: {e}")
 
-# ---------------- Controle de horário Forex ----------------
-def is_forex_open() -> bool:
-    now = datetime.now(timezone.utc)
-    weekday = now.weekday()
-    hour = now.hour
-    if weekday == 6 and hour < 22:
-        return False
-    if weekday == 4 and hour >= 21:
-        return False
-    if weekday == 5:
-        return False
-    return True
-
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values('epoch').reset_index(drop=True)
@@ -89,30 +75,42 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df['bb_lower'] = bb.bollinger_lband()
     return df
 
+# ---------------- Geração de sinal ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
     ultima = df.iloc[-1]
     ema9, ema21, ema55 = ultima['ema9'], ultima['ema21'], ultima['ema55']
     rsi, close = ultima['rsi'], ultima['close']
     bb_upper, bb_lower = ultima['bb_upper'], ultima['bb_lower']
 
-    print(f"\n🧩 [{symbol}] Analisando último candle")
-    print(f"• RSI={rsi:.2f} | EMA9={ema9:.5f} | EMA21={ema21:.5f} | EMA55={ema55:.5f}")
-    print(f"• BB Lower={bb_lower:.5f} | Upper={bb_upper:.5f} | Close={close:.5f}")
+    # DEBUG: Log de cálculo
+    print(f"\n🧮 [{symbol}] Indicadores calculados:")
+    print(f"   RSI={rsi:.2f} | EMA9={ema9:.5f} | EMA21={ema21:.5f} | EMA55={ema55:.5f}")
+    print(f"   Bollinger: lower={bb_lower:.5f} | upper={bb_upper:.5f} | close={close:.5f}")
 
     if pd.isna(ema9) or pd.isna(ema21) or pd.isna(ema55) or pd.isna(rsi):
+        print(f"⚠️ [{symbol}] Indicadores incompletos — aguardando mais dados...")
         return None
 
+    # Condições com logs de decisão
     if ema9 > ema21 > ema55 and 30 <= rsi <= 45 and close <= bb_lower:
+        print(f"✅ [{symbol}] Condição de *COMPRA* atendida!")
         return "COMPRA"
     elif ema9 < ema21 < ema55 and 55 <= rsi <= 70 and close >= bb_upper:
+        print(f"✅ [{symbol}] Condição de *VENDA* atendida!")
         return "VENDA"
+    else:
+        print(f"🚫 [{symbol}] Nenhum sinal — condições não atendidas.")
+        print(f"   EMA alinhadas: {ema9>ema21>ema55 or ema9<ema21<ema55}")
+        print(f"   RSI={rsi:.2f} (compra→30-45 | venda→55-70)")
+        print(f"   Fechamento vs Bollinger: close={close:.5f} | bb_lower={bb_lower:.5f} | bb_upper={bb_upper:.5f}")
     return None
 
+# ---------------- Salvar candles ----------------
 def save_last_candles(df: pd.DataFrame, symbol: str):
     path = DATA_DIR / f"candles_{symbol}.csv"
     df.tail(200).to_csv(path, index=False)
 
-# ---------------- Monitor individual por símbolo ----------------
+# ---------------- Monitor por símbolo ----------------
 async def monitor_symbol(symbol: str):
     reconnect_count = 0
     while True:
@@ -124,7 +122,6 @@ async def monitor_symbol(symbol: str):
                 else:
                     print(f"🔌 [{symbol}] Nova conexão iniciada.")
 
-                # Autorizar
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 auth = json.loads(await ws.recv())
                 if not auth.get("authorize"):
@@ -132,7 +129,6 @@ async def monitor_symbol(symbol: str):
                     await asyncio.sleep(10)
                     continue
 
-                # Histórico inicial
                 req_hist = {"ticks_history": symbol, "count": 200, "end": "latest",
                             "granularity": CANDLE_INTERVAL * 60, "style": "candles"}
                 await ws.send(json.dumps(req_hist))
@@ -150,20 +146,22 @@ async def monitor_symbol(symbol: str):
                     send_telegram(f"📥 [{symbol}] Download de velas executado com sucesso ({len(df)} candles).", symbol)
                     sent_download_message[symbol] = True
 
-                # Assinar candle ao vivo
                 sub_req = {"ticks_history": symbol, "style": "candles",
                            "granularity": CANDLE_INTERVAL * 60, "end": "latest", "subscribe": 1}
                 await ws.send(json.dumps(sub_req))
 
-                print(f"✅ [{symbol}] Conexão ativa e assinada.")
+                print(f"✅ [{symbol}] Conexão ativa e assinada (recebendo candles ao vivo).")
 
-                # Receber dados ao vivo
                 while True:
                     msg = await asyncio.wait_for(ws.recv(), timeout=180)
                     data = json.loads(msg)
                     candle = data.get("candle")
                     if not candle:
                         continue
+
+                    # DEBUG: log do candle recebido
+                    candle_time = datetime.utcfromtimestamp(candle['epoch']).strftime('%H:%M:%S')
+                    print(f"📊 [{symbol}] Novo candle recebido às {candle_time} UTC | close={candle['close']}")
 
                     if df.iloc[-1]['epoch'] != candle['epoch']:
                         df.loc[len(df)] = candle
@@ -184,7 +182,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Bot ativo ✅ (versão multi-conexão com reconexão)"
+    return "Bot ativo ✅ (versão multi-conexão com debug detalhado)"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -194,7 +192,7 @@ def run_flask():
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise! 🔍 (conta REAL)")
-    print("▶ Iniciando monitoramento paralelo por par...")
+    print("▶ Iniciando monitoramento paralelo por par (modo debug detalhado)...")
 
     tasks = [monitor_symbol(symbol) for symbol in SYMBOLS]
     await asyncio.gather(*tasks)
