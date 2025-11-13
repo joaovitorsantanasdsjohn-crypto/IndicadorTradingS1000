@@ -31,8 +31,7 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 SYMBOLS = [
     "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
     "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
-    "frxEURAUD", "frxAUDJPY", "frxCHFJPY", "frxCADJPY", "frxGBPAUD",
-    "frxGBPCAD", "frxAUDNZD", "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
+    "frxEURAUD", "frxAUDJPY", "frxGBPAUD","frxGBPCAD", "frxAUDNZD", "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
 ]
 
 DATA_DIR = Path("./candles_data")
