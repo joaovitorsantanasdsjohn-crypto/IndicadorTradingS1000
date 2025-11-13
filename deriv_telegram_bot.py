@@ -90,19 +90,33 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df['bb_lower'] = bb.bollinger_lband()
     return df
 
-def gerar_sinal(df: pd.DataFrame):
+def gerar_sinal(df: pd.DataFrame, symbol: str):
     ultima = df.iloc[-1]
     ema9, ema21, ema55 = ultima['ema9'], ultima['ema21'], ultima['ema55']
     rsi, close = ultima['rsi'], ultima['close']
     bb_upper, bb_lower = ultima['bb_upper'], ultima['bb_lower']
 
+    # Debug detalhado
+    print(f"\n🧩 Analisando [{symbol}]")
+    print(f"• Último preço: {close:.5f}")
+    print(f"• RSI: {rsi:.2f}")
+    print(f"• EMA9: {ema9:.5f} | EMA21: {ema21:.5f} | EMA55: {ema55:.5f}")
+    print(f"• BB: Lower={bb_lower:.5f} | Upper={bb_upper:.5f}")
+
     if pd.isna(ema9) or pd.isna(ema21) or pd.isna(ema55) or pd.isna(rsi):
+        print("⚠️ Dados insuficientes para gerar sinal.")
         return None
+
+    # Condições de compra/venda
     if ema9 > ema21 > ema55 and 30 <= rsi <= 45 and close <= bb_lower:
+        print("✅ Condição de COMPRA confirmada.")
         return "COMPRA"
     elif ema9 < ema21 < ema55 and 55 <= rsi <= 70 and close >= bb_upper:
+        print("✅ Condição de VENDA confirmada.")
         return "VENDA"
-    return None
+    else:
+        print("❌ Nenhum sinal válido identificado neste candle.")
+        return None
 
 def save_last_candles(df: pd.DataFrame, symbol: str):
     path = DATA_DIR / f"candles_{symbol}.csv"
@@ -110,7 +124,7 @@ def save_last_candles(df: pd.DataFrame, symbol: str):
 
 # ---------------- WebSocket único ----------------
 async def monitor_all_symbols():
-    async with websockets.connect(WS_URL) as ws:
+    async with websockets.connect(WS_URL, ping_interval=None) as ws:
         # Autorizar
         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
         auth_resp = json.loads(await ws.recv())
@@ -178,9 +192,9 @@ async def monitor_all_symbols():
                     df = calcular_indicadores(df)
                     candles_data[symbol] = df
 
-                    sinal = gerar_sinal(df)
+                    sinal = gerar_sinal(df, symbol)
                     ultima = df.iloc[-1]
-                    print(f"[{symbol}] 🧩 Close={ultima['close']:.5f}, RSI={ultima['rsi']:.2f}, "
+                    print(f"[{symbol}] Close={ultima['close']:.5f}, RSI={ultima['rsi']:.2f}, "
                           f"EMA9={ultima['ema9']:.5f}, EMA21={ultima['ema21']:.5f}, EMA55={ultima['ema55']:.5f}, "
                           f"Sinal={sinal or 'Nenhum'}")
 
@@ -188,6 +202,7 @@ async def monitor_all_symbols():
                         send_telegram(f"💹 [{symbol}] *Sinal {sinal}* detectado!", symbol)
 
             except asyncio.TimeoutError:
+                print("⏳ Timeout sem dados, aguardando novas velas...")
                 continue
             except Exception as e:
                 print(f"⚠️ Erro WebSocket: {e}")
