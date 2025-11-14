@@ -302,7 +302,7 @@ async def monitor_symbol(symbol: str):
                             sinal = gerar_sinal(df, symbol)
                             if sinal:
                                 # ------------------------------
-                                # NOVA FORMATAÇÃO DO SINAL
+                                # NOVA FORMATAÇÃO DO SINAL (Modelo 1)
                                 # ------------------------------
                                 arrow = "🟢" if sinal == "COMPRA" else "🔴"
                                 close_price = float(df.iloc[-1]["close"])
