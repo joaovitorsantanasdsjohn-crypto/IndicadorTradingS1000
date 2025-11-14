@@ -150,11 +150,6 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         return None
 
     # Ajuste de "afrouxamento":
-    # - usamos só EMA9 vs EMA21 (EMA55 continua para info)
-    # - RSI faixa mais ampla para permitir mais sinais
-    # - Bollinger ajustada: testamos proximidade com banda usando um ponto intermediário
-    #   * buy_threshold = bb_lower + 0.4*(bb_mavg - bb_lower)
-    #   * sell_threshold = bb_upper - 0.4*(bb_upper - bb_mavg)
     buy_threshold = bb_lower + 0.4 * (bb_mavg - bb_lower)
     sell_threshold = bb_upper - 0.4 * (bb_upper - bb_mavg)
 
@@ -162,18 +157,15 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
     buy_cond = (ema9 > ema21) and (35 <= rsi <= 55) and (close <= buy_threshold)
     sell_cond = (ema9 < ema21) and (45 <= rsi <= 65) and (close >= sell_threshold)
 
-    # log das condições avaliadas (pequeno)
     log(f"   Avaliação cond: buy_cond={buy_cond} | sell_cond={sell_cond} | buy_thr={buy_threshold:.5f} | sell_thr={sell_threshold:.5f}")
 
     # Opção A: evitar repetir sinal até condição limpar
     current_state = last_signal_state.get(symbol)
 
-    # Se já há sinal ativo do mesmo tipo e foi gerado no mesmo candle, não reenvia
     if buy_cond:
         if current_state == "COMPRA" and last_signal_candle.get(symbol) == epoch:
             log(f"   [{symbol}] Sinal COMPRA já enviado para este candle (skip).")
             return None
-        # só envia COMPRA se não houver COMPRA ativa (ou se a condição estava limpa antes)
         if current_state != "COMPRA":
             last_signal_state[symbol] = "COMPRA"
             last_signal_candle[symbol] = epoch
@@ -196,7 +188,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             log(f"   [{symbol}] VENDA já ativa, aguardando limpeza da condição.")
             return None
 
-    # Se nenhuma condição ativa, limpa estado (permite novo sinal quando reaparecer)
+    # Se nenhuma condição ativa, limpa estado
     if not buy_cond and not sell_cond:
         if last_signal_state.get(symbol) is not None:
             log(f"🔄 [{symbol}] Condição limpa — sinal anterior ({last_signal_state[symbol]}) removido.")
@@ -261,11 +253,10 @@ async def monitor_symbol(symbol: str):
                 df = calcular_indicadores(df)
                 save_last_candles(df, symbol)
 
-                # FORÇAR cálculo inicial (mostra no log se indicadores prontos e razão)
+                # FORÇAR cálculo inicial
                 try:
                     initial_signal = gerar_sinal(df, symbol)
                     if initial_signal:
-                        # só notifica via telegram se já houver sinal ativo e ainda não notificado
                         send_telegram(f"📥 [{symbol}] Download de velas executado com sucesso ({len(df)} candles). Sinal inicial: *{initial_signal}*.", symbol)
                         sent_download_message[symbol] = True
                     else:
@@ -287,37 +278,46 @@ async def monitor_symbol(symbol: str):
 
                 ultimo_candle_time = time.time()
 
-                # Loop de recebimento
+                # Loop vivo
                 while True:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=180)
                         data = json.loads(msg)
 
-                        # mensagens podem ser variadas — buscamos candle
                         candle = data.get("candle")
-                        # some responses are subscriptions updates with 'history' etc.; we ignore when no candle
                         if not candle:
                             continue
 
-                        # log do candle recebido
                         candle_time = datetime.utcfromtimestamp(candle['epoch']).strftime('%Y-%m-%d %H:%M:%S')
                         log(f"📊 [{symbol}] Novo candle recebido às {candle_time} UTC | close={candle['close']}")
 
                         ultimo_candle_time = time.time()
 
                         # atualiza df e indicadores
-                        # prevenir que df esteja vazio
                         if df.empty or df.iloc[-1]['epoch'] != candle['epoch']:
                             df.loc[len(df)] = candle
                             df = calcular_indicadores(df)
                             save_last_candles(df, symbol)
-                            # gera sinal e envia conforme lógica
+
                             sinal = gerar_sinal(df, symbol)
                             if sinal:
-                                # Envia apenas 1 sinal por condição (Opção A)
-                                send_telegram(f"💹 [{symbol}] *Sinal {sinal}* detectado! (fechamento do candle {CANDLE_INTERVAL}m)", symbol)
+                                # ------------------------------
+                                # NOVA FORMATAÇÃO DO SINAL
+                                # ------------------------------
+                                arrow = "🟢" if sinal == "COMPRA" else "🔴"
+                                close_price = float(df.iloc[-1]["close"])
+                                utc_time = datetime.utcnow().strftime('%H:%M:%S')
+
+                                mensagem_sinal = (
+                                    f"📊 *NOVO SINAL — M{CANDLE_INTERVAL}*\n"
+                                    f"• Par: {symbol.replace('frx','')}\n"
+                                    f"• Direção: {arrow} *{sinal}*\n"
+                                    f"• Preço: {close_price:.5f}\n"
+                                    f"• Horário: {utc_time} UTC"
+                                )
+
+                                send_telegram(mensagem_sinal, symbol)
                     except asyncio.TimeoutError:
-                        # Se ficar muito tempo sem candle, reconecta
                         if time.time() - ultimo_candle_time > 300:
                             log(f"⚠️ [{symbol}] Nenhum candle há 5 minutos — forçando reconexão.", "warning")
                             raise Exception("Reconexão forçada por inatividade")
@@ -327,7 +327,6 @@ async def monitor_symbol(symbol: str):
 
         except Exception as e:
             log(f"⚠️ [{symbol}] Erro WebSocket / loop: {e}", "error")
-            # espera randômica antes de reconectar para evitar bursts no Render gratuito
             wait = random.uniform(3, 8)
             log(f"⏳ [{symbol}] Aguardando {wait:.1f}s antes de tentar reconectar...", "info")
             await asyncio.sleep(wait)
@@ -341,18 +340,15 @@ def index():
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    # Forçar log de start do Flask
     log(f"🌐 Flask rodando na porta {port}")
     app.run(host="0.0.0.0", port=port)
 
 # ---------------- Execução principal ----------------
 async def main():
-    # starta Flask em thread
     threading.Thread(target=run_flask, daemon=True).start()
     send_telegram("✅ Bot iniciado com sucesso no Render e pronto para análise! 🔍 (conta REAL)")
     log("▶ Iniciando monitoramento paralelo por par (modo estável com reconexão automática)...")
 
-    # cria tasks paralelas, uma conexão por par (mantido para robustez)
     tasks = [monitor_symbol(symbol) for symbol in SYMBOLS]
     await asyncio.gather(*tasks)
 
