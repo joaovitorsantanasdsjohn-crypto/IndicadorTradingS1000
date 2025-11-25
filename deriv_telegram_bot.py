@@ -1,5 +1,5 @@
 # ===============================================================
-# deriv_telegram_bot.py — versão com NOVA LÓGICA DE SINAIS
+# deriv_telegram_bot.py — versão com NOVA LÓGICA DE SINAIS (CRUZAMENTO)
 # ===============================================================
 
 import asyncio
@@ -12,7 +12,7 @@ from ta.trend import EMAIndicator
 from ta.volatility import BollingerBands
 
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import os
 import threading
@@ -44,11 +44,11 @@ SYMBOLS = [
 DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# Controle
-last_signal_state = {s: None for s in SYMBOLS}
-last_signal_candle = {s: None for s in SYMBOLS}
+# Controle de estado de sinais
+last_signal_state = {s: None for s in SYMBOLS}       # None / "COMPRA" / "VENDA"
+last_signal_candle = {s: None for s in SYMBOLS}      # epoch do candle que gerou o último sinal
 sent_download_message = {s: False for s in SYMBOLS}
-last_notify_time = {}
+last_notify_time = {}                                # throttle Telegram por par
 
 # ---------------- Logging ----------------
 logger = logging.getLogger("indicador")
@@ -58,203 +58,268 @@ handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 logger.addHandler(handler)
 
 def log(msg: str):
+    """Log para Render + flush imediato."""
     logger.info(msg)
     print(msg, flush=True)
 
-
 # ---------------- Telegram ----------------
 def send_telegram(message: str, symbol: str = None):
+    """Envia mensagem ao Telegram (com throttle por símbolo)."""
     now = time.time()
     if symbol:
         last = last_notify_time.get(symbol, 0)
         if now - last < 3:
+            # evita flood (3s)
             return
         last_notify_time[symbol] = now
 
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        log(f"⚠️ Telegram não configurado. Mensagem não enviada: {message}")
+        return
+
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown"
-        }, timeout=10)
-    except:
-        pass
-
+        payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
+        requests.post(url, data=payload, timeout=10)
+        log(f"Telegram enviado: {message}")
+    except Exception as e:
+        log(f"❌ Erro ao enviar Telegram: {e}")
 
 # ---------------- Indicadores ----------------
-def calcular_indicadores(df: pd.DataFrame):
+def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula EMA20, EMA50, RSI14 e Bollinger20(2)."""
     df = df.sort_values("epoch").reset_index(drop=True)
     df["close"] = df["close"].astype(float)
 
+    # EMAs
     df["ema20"] = EMAIndicator(df["close"], window=20).ema_indicator()
     df["ema50"] = EMAIndicator(df["close"], window=50).ema_indicator()
+
+    # RSI
     df["rsi"] = RSIIndicator(df["close"], window=14).rsi()
 
+    # Bollinger Bands
     bb = BollingerBands(df["close"], window=20, window_dev=2)
     df["bb_upper"] = bb.bollinger_hband()
     df["bb_lower"] = bb.bollinger_lband()
+    df["bb_mavg"] = bb.bollinger_mavg()
 
     return df
 
-
-# ---------------- NOVA LÓGICA DO USUÁRIO ----------------
+# ---------------- Lógica de Sinal (com CRUZAMENTO) ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
-    """ NOVO SETUP:
-        COMPRA:
-            - EMA20 > EMA50
-            - close < banda inferior
-            - RSI < 50
-        VENDA:
-            - EMA20 < EMA50
-            - close > banda superior
-            - RSI > 50
     """
-    ultima = df.iloc[-1]
+    Requisitos (confirmados pelo usuário):
+    - SINAL SÓ APÓS FECHAMENTO DA VELA (executado quando o novo candle chega)
+    - COMPRA:
+        1) EMA20 anterior < EMA50 anterior
+        2) EMA20 atual  > EMA50 atual  (cruzou pra cima)
+        3) close atual < bb_lower (fechou abaixo da banda inferior)
+        4) RSI atual < 50
+    - VENDA:
+        1) EMA20 anterior > EMA50 anterior
+        2) EMA20 atual  < EMA50 atual  (cruzou pra baixo)
+        3) close atual > bb_upper (fechou acima da banda superior)
+        4) RSI atual > 50
+    - evita reenvio do mesmo sinal gerado no mesmo candle
+    """
 
-    epoch = int(ultima["epoch"])
-    close = float(ultima["close"])
-    ema20 = ultima["ema20"]
-    ema50 = ultima["ema50"]
-    rsi = ultima["rsi"]
-    bb_lower = ultima["bb_lower"]
-    bb_upper = ultima["bb_upper"]
-
-    log(f"[{symbol}] close={close:.5f} EMA20={ema20:.5f} EMA50={ema50:.5f} RSI={rsi:.1f} BB_low={bb_lower:.5f} BB_up={bb_upper:.5f}")
-
-    if any(pd.isna([ema20, ema50, rsi, bb_lower, bb_upper])):
+    # precisa de pelo menos 2 candles para detectar cruzamento
+    if len(df) < 2:
         return None
 
-    # ---------------- COMPRA ----------------
-    cond_buy = (
-        ema20 > ema50 and
-        close < bb_lower and
-        rsi < 50
-    )
+    atual = df.iloc[-1]
+    anterior = df.iloc[-2]
 
-    # ---------------- VENDA ----------------
-    cond_sell = (
-        ema20 < ema50 and
-        close > bb_upper and
-        rsi > 50
-    )
+    epoch = int(atual["epoch"])
+    close = float(atual["close"])
 
-    atual = last_signal_state.get(symbol)
+    ema20_now = atual.get("ema20")
+    ema50_now = atual.get("ema50")
+    ema20_prev = anterior.get("ema20")
+    ema50_prev = anterior.get("ema50")
+    rsi_now = atual.get("rsi")
+    bb_lower = atual.get("bb_lower")
+    bb_upper = atual.get("bb_upper")
 
+    # log detalhado para debug
+    try:
+        log(f"[{symbol}] close={close:.5f} EMA20_prev={ema20_prev:.5f} EMA50_prev={ema50_prev:.5f} EMA20_now={ema20_now:.5f} EMA50_now={ema50_now:.5f} RSI={rsi_now:.1f} BB_low={bb_lower:.5f} BB_up={bb_upper:.5f}")
+    except Exception:
+        log(f"[{symbol}] (log indicadores: possível NaN)")
+
+    # validação de NaNs
+    if any(pd.isna([ema20_prev, ema50_prev, ema20_now, ema50_now, rsi_now, bb_lower, bb_upper])):
+        log(f"[{symbol}] Indicadores incompletos (NaN) — aguardando mais candles.")
+        return None
+
+    # condição de COMPRA: cruzamento de baixo->cima + fechamento abaixo da banda inferior + rsi<50
+    cruzou_para_cima = (ema20_prev <= ema50_prev) and (ema20_now > ema50_now)
+    cond_buy = cruzou_para_cima and (close < bb_lower) and (rsi_now < 50)
+
+    # condição de VENDA: cruzamento de cima->baixo + fechamento acima da banda superior + rsi>50
+    cruzou_para_baixo = (ema20_prev >= ema50_prev) and (ema20_now < ema50_now)
+    cond_sell = cruzou_para_baixo and (close > bb_upper) and (rsi_now > 50)
+
+    estado_atual = last_signal_state.get(symbol)
+
+    # COMPRA
     if cond_buy:
-        if atual == "COMPRA" and last_signal_candle[symbol] == epoch:
+        # evita reenviar no mesmo candle
+        if estado_atual == "COMPRA" and last_signal_candle.get(symbol) == epoch:
+            log(f"[{symbol}] COMPRA já enviada neste candle (skip).")
             return None
         last_signal_state[symbol] = "COMPRA"
         last_signal_candle[symbol] = epoch
+        log(f"✅ [{symbol}] SINAL COMPRA gerado (cruzamento + fechamento abaixo BB + RSI<50).")
         return "COMPRA"
 
+    # VENDA
     if cond_sell:
-        if atual == "VENDA" and last_signal_candle[symbol] == epoch:
+        if estado_atual == "VENDA" and last_signal_candle.get(symbol) == epoch:
+            log(f"[{symbol}] VENDA já enviada neste candle (skip).")
             return None
         last_signal_state[symbol] = "VENDA"
         last_signal_candle[symbol] = epoch
+        log(f"✅ [{symbol}] SINAL VENDA gerado (cruzamento + fechamento acima BB + RSI>50).")
         return "VENDA"
 
-    # limpar estado
-    last_signal_state[symbol] = None
-    last_signal_candle[symbol] = None
+    # se nenhuma condição, limpar estado (permite novo sinal quando condição reaparecer)
+    if last_signal_state.get(symbol) is not None:
+        last_signal_state[symbol] = None
+        last_signal_candle[symbol] = None
+        log(f"[{symbol}] Estado de sinal limpo (nenhuma condição ativa).")
 
     return None
 
+# ---------------- Salvar candles ----------------
+def save_last_candles(df: pd.DataFrame, symbol: str):
+    path = DATA_DIR / f"candles_{symbol}.csv"
+    df.tail(200).to_csv(path, index=False)
+    log(f"[{symbol}] Últimos candles salvos em {path}")
 
-# ---------------- Monitor Símbolo ----------------
+# ---------------- Monitor Símbolo (24/7 + reconexão infinita) ----------------
 async def monitor_symbol(symbol: str):
     while True:
         try:
             async with websockets.connect(WS_URL, ping_interval=None) as ws:
-
                 send_telegram(f"🔌 [{symbol}] Conectado ao WebSocket.", symbol)
                 log(f"[{symbol}] WebSocket conectado.")
 
                 # Autorizar
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-                auth = json.loads(await ws.recv())
+                auth_raw = await ws.recv()
+                auth = json.loads(auth_raw)
                 if "authorize" not in auth:
-                    raise Exception(f"Falha na autorização: {auth}")
+                    log(f"[{symbol}] Falha na autorização: {auth}")
+                    raise Exception("Falha na autorização Deriv.")
 
-                # Histórico 200 velas
-                req = {
+                log(f"[{symbol}] Autorizado na Deriv.")
+
+                # Histórico inicial (200 candles)
+                req_hist = {
                     "ticks_history": symbol,
                     "count": 200,
                     "end": "latest",
                     "granularity": CANDLE_INTERVAL * 60,
                     "style": "candles"
                 }
-                await ws.send(json.dumps(req))
-                data = json.loads(await ws.recv())
+                await ws.send(json.dumps(req_hist))
+                data_raw = await ws.recv()
+                data = json.loads(data_raw)
+
+                if "candles" not in data:
+                    log(f"[{symbol}] Histórico inicial sem candles: {data}")
+                    # tenta novamente depois de breve pausa
+                    await asyncio.sleep(5)
+                    continue
 
                 df = pd.DataFrame(data["candles"])
                 df = calcular_indicadores(df)
+                save_last_candles(df, symbol)
 
+                # Mensagem de download (se ainda não enviada)
                 if not sent_download_message[symbol]:
                     send_telegram(f"📥 [{symbol}] Download de velas completo ({len(df)} candles).", symbol)
                     sent_download_message[symbol] = True
 
-                # Assinar realtime
-                sub = {
+                # Subscribes para candles ao vivo
+                sub_req = {
                     "ticks_history": symbol,
                     "style": "candles",
                     "granularity": CANDLE_INTERVAL * 60,
                     "end": "latest",
                     "subscribe": 1
                 }
-                await ws.send(json.dumps(sub))
+                await ws.send(json.dumps(sub_req))
+                log(f"[{symbol}] Assinado para candles ao vivo.")
 
-                last_candle = time.time()
+                ultimo_candle_time = time.time()
 
+                # Loop de recebimento - cada msg geralmente contém campo "candle"
                 while True:
                     raw = await asyncio.wait_for(ws.recv(), timeout=180)
-                    data = json.loads(raw)
+                    msg = json.loads(raw)
 
-                    candle = data.get("candle")
+                    candle = msg.get("candle")
                     if not candle:
+                        # ignorar outros tipos de mensagens
                         continue
 
-                    if df.iloc[-1]["epoch"] != candle["epoch"]:
+                    # se for um novo candle fechado
+                    if df.empty or df.iloc[-1]["epoch"] != candle["epoch"]:
                         df.loc[len(df)] = candle
                         df = calcular_indicadores(df)
+                        save_last_candles(df, symbol)
 
+                        # gera sinal apenas após fechamento (quando candle novo é recebido)
                         sinal = gerar_sinal(df, symbol)
                         if sinal:
                             arrow = "🟢" if sinal == "COMPRA" else "🔴"
-                            msg = (
+                            close_price = float(candle["close"])
+                            utc_time = datetime.utcnow().strftime("%H:%M:%S")
+                            mensagem_sinal = (
                                 f"📊 *NOVO SINAL — M{CANDLE_INTERVAL}*\n"
                                 f"• Par: {symbol.replace('frx','')}\n"
                                 f"• Direção: {arrow} *{sinal}*\n"
-                                f"• Preço: {float(candle['close']):.5f}\n"
-                                f"• Horário: {datetime.utcnow().strftime('%H:%M:%S')} UTC"
+                                f"• Preço: {close_price:.5f}\n"
+                                f"• Horário: {utc_time} UTC"
                             )
-                            send_telegram(msg, symbol)
+                            # envia a mensagem de sinal separada da mensagem de download
+                            send_telegram(mensagem_sinal, symbol)
 
+                    ultimo_candle_time = time.time()
+
+        except asyncio.TimeoutError:
+            log(f"[{symbol}] Timeout de leitura — forçando reconexão.")
+            await asyncio.sleep(random.uniform(1.5, 5.0))
+            continue
         except Exception as e:
-            log(f"[{symbol}] ERRO: {e}")
-            await asyncio.sleep(random.uniform(2, 6))
+            log(f"[{symbol}] ERRO no WebSocket / loop: {e}")
+            # backoff curto com jitter para evitar bursts no Render gratuito
+            await asyncio.sleep(random.uniform(2.0, 6.0))
             continue
 
-
-# ---------------- Flask ----------------
+# ---------------- Flask (diagnóstico) ----------------
 app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Bot ativo — Nova Lógica (EMA+BB+RSI) ✔"
+    return "Bot ativo — Nova lógica: EMA20/50 + BB20 + RSI14 (cruzamento + fechamento)"
 
-
-# ---------------- Execução ----------------
+# ---------------- Execução principal ----------------
 async def main():
-    threading.Thread(target=lambda: app.run(
-        host="0.0.0.0", port=int(os.getenv("PORT", 10000))), daemon=True).start()
+    # roda Flask em thread separada
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000))), daemon=True).start()
 
-    send_telegram("✅ Bot reiniciado com NOVA LÓGICA (EMA20/50 + BB20 + RSI14).")
+    send_telegram("✅ Bot iniciado com NOVA LÓGICA (EMA20/EMA50 + BB20 + RSI14).")
 
-    tasks = [monitor_symbol(sym) for sym in SYMBOLS]
+    # cria tasks paralelas (uma por símbolo)
+    tasks = [monitor_symbol(s) for s in SYMBOLS]
     await asyncio.gather(*tasks)
 
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log("Encerrando...")
