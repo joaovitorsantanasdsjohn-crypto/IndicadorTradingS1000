@@ -1,5 +1,5 @@
 # ===============================================================
-# deriv_telegram_bot.py — versão com NOVA LÓGICA DE SINAIS (CRUZAMENTO)
+# deriv_telegram_bot.py — versão corrigida e instrumentada
 # ===============================================================
 
 import asyncio
@@ -21,6 +21,7 @@ from pathlib import Path
 import time
 import random
 import logging
+import traceback
 
 # ---------------- Inicialização ----------------
 load_dotenv()
@@ -54,13 +55,23 @@ last_notify_time = {}                                # throttle Telegram por par
 logger = logging.getLogger("indicador")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%dT%H:%M:%S"))
 logger.addHandler(handler)
 
-def log(msg: str):
+def log(msg: str, level: str = "info"):
     """Log para Render + flush imediato."""
-    logger.info(msg)
-    print(msg, flush=True)
+    if level == "info":
+        logger.info(msg)
+        print(msg, flush=True)
+    elif level == "warning":
+        logger.warning(msg)
+        print(msg, flush=True)
+    elif level == "error":
+        logger.error(msg)
+        print(msg, flush=True)
+    else:
+        logger.debug(msg)
+        print(msg, flush=True)
 
 # ---------------- Telegram ----------------
 def send_telegram(message: str, symbol: str = None):
@@ -70,20 +81,24 @@ def send_telegram(message: str, symbol: str = None):
         last = last_notify_time.get(symbol, 0)
         if now - last < 3:
             # evita flood (3s)
+            log(f"Telegram rate limit skipped for {symbol}", "warning")
             return
         last_notify_time[symbol] = now
 
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        log(f"⚠️ Telegram não configurado. Mensagem não enviada: {message}")
+        log(f"⚠️ Telegram não configurado. Mensagem não enviada: {message}", "warning")
         return
 
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
-        requests.post(url, data=payload, timeout=10)
-        log(f"Telegram enviado: {message}")
+        r = requests.post(url, data=payload, timeout=10)
+        if r.status_code != 200:
+            log(f"❌ Telegram retornou {r.status_code}: {r.text}", "error")
+        else:
+            log(f"Telegram enviado: {message}")
     except Exception as e:
-        log(f"❌ Erro ao enviar Telegram: {e}")
+        log(f"❌ Erro ao enviar Telegram: {e}\n{traceback.format_exc()}", "error")
 
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
@@ -109,15 +124,15 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------- Lógica de Sinal (com CRUZAMENTO) ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
     """
-    Requisitos (confirmados pelo usuário):
+    Requisitos:
     - SINAL SÓ APÓS FECHAMENTO DA VELA (executado quando o novo candle chega)
     - COMPRA:
-        1) EMA20 anterior < EMA50 anterior
+        1) EMA20 anterior <= EMA50 anterior
         2) EMA20 atual  > EMA50 atual  (cruzou pra cima)
         3) close atual < bb_lower (fechou abaixo da banda inferior)
         4) RSI atual < 50
     - VENDA:
-        1) EMA20 anterior > EMA50 anterior
+        1) EMA20 anterior >= EMA50 anterior
         2) EMA20 atual  < EMA50 atual  (cruzou pra baixo)
         3) close atual > bb_upper (fechou acima da banda superior)
         4) RSI atual > 50
@@ -206,15 +221,26 @@ async def monitor_symbol(symbol: str):
                 send_telegram(f"🔌 [{symbol}] Conectado ao WebSocket.", symbol)
                 log(f"[{symbol}] WebSocket conectado.")
 
-                # Autorizar
+                # Autorizar (envia token e aguarda resposta)
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 auth_raw = await ws.recv()
-                auth = json.loads(auth_raw)
-                if "authorize" not in auth:
-                    log(f"[{symbol}] Falha na autorização: {auth}")
-                    raise Exception("Falha na autorização Deriv.")
+                try:
+                    auth = json.loads(auth_raw)
+                except Exception:
+                    log(f"[{symbol}] Não foi possível parsear authorize response: {auth_raw}", "error")
+                    raise Exception("Authorize parse error")
 
-                log(f"[{symbol}] Autorizado na Deriv.")
+                # Tratar possíveis formatos de resposta:
+                if "error" in auth:
+                    log(f"[{symbol}] Resposta de authorize contém error: {auth}", "error")
+                    raise Exception("Authorize error from Deriv")
+                if "authorize" not in auth:
+                    # log completo para debugging remoto
+                    log(f"[{symbol}] Falha na autorização (payload inesperado): {auth}", "error")
+                    raise Exception("Falha na autorização Deriv (campo 'authorize' ausente).")
+
+                # Autorization ok (registro)
+                log(f"[{symbol}] Autorizado na Deriv: {auth.get('authorize')}")
 
                 # Histórico inicial (200 candles)
                 req_hist = {
@@ -226,10 +252,14 @@ async def monitor_symbol(symbol: str):
                 }
                 await ws.send(json.dumps(req_hist))
                 data_raw = await ws.recv()
-                data = json.loads(data_raw)
+                try:
+                    data = json.loads(data_raw)
+                except Exception:
+                    log(f"[{symbol}] Erro ao parsear histórico inicial: {data_raw}", "error")
+                    raise
 
                 if "candles" not in data:
-                    log(f"[{symbol}] Histórico inicial sem candles: {data}")
+                    log(f"[{symbol}] Histórico inicial sem candles: {data}", "warning")
                     # tenta novamente depois de breve pausa
                     await asyncio.sleep(5)
                     continue
@@ -258,8 +288,22 @@ async def monitor_symbol(symbol: str):
 
                 # Loop de recebimento - cada msg geralmente contém campo "candle"
                 while True:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=180)
-                    msg = json.loads(raw)
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=180)
+                    except asyncio.TimeoutError:
+                        # se ficar sem mensagens por muito tempo, força reconexão
+                        if time.time() - ultimo_candle_time > 300:
+                            log(f"[{symbol}] Nenhum candle há 5 minutos — forçando reconexão.", "warning")
+                            raise Exception("Reconexão forçada por inatividade")
+                        else:
+                            log(f"[{symbol}] Timeout aguardando mensagem, mantendo conexão...", "info")
+                            continue
+
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        log(f"[{symbol}] Mensagem não-JSON recebida: {raw}", "warning")
+                        continue
 
                     candle = msg.get("candle")
                     if not candle:
@@ -290,12 +334,8 @@ async def monitor_symbol(symbol: str):
 
                     ultimo_candle_time = time.time()
 
-        except asyncio.TimeoutError:
-            log(f"[{symbol}] Timeout de leitura — forçando reconexão.")
-            await asyncio.sleep(random.uniform(1.5, 5.0))
-            continue
         except Exception as e:
-            log(f"[{symbol}] ERRO no WebSocket / loop: {e}")
+            log(f"[{symbol}] ERRO no WebSocket / loop: {e}\n{traceback.format_exc()}", "error")
             # backoff curto com jitter para evitar bursts no Render gratuito
             await asyncio.sleep(random.uniform(2.0, 6.0))
             continue
@@ -308,11 +348,18 @@ def index():
     return "Bot ativo — Nova lógica: EMA20/50 + BB20 + RSI14 (cruzamento + fechamento)"
 
 # ---------------- Execução principal ----------------
+def run_flask():
+    port = int(os.getenv("PORT", 10000))
+    # IMPORTANT: use_reloader=False é crítico para evitar múltiplos processos e logs "sumindo"
+    log(f"🌐 Iniciando Flask na porta {port} (no thread).")
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
 async def main():
-    # roda Flask em thread separada
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000))), daemon=True).start()
+    # roda Flask em thread separada (sem reloader)
+    threading.Thread(target=run_flask, daemon=True).start()
 
     send_telegram("✅ Bot iniciado com NOVA LÓGICA (EMA20/EMA50 + BB20 + RSI14).")
+    log("▶ Iniciando monitoramento paralelo por par (24/7, reconexão infinita)...")
 
     # cria tasks paralelas (uma por símbolo)
     tasks = [monitor_symbol(s) for s in SYMBOLS]
@@ -322,4 +369,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log("Encerrando...")
+        log("Encerrando...", "info")
