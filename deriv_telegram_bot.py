@@ -10,7 +10,7 @@ from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import BollingerBands
 import requests
-from datetime import datetime, timezone
+from datetime import datetime
 from dotenv import load_dotenv
 import os
 import threading
@@ -339,8 +339,7 @@ async def monitor_symbol(symbol: str):
                             log(f"[{symbol}] Timeout aguardando mensagem, mantendo conexão...", "info")
                             continue
 
-                    # ----------------- INÍCIO do trecho robusto de parsing -----------------
-                    # parse robusto e extração do candle (aceita candle/ohlc/history/tick)
+                    # parse robusto e extração do candle (aceita candle/ohlc/history/candles)
                     try:
                         msg = json.loads(raw)
                     except Exception:
@@ -348,11 +347,10 @@ async def monitor_symbol(symbol: str):
                         continue
 
                     # função local para normalizar/retornar um candle dict ou None
-                    def _extract_candle_from_msg(msg):
+                    def _extract_candle_from_msg(obj):
                         # 1) mensagem com chave "candle" (padrão usado antes)
-                        if isinstance(msg, dict) and "candle" in msg and isinstance(msg["candle"], dict):
-                            c = msg["candle"]
-                            # Deriv às vezes retorna campos em strings; converta se necessário
+                        if isinstance(obj, dict) and "candle" in obj and isinstance(obj["candle"], dict):
+                            c = obj["candle"]
                             try:
                                 c_norm = {
                                     "epoch": int(c.get("epoch")),
@@ -366,11 +364,9 @@ async def monitor_symbol(symbol: str):
                             except Exception:
                                 return None
 
-                        # 2) mensagens com "ohlc" (visto no seu log)
-                        # formatos possíveis:
-                        # {"ohlc": {"open":..., "close":..., "high":..., "low":..., "epoch":...}}
-                        if isinstance(msg, dict) and "ohlc" in msg:
-                            o = msg["ohlc"]
+                        # 2) mensagens com "ohlc"
+                        if isinstance(obj, dict) and "ohlc" in obj:
+                            o = obj["ohlc"]
                             if isinstance(o, dict):
                                 try:
                                     c_norm = {
@@ -385,10 +381,9 @@ async def monitor_symbol(symbol: str):
                                 except Exception:
                                     return None
 
-                        # 3) mensagens com "history" que contenham "candles" array (ou "candles")
-                        # ex: {"history": {"candles": [...]} }
-                        if isinstance(msg, dict) and "history" in msg and isinstance(msg["history"], dict):
-                            history = msg["history"]
+                        # 3) mensagens com "history" que contenham "candles" array
+                        if isinstance(obj, dict) and "history" in obj and isinstance(obj["history"], dict):
+                            history = obj["history"]
                             if isinstance(history.get("candles"), list) and len(history["candles"]) > 0:
                                 last = history["candles"][-1]
                                 try:
@@ -404,11 +399,10 @@ async def monitor_symbol(symbol: str):
                                 except Exception:
                                     return None
 
-                        # 4) mensagem contendo "candles" top-level (algumas APIs)
-                        if isinstance(msg, dict) and "candles" in msg and isinstance(msg["candles"], list):
-                            # pega último candle
+                        # 4) mensagem contendo "candles" top-level
+                        if isinstance(obj, dict) and "candles" in obj and isinstance(obj["candles"], list):
                             try:
-                                last = msg["candles"][-1]
+                                last = obj["candles"][-1]
                                 c_norm = {
                                     "epoch": int(last.get("epoch")),
                                     "open": float(last.get("open")),
@@ -421,28 +415,19 @@ async def monitor_symbol(symbol: str):
                             except Exception:
                                 return None
 
-                        # 5) mensagem tipo "tick" ou "tick" nested (menos provável para candles)
-                        if isinstance(msg, dict) and "tick" in msg and isinstance(msg["tick"], dict):
-                            t = msg["tick"]
-                            if "quote" in t and "epoch" in t:
-                                # não é candle fechado, mas podemos ignorar
-                                return None
+                        # 5) tick messages — ignoradas para candles fechados
+                        if isinstance(obj, dict) and "tick" in obj and isinstance(obj["tick"], dict):
+                            return None
 
-                        # nada reconhecido
                         return None
 
-                    # extrai candle (normalizado) — None se a mensagem não contiver um candle fechado
                     candle = _extract_candle_from_msg(msg)
 
                     # para debug: log de controle (quando msg tiver msg_type)
                     if candle is None:
-                        # se for um controle conhecido (ex: msg_type / ohlc) logue o tipo
                         if isinstance(msg, dict) and msg.get("msg_type"):
                             log(f"[{symbol}] Recebeu msg de controle: {msg.get('msg_type')}")
-                        else:
-                            # opcional: log raw resumido (cuidado com volume de logs)
-                            # log(f"[{symbol}] RAW desconhecido: {str(msg)[:300]}")
-                            pass
+                        # else: desconhecido — silencioso para não encher logs
 
                     # se temos candle normalizado, use-o
                     if candle:
@@ -450,9 +435,8 @@ async def monitor_symbol(symbol: str):
                         log(f"[{symbol}] Novo candle (normalizado) recebido às {candle_time} UTC | close={candle['close']}")
                         ultimo_candle_time = time.time()
 
-                        # adiciona novo candle (fechado) ao df (mesma lógica sua)
+                        # adiciona novo candle (fechado) ao df
                         if df.empty or int(df.iloc[-1]["epoch"]) != int(candle["epoch"]):
-                            # df espera colunas 'epoch','open','high','low','close','volume' como strings/numbers
                             df.loc[len(df)] = {
                                 "epoch": candle["epoch"],
                                 "open": candle["open"],
@@ -477,7 +461,6 @@ async def monitor_symbol(symbol: str):
                                     f"• Horário de entrada (UTC): {entrada_utc}"
                                 )
                                 send_telegram(mensagem_sinal, symbol)
-                    # ----------------- FIM do trecho robusto de parsing -----------------
 
         except Exception as e:
             log(f"[{symbol}] ERRO no WebSocket / loop: {e}\n{traceback.format_exc()}", "error")
