@@ -43,14 +43,15 @@ SYMBOLS = [
 DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# ---------------- Parâmetros de sinal/freq ----------------
-SIGNAL_MIN_INTERVAL_SECONDS = 1800  # cooldown por par (ajustável)
-RSI_STRICT_BUY = 40
-RSI_STRICT_SELL = 60
-RSI_RELAX = 45
+# ---------------- Parâmetros de sinal/freq (Config B - Volume alto) ----------------
+# Configuração agressiva para gerar 30-50 sinais / dia
+SIGNAL_MIN_INTERVAL_SECONDS = 0    # cooldown por par (0 = sem cooldown para volume alto)
+BB_PROXIMITY_PCT = 0.45           # 45% -> mais proximidade aceita
+RSI_STRICT_BUY = 60
+RSI_STRICT_SELL = 40
+RSI_RELAX = 70
 USE_MACD_CONFIRMATION = True
-MACD_DIFF_RELAX = 0.0001
-BB_PROXIMITY_PCT = 0.02  # 2%
+MACD_DIFF_RELAX = 0.004
 
 # ---------------- Estado / controle ----------------
 last_signal_state = {s: None for s in SYMBOLS}
@@ -138,116 +139,97 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# ---------------- Lógica de Sinal (Lógica B) ----------------
+# ---------------- Lógica de Sinal — OPÇÃO 1 (Lógica B mais leve/agressiva) ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
     try:
-        if len(df) < 2:
+        if len(df) < 3:
             return None
+        
+        now = df.iloc[-1]
+        prev = df.iloc[-2]
 
-        now_row = df.iloc[-1]
-        prev_row = df.iloc[-2]
+        close = float(now["close"])
+        epoch = int(now["epoch"])
 
-        epoch = int(now_row["epoch"])
-        close = float(now_row["close"])
+        ema20_now = now.get("ema20")
+        ema50_now = now.get("ema50")
+        ema20_prev = prev.get("ema20")
+        ema50_prev = prev.get("ema50")
+        rsi_now = now.get("rsi")
 
-        ema20_now = now_row.get("ema20")
-        ema50_now = now_row.get("ema50")
-        ema20_prev = prev_row.get("ema20")
-        ema50_prev = prev_row.get("ema50")
-        rsi_now = now_row.get("rsi")
-        bb_lower = now_row.get("bb_lower")
-        bb_upper = now_row.get("bb_upper")
-        bb_mavg = now_row.get("bb_mavg")
-        macd_diff = now_row.get("macd_diff")
+        bb_upper = now.get("bb_upper")
+        bb_lower = now.get("bb_lower")
+        bb_mavg  = now.get("bb_mavg")
 
-        if any(pd.isna([ema20_prev, ema50_prev, ema20_now, ema50_now, rsi_now, bb_lower, bb_upper])):
+        macd_diff = now.get("macd_diff", None)
+
+        # Verifica NaNs
+        if any(pd.isna([ema20_now, ema50_now, ema20_prev, ema50_prev, rsi_now, bb_upper, bb_lower])):
             log(f"[{symbol}] Indicadores incompletos (NaN) — aguardando mais candles.")
             return None
 
-        # logs
-        try:
-            log(f"[{symbol}] close={close:.5f} EMA20_prev={ema20_prev:.5f} EMA50_prev={ema50_prev:.5f} EMA20_now={ema20_now:.5f} EMA50_now={ema50_now:.5f} RSI={rsi_now:.2f} macd_diff={macd_diff}")
-        except Exception:
-            log(f"[{symbol}] (log indicadores: possível NaN)")
-
-        cruzou_para_cima = (ema20_prev <= ema50_prev) and (ema20_now > ema50_now)
+        # ---------------- Cruzamentos / direção ----------------
+        # Opção 1: aceita direção (ou cruzamento imediato)
+        cruzou_para_cima  = (ema20_prev <= ema50_prev) and (ema20_now > ema50_now)
         cruzou_para_baixo = (ema20_prev >= ema50_prev) and (ema20_now < ema50_now)
+        # também aceita simplesmente EMA20 > EMA50 (tendência de alta) / EMA20 < EMA50 (tendência de baixa)
+        tendencia_alta = ema20_now > ema50_now
+        tendencia_baixa = ema20_now < ema50_now
 
-        bb_gap_buy = bb_mavg - bb_lower
-        bb_gap_sell = bb_upper - bb_mavg
-        prox_buy_threshold = bb_lower + BB_PROXIMITY_PCT * bb_gap_buy
-        prox_sell_threshold = bb_upper - BB_PROXIMITY_PCT * bb_gap_sell
+        # ---------------- Proximidade Bollinger (mais leve) ----------------
+        banda_range = bb_upper - bb_lower
+        if banda_range == 0:
+            return None
+        lim_inf = bb_lower + banda_range * 0.15
+        lim_sup = bb_upper - banda_range * 0.15
 
-        close_below_lower = close <= bb_lower or close <= prox_buy_threshold
-        close_above_upper = close >= bb_upper or close >= prox_sell_threshold
+        perto_da_lower = close <= lim_inf
+        perto_da_upper = close >= lim_sup
 
-        # RSI rules with MACD relax
-        buy_rsi_ok = False
-        sell_rsi_ok = False
+        # ---------------- RSI leve (mais permissivo) ----------------
+        buy_rsi_ok  = rsi_now <= 55
+        sell_rsi_ok = rsi_now >= 45
 
-        if rsi_now <= RSI_STRICT_BUY:
-            buy_rsi_ok = True
-        elif RSI_STRICT_BUY < rsi_now <= RSI_RELAX:
-            if USE_MACD_CONFIRMATION and (not pd.isna(macd_diff)) and macd_diff > MACD_DIFF_RELAX:
-                buy_rsi_ok = True
+        # ---------------- MACD opcional ----------------
+        macd_buy_ok = True
+        macd_sell_ok = True
+        if macd_diff is not None and not pd.isna(macd_diff):
+            macd_buy_ok  = macd_diff > -MACD_DIFF_RELAX
+            macd_sell_ok = macd_diff <  MACD_DIFF_RELAX
 
-        if rsi_now >= RSI_STRICT_SELL:
-            sell_rsi_ok = True
-        elif RSI_RELAX <= rsi_now < RSI_STRICT_SELL:
-            if USE_MACD_CONFIRMATION and (not pd.isna(macd_diff)) and macd_diff < -MACD_DIFF_RELAX:
-                sell_rsi_ok = True
+        # ---------------- Condições finais ----------------
+        # Aceita cruzamento imediato OU direção (tendência) para aumentar volume de sinais
+        cond_buy = (cruzou_para_cima or tendencia_alta) and perto_da_lower and buy_rsi_ok and macd_buy_ok
+        cond_sell = (cruzou_para_baixo or tendencia_baixa) and perto_da_upper and sell_rsi_ok and macd_sell_ok
 
-        macd_confirms_buy = True
-        macd_confirms_sell = True
-        if USE_MACD_CONFIRMATION:
-            if pd.isna(macd_diff):
-                macd_confirms_buy = False
-                macd_confirms_sell = False
-            else:
-                macd_confirms_buy = macd_diff > -MACD_DIFF_RELAX
-                macd_confirms_sell = macd_diff < MACD_DIFF_RELAX
-
-        cond_buy = cruzou_para_cima and close_below_lower and buy_rsi_ok and macd_confirms_buy
-        cond_sell = cruzou_para_baixo and close_above_upper and sell_rsi_ok and macd_confirms_sell
-
-        # cooldown
-        last_time = last_signal_time.get(symbol, 0)
+        # Cooldown (usa constante configurável)
         now_ts = time.time()
-        if now_ts - last_time < SIGNAL_MIN_INTERVAL_SECONDS:
+        last_time = last_signal_time.get(symbol, 0)
+        if SIGNAL_MIN_INTERVAL_SECONDS and (now_ts - last_time < SIGNAL_MIN_INTERVAL_SECONDS):
+            # se está em cooldown, não envia -- mas como em config B normalmente é 0, não bloqueará
             if cond_buy or cond_sell:
                 log(f"[{symbol}] Condição satisfeita, mas em cooldown ({int(now_ts-last_time)}s desde último sinal).")
             return None
 
-        current_state = last_signal_state.get(symbol)
+        # ------------ Geração do sinal ------------
         if cond_buy:
-            if current_state == "COMPRA" and last_signal_candle.get(symbol) == epoch:
-                log(f"[{symbol}] COMPRA já enviada neste candle (skip).")
-                return None
+            last_signal_time[symbol] = now_ts
             last_signal_state[symbol] = "COMPRA"
             last_signal_candle[symbol] = epoch
-            last_signal_time[symbol] = now_ts
-            log(f"✅ [{symbol}] SINAL COMPRA gerado. close={close:.5f} RSI={rsi_now:.2f} macd_diff={macd_diff}")
+            log(f"📈 [{symbol}] SINAL COMPRA — close={close:.5f} RSI={rsi_now:.2f} macd_diff={macd_diff}")
             return "COMPRA"
 
         if cond_sell:
-            if current_state == "VENDA" and last_signal_candle.get(symbol) == epoch:
-                log(f"[{symbol}] VENDA já enviada neste candle (skip).")
-                return None
+            last_signal_time[symbol] = now_ts
             last_signal_state[symbol] = "VENDA"
             last_signal_candle[symbol] = epoch
-            last_signal_time[symbol] = now_ts
-            log(f"✅ [{symbol}] SINAL VENDA gerado. close={close:.5f} RSI={rsi_now:.2f} macd_diff={macd_diff}")
+            log(f"📉 [{symbol}] SINAL VENDA — close={close:.5f} RSI={rsi_now:.2f} macd_diff={macd_diff}")
             return "VENDA"
-
-        if last_signal_state.get(symbol) is not None:
-            last_signal_state[symbol] = None
-            last_signal_candle[symbol] = None
-            log(f"[{symbol}] Estado de sinal limpo (nenhuma condição ativa).")
 
         return None
 
     except Exception as e:
-        log(f"[{symbol}] Erro em gerar_sinal: {e}\n{traceback.format_exc()}", "error")
+        log(f"[{symbol}] Erro em gerar_sinal (opção 1): {e}\n{traceback.format_exc()}", "error")
         return None
 
 # ---------------- Persistência candles ----------------
