@@ -65,7 +65,7 @@ DEFAULT_EMA_SEP_SCALE = 0.01
 # ---------------- Estado ----------------
 last_signal_state = {s: None for s in SYMBOLS}        # "COMPRA"/"VENDA"
 last_signal_candle = {s: None for s in SYMBOLS}      # candle_id
-last_signal_time = {s: 0 for s in SYMBOLS}           # timestamp last signal
+last_signal_time = {s: 0 for s in SYMBOLS}           # timestamp last signal (set WHEN SENT)
 last_notify_time = {}                                 # throttle per-symbol for normal messages
 
 # ---------------- Logging ----------------
@@ -158,9 +158,12 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
     Retorna None ou dict {"tipo": "COMPRA"/"VENDA", "forca": int(0-100), "candle_id": ...}
     Regras principais implementadas:
       - 1 sinal por candle (last_signal_candle)
-      - cooldown global (MIN_SECONDS_BETWEEN_SIGNALS)
+      - cooldown global (MIN_SECONDS_BETWEEN_SIGNALS) aplicado NA HORA DO ENVIO
       - bloqueio de sinais opostos por MIN_SECONDS_BETWEEN_OPPOSITE
       - exigir separação mínima de EMA para evitar micro-ruído (checagem relativa)
+    Nota importante da correção 1:
+      -> Não atualizamos last_signal_time dentro de gerar_sinal (isso foi a causa do skip de 0.0s).
+         last_signal_time será atualizado somente quando a mensagem for realmente enviada.
     """
     try:
         if len(df) < 3:
@@ -216,10 +219,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         # Evitar micro-ruído: exigir EMA separation relativa (ema_sep / close)
         ema_sep = abs(ema20_now - ema50_now)
         rel_sep = ema_sep / max(1e-12, abs(close))  # razão relativa
-        # adaptatividade por símbolo pode ser aplicada multiplicando REL_EMA_SEP_PCT por um fator
-        # mas por agora usamos REL_EMA_SEP_PCT diretamente (é suficientemente pequeno)
         if rel_sep < REL_EMA_SEP_PCT:
-            # log informativo para debugging (antes: muitos "ignored by absolute threshold")
             log(f"[{symbol}] Ignorando por micro-ruído: ema_sep={ema_sep:.6f}, close={close:.6f}, rel_sep={rel_sep:.6e} < REL_EMA_SEP_PCT={REL_EMA_SEP_PCT:.6e}", "info")
             return None
 
@@ -231,7 +231,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             log(f"[{symbol}] Condições buy/sell não satisfeitas (cruzou_up={cruzou_up}, tendencia_up={tendencia_up}, perto_lower={perto_lower}, buy_rsi_ok={buy_rsi_ok}, macd_buy_ok={macd_buy_ok}).", "debug")
             return None
 
-        # Evitar sinais opostos muito próximos
+        # Evitar sinais opostos muito próximos (usa last_signal_time, que é o momento do ÚLTIMO ENVIO)
         last_state = last_signal_state.get(symbol)
         last_time = last_signal_time.get(symbol, 0)
         now_ts = time.time()
@@ -274,8 +274,8 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         # Build result
         if cond_buy:
             force = calc_forca(is_buy=True)
+            # set candle & state but DON'T set last_signal_time here (correction 1)
             last_signal_candle[symbol] = candle_id
-            last_signal_time[symbol] = time.time()
             last_signal_state[symbol] = "COMPRA"
             log(f"[{symbol}] SINAL GERADO: COMPRA (força={force}%)", "info")
             return {"tipo": "COMPRA", "forca": force, "candle_id": candle_id}
@@ -283,7 +283,6 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         if cond_sell:
             force = calc_forca(is_buy=False)
             last_signal_candle[symbol] = candle_id
-            last_signal_time[symbol] = time.time()
             last_signal_state[symbol] = "VENDA"
             log(f"[{symbol}] SINAL GERADO: VENDA (força={force}%)", "info")
             return {"tipo": "VENDA", "forca": force, "candle_id": candle_id}
@@ -439,6 +438,7 @@ async def monitor_symbol(symbol: str):
                         log(f"[{symbol}] Candle com campos inválidos, ignorando: {candle}", "warning")
                         continue
 
+                    # Consider only closed candles aligned with granularity
                     if epoch % GRANULARITY_SECONDS != 0:
                         continue
 
@@ -463,6 +463,7 @@ async def monitor_symbol(symbol: str):
                         sinal = gerar_sinal(df, symbol)
 
                         if sinal:
+                            # IMPORTANT: aqui checamos cooldown com base no último ENVIO (last_signal_time)
                             now_ts = time.time()
                             last_ts = last_signal_time.get(symbol, 0)
                             if now_ts - last_ts < MIN_SECONDS_BETWEEN_SIGNALS:
@@ -487,9 +488,14 @@ async def monitor_symbol(symbol: str):
                                 f"• Horário de entrada (Brasília): {entrada_str}"
                             )
 
+                            # Agora sim: atualizamos last_signal_time no momento do ENVIO
                             last_signal_time[symbol] = time.time()
                             # sinais usam throttle por símbolo (não bypass)
-                            send_telegram(msg_final, symbol=symbol, bypass_throttle=False)
+                            try:
+                                send_telegram(msg_final, symbol=symbol, bypass_throttle=False)
+                                log(f"[{symbol}] Mensagem enviada ao Telegram.", "info")
+                            except Exception:
+                                log(f"[{symbol}] Falha ao enviar sinal ao Telegram.", "warning")
 
         except websockets.exceptions.ConnectionClosed as e:
             log(f"[WS {symbol}] ConnectionClosed: {e}", "warning")
