@@ -1,5 +1,5 @@
 # ===============================================================
-# deriv_telegram_bot.py — LÓGICA B (ajustada) — 1 WS por par (Opção A) — COMPLETO + CORREÇÕES
+# deriv_telegram_bot.py — LÓGICA B (AJUSTADA) — Opção A — COMPLETO
 # ===============================================================
 
 import asyncio
@@ -28,7 +28,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
-CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # minutos (5m)
+CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
 
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
@@ -43,18 +43,16 @@ SYMBOLS = [
 DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# ---------------- Parâmetros ajustados (CORREÇÃO 3 – mais assertivo) ----------------
-SIGNAL_MIN_INTERVAL_SECONDS = 0
-BB_PROXIMITY_PCT = 0.20     # porcentagem mais próxima das bandas → mais assertivo
-RSI_BUY_MAX = 52            # antes: 55
-RSI_SELL_MIN = 48           # antes: 45
-MACD_TOLERANCE = 0.002      # macd mais restrito
+# ---------------- Parâmetros (mais assertivo) ----------------
+BB_PROXIMITY_PCT = 0.20
+RSI_BUY_MAX = 52
+RSI_SELL_MIN = 48
+MACD_TOLERANCE = 0.002
 
-# ---------------- Estado / controle ----------------
+# ---------------- Estado ----------------
 last_signal_state = {s: None for s in SYMBOLS}
 last_signal_candle = {s: None for s in SYMBOLS}
 last_signal_time = {s: 0 for s in SYMBOLS}
-sent_download_message = {s: False for s in SYMBOLS}
 last_notify_time = {}
 
 # ---------------- Logging ----------------
@@ -67,58 +65,44 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 def log(msg: str, level: str = "info"):
-    if level == "info":
-        logger.info(msg)
-        print(msg, flush=True)
-    elif level == "warning":
-        logger.warning(msg)
-        print(msg, flush=True)
-    elif level == "error":
-        logger.error(msg)
-        print(msg, flush=True)
-    else:
-        logger.debug(msg)
-        print(msg, flush=True)
+    if level == "info": logger.info(msg)
+    elif level == "warning": logger.warning(msg)
+    elif level == "error": logger.error(msg)
+    print(msg, flush=True)
 
-# ---------------- Telegram helper ----------------
+# ---------------- Telegram ----------------
 def send_telegram(message: str, symbol: str = None):
     now = time.time()
+
     if symbol:
         last = last_notify_time.get(symbol, 0)
         if now - last < 3:
-            log(f"Telegram rate limit skipped for {symbol}", "warning")
             return
         last_notify_time[symbol] = now
 
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        log(f"⚠️ Telegram não configurado. Mensagem: {message}", "warning")
+        log("⚠️ Telegram não configurado.")
         return
 
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            log(f"❌ Telegram retornou {r.status_code}: {r.text}", "error")
-        else:
-            log(f"Telegram enviado: {message}")
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"})
     except Exception as e:
-        log(f"❌ Erro ao enviar Telegram: {e}\n{traceback.format_exc()}", "error")
+        log(f"[TG] Erro: {e}", "error")
 
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("epoch").reset_index(drop=True)
     df["close"] = df["close"].astype(float)
 
-    df["ema20"] = EMAIndicator(df["close"], window=20).ema_indicator()
-    df["ema50"] = EMAIndicator(df["close"], window=50).ema_indicator()
-
-    df["rsi"] = RSIIndicator(df["close"], window=14).rsi()
+    df["ema20"] = EMAIndicator(df["close"], 20).ema_indicator()
+    df["ema50"] = EMAIndicator(df["close"], 50).ema_indicator()
+    df["rsi"] = RSIIndicator(df["close"], 14).rsi()
 
     try:
-        macd = MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
+        macd = MACD(df["close"], 26, 12, 9)
         df["macd_diff"] = macd.macd_diff()
-    except Exception:
+    except:
         df["macd_diff"] = pd.NA
 
     bb = BollingerBands(df["close"], window=20, window_dev=2)
@@ -128,7 +112,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# -------------- Lógica de sinal (OPÇÃO 1 — corrigida) --------------
+# ---------------- Lógica — CORRIGIDA + FORÇA DO SINAL ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
     try:
         if len(df) < 3:
@@ -137,130 +121,124 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         now = df.iloc[-1]
         prev = df.iloc[-2]
 
-        close = float(now["close"])
         epoch = int(now["epoch"])
+        close = float(now["close"])
 
-        ema20_now = now["ema20"]
-        ema50_now = now["ema50"]
-        ema20_prev = prev["ema20"]
-        ema50_prev = prev["ema50"]
-        rsi_now = now["rsi"]
-        bb_upper = now["bb_upper"]
-        bb_lower = now["bb_lower"]
-        macd_diff = now.get("macd_diff")
-
-        if any(pd.isna([ema20_now, ema50_now, ema20_prev, ema50_prev, rsi_now, bb_upper, bb_lower])):
+        # Evitar duplicidade
+        if last_signal_candle.get(symbol) == epoch:
             return None
 
-        # ---------------- Tendência e cruzamentos ----------------
+        ema20_now, ema50_now = now["ema20"], now["ema50"]
+        ema20_prev, ema50_prev = prev["ema20"], prev["ema50"]
+        rsi_now = now["rsi"]
+        bb_upper, bb_lower = now["bb_upper"], now["bb_lower"]
+        macd_diff = now.get("macd_diff")
+
+        if any(pd.isna([ema20_now, ema50_now, ema20_prev, ema50_prev, rsi_now])):
+            return None
+
+        # Tendência
         cruzou_up = ema20_prev <= ema50_prev and ema20_now > ema50_now
         cruzou_down = ema20_prev >= ema50_prev and ema20_now < ema50_now
         tendencia_up = ema20_now > ema50_now
         tendencia_down = ema20_now < ema50_now
 
-        # ---------------- Bollinger ----------------
-        banda_range = bb_upper - bb_lower
-        if banda_range == 0:
-            return None
-
-        lim_inf = bb_lower + banda_range * BB_PROXIMITY_PCT
-        lim_sup = bb_upper - banda_range * BB_PROXIMITY_PCT
+        # Bollinger
+        range_bb = bb_upper - bb_lower
+        lim_inf = bb_lower + range_bb * BB_PROXIMITY_PCT
+        lim_sup = bb_upper - range_bb * BB_PROXIMITY_PCT
 
         perto_lower = close <= lim_inf
         perto_upper = close >= lim_sup
 
-        # ---------------- RSI ----------------
+        # RSI
         buy_rsi_ok = rsi_now <= RSI_BUY_MAX
         sell_rsi_ok = rsi_now >= RSI_SELL_MIN
 
-        # ---------------- MACD ----------------
-        macd_buy_ok = True
-        macd_sell_ok = True
-        if macd_diff is not None and not pd.isna(macd_diff):
-            macd_buy_ok = macd_diff > -MACD_TOLERANCE
-            macd_sell_ok = macd_diff < MACD_TOLERANCE
+        # MACD
+        macd_buy_ok = macd_diff > -MACD_TOLERANCE if macd_diff is not None else True
+        macd_sell_ok = macd_diff < MACD_TOLERANCE if macd_diff is not None else True
 
-        # ---------------- Condições ----------------
         cond_buy = (cruzou_up or tendencia_up) and perto_lower and buy_rsi_ok and macd_buy_ok
         cond_sell = (cruzou_down or tendencia_down) and perto_upper and sell_rsi_ok and macd_sell_ok
 
-        # -------------- CORREÇÃO 2 — evitar duplicidade --------------
-        if last_signal_candle.get(symbol) == epoch:
-            return None
+        # ----------- CÁLCULO DA FORÇA DO SINAL -----------
+        def calc_forca():
+            forca = 0
 
-        # ------------ resultado ------------
+            # Bollinger força
+            if cond_buy:
+                dist = max(0, min(1, (lim_inf - close) / range_bb))
+                forca += dist * 40
+            elif cond_sell:
+                dist = max(0, min(1, (close - lim_sup) / range_bb))
+                forca += dist * 40
+
+            # RSI força
+            if cond_buy:
+                rsi_strength = max(0, min(1, (52 - rsi_now) / 20))
+                forca += rsi_strength * 30
+            elif cond_sell:
+                rsi_strength = max(0, min(1, (rsi_now - 48) / 20))
+                forca += rsi_strength * 30
+
+            # MACD força
+            if macd_diff is not None and not pd.isna(macd_diff):
+                macd_strength = min(1, abs(macd_diff) / MACD_TOLERANCE)
+                forca += macd_strength * 30
+
+            return int(forca)
+
         if cond_buy:
             last_signal_candle[symbol] = epoch
-            return "COMPRA"
+            return {"tipo": "COMPRA", "forca": calc_forca()}
 
         if cond_sell:
             last_signal_candle[symbol] = epoch
-            return "VENDA"
+            return {"tipo": "VENDA", "forca": calc_forca()}
 
         return None
 
     except Exception as e:
-        log(f"[{symbol}] Erro em gerar_sinal: {e}\n{traceback.format_exc()}", "error")
+        log(f"[{symbol}] Erro sinal: {e}", "error")
         return None
 
 # ---------------- Persistência ----------------
 def save_last_candles(df: pd.DataFrame, symbol: str):
-    path = DATA_DIR / f"candles_{symbol}.csv"
-    df.tail(200).to_csv(path, index=False)
+    df.tail(200).to_csv(DATA_DIR / f"candles_{symbol}.csv", index=False)
 
-# ---------------- Monitor por símbolo ----------------
+# ---------------- Monitor WebSocket ----------------
 async def monitor_symbol(symbol: str):
-    reconnect_attempt = 0
     while True:
         try:
-            reconnect_attempt += 1
             async with websockets.connect(WS_URL, ping_interval=None) as ws:
 
-                # authorize
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 await ws.recv()
 
-                # request history
-                req_hist = {
+                await ws.send(json.dumps({
                     "ticks_history": symbol,
                     "count": 200,
                     "end": "latest",
                     "granularity": CANDLE_INTERVAL * 60,
                     "style": "candles"
-                }
-                await ws.send(json.dumps(req_hist))
-                data = json.loads(await ws.recv())
+                }))
 
+                data = json.loads(await ws.recv())
                 df = pd.DataFrame(data["candles"])
                 df = calcular_indicadores(df)
-
                 save_last_candles(df, symbol)
 
-                # subscribe
-                sub_req = {
+                await ws.send(json.dumps({
                     "ticks_history": symbol,
                     "style": "candles",
                     "granularity": CANDLE_INTERVAL * 60,
-                    "end": "latest",
                     "subscribe": 1
-                }
-                await ws.send(json.dumps(sub_req))
+                }))
 
-                # evento
                 while True:
-                    raw = await ws.recv()
-                    msg = json.loads(raw)
-
-                    candle = None
-
-                    # normalização
-                    if "candle" in msg:
-                        candle = msg["candle"]
-                    if "ohlc" in msg:
-                        candle = msg["ohlc"]
-                    if "candles" in msg:
-                        candle = msg["candles"][-1]
-
+                    msg = json.loads(await ws.recv())
+                    candle = msg.get("candle") or msg.get("ohlc") or (msg.get("candles", [None])[-1])
                     if not candle:
                         continue
 
@@ -268,12 +246,12 @@ async def monitor_symbol(symbol: str):
 
                     if df.empty or int(df.iloc[-1]["epoch"]) != epoch:
                         df.loc[len(df)] = {
-                            "epoch": candle["epoch"],
+                            "epoch": epoch,
                             "open": candle["open"],
                             "high": candle["high"],
                             "low": candle["low"],
                             "close": candle["close"],
-                            "volume": candle.get("volume", 0.0)
+                            "volume": candle.get("volume", 0)
                         }
 
                         df = calcular_indicadores(df)
@@ -282,46 +260,47 @@ async def monitor_symbol(symbol: str):
                         sinal = gerar_sinal(df, symbol)
 
                         if sinal:
-                            arrow = "🟢" if sinal == "COMPRA" else "🔴"
-                            close_price = float(candle["close"])
+                            tipo = sinal["tipo"]
+                            forca = sinal["forca"]
 
-                            # --------- CORREÇÃO 1 — Horário de Brasília ------------
-                            entrada_brasilia = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
-                            entrada_brasilia_str = entrada_brasilia.strftime("%Y-%m-%d %H:%M:%S")
+                            arrow = "🟢" if tipo == "COMPRA" else "🔴"
+                            price = float(candle["close"])
 
-                            mensagem = (
+                            entrada_br = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
+                            entrada_str = entrada_br.strftime("%Y-%m-%d %H:%M:%S")
+
+                            msg_final = (
                                 f"📊 *NOVO SINAL — M{CANDLE_INTERVAL}*\n"
                                 f"• Par: {symbol.replace('frx','')}\n"
-                                f"• Direção: {arrow} *{sinal}*\n"
-                                f"• Preço: {close_price:.5f}\n"
-                                f"• Horário de entrada (Brasília): {entrada_brasilia_str}"
+                                f"• Direção: {arrow} *{tipo}*\n"
+                                f"• Força do sinal: *{forca}%*\n"
+                                f"• Preço: {price:.5f}\n"
+                                f"• Horário de entrada (Brasília): {entrada_str}"
                             )
 
-                            send_telegram(mensagem, symbol)
+                            send_telegram(msg_final, symbol)
 
         except Exception as e:
-            log(f"[{symbol}] ERRO no WS: {e}")
-            await asyncio.sleep(random.uniform(2, 6))
-            continue
+            log(f"[WS {symbol}] erro: {e}")
+            await asyncio.sleep(random.uniform(2, 5))
 
 # ---------------- Flask ----------------
 app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Bot ativo — Opção A — Lógica B Ajustada"
+    return "Bot ativo — Lógica B (com força do sinal)"
 
 # ---------------- Execução ----------------
 def run_flask():
     port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    app.run("0.0.0.0", port, debug=False, use_reloader=False)
 
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
-    send_telegram("Bot iniciado — Lógica B ajustada")
+    send_telegram("Bot iniciado — Lógica B + Força do Sinal")
 
-    tasks = [monitor_symbol(s) for s in SYMBOLS]
-    await asyncio.gather(*tasks)
+    await asyncio.gather(*(monitor_symbol(s) for s in SYMBOLS))
 
 if __name__ == "__main__":
     asyncio.run(main())
