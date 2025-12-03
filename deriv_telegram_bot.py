@@ -1,7 +1,8 @@
 # ===============================================================
-# deriv_telegram_bot.py — LÓGICA B (AJUSTADA) — Opção A — COMPLETO
+# deriv_telegram_bot.py — LÓGICA B (AJUSTADA) — Opção B — COMPLETO
 # (com: anti-duplicação reforçada, horário Brasília (timezone-aware),
-#  backoff/reconexão, validação robusta do histórico, e Força do Sinal)
+#  backoff/reconexão, validação robusta do histórico, Força do Sinal,
+#  e notificação Telegram quando cada WebSocket conectar)
 # ===============================================================
 
 import asyncio
@@ -144,7 +145,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
       - 1 sinal por candle (last_signal_candle armazenado como candle_id)
       - validação de NaNs
       - força combinada a partir de distância a Bollinger, RSI, EMA separation e MACD
-      - reversões são permitidas (Opção A)
+      - reversões são permitidas (Opção B)
     """
     try:
         if len(df) < 3:
@@ -277,6 +278,12 @@ async def monitor_symbol(symbol: str):
             log(f"[{symbol}] Conectando ao WS (attempt {reconnect_attempt})...")
             async with websockets.connect(WS_URL, ping_interval=None) as ws:
                 log(f"[{symbol}] WS conectado.")
+                # Envia notificação no Telegram sobre conexão do WS
+                try:
+                    send_telegram(f"🔌 [{symbol}] WebSocket conectado.", symbol)
+                except Exception:
+                    log(f"[{symbol}] Falha ao notificar Telegram sobre conexão.", "warning")
+
                 reconnect_attempt = 0  # reset on success
 
                 # authorize
@@ -333,6 +340,11 @@ async def monitor_symbol(symbol: str):
                 df = calcular_indicadores(df)
                 save_last_candles(df, symbol)
                 log(f"[{symbol}] Histórico inicial carregado ({len(df)} candles).")
+                # Notifica que histórico foi carregado (opcional)
+                try:
+                    send_telegram(f"📥 [{symbol}] Histórico inicial ({len(df)} candles) carregado.", symbol)
+                except Exception:
+                    log(f"[{symbol}] Falha ao notificar Telegram sobre histórico.", "warning")
 
                 # subscribe ao feed de candles ao vivo
                 sub_req = {
@@ -344,6 +356,11 @@ async def monitor_symbol(symbol: str):
                 }
                 await ws.send(json.dumps(sub_req))
                 log(f"[{symbol}] Inscrito em candles ao vivo.")
+                # Notifica inscrição (opcional)
+                try:
+                    send_telegram(f"🔔 [{symbol}] Inscrito em candles ao vivo (M{CANDLE_INTERVAL}).", symbol)
+                except Exception:
+                    log(f"[{symbol}] Falha ao notificar Telegram sobre inscrição.", "warning")
 
                 ultimo_candle_time = time.time()
 
