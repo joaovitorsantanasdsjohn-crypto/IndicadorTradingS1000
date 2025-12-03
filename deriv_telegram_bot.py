@@ -1,8 +1,8 @@
 # ===============================================================
 # deriv_telegram_bot.py — LÓGICA B (AJUSTADA) — Opção B — COMPLETO
-# (com: anti-duplicação reforçada, horário Brasília (timezone-aware),
+# (com: anti-duplicação reforçada, timezone-aware (Brasília),
 #  backoff/reconexão, validação robusta do histórico, Força do Sinal,
-#  e notificação Telegram quando cada WebSocket conectar — sem throttle)
+#  notificação Telegram quando cada WebSocket conectar — sem throttle)
 # ===============================================================
 
 import asyncio
@@ -48,20 +48,24 @@ SYMBOLS = [
 DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# ---------------- Parâmetros (mais assertivo) ----------------
+# ---------------- Parâmetros ----------------
 BB_PROXIMITY_PCT = 0.20
 RSI_BUY_MAX = 52
 RSI_SELL_MIN = 48
 MACD_TOLERANCE = 0.002
 
-# Anti-spam minimum between signals for the same symbol (seconds).
-MIN_SECONDS_BETWEEN_SIGNALS = 10
+# Anti-spam / anti-duplicate
+MIN_SECONDS_BETWEEN_SIGNALS = 10           # evita sinais repetidos imediatos
+MIN_SECONDS_BETWEEN_OPPOSITE = 60         # evita compra->venda imediata (opposite cooldown)
+
+# Require minimum EMA separation to consider trend/cross meaningful (adaptive per instrument)
+DEFAULT_EMA_SEP_SCALE = 0.01  # baseline scale (will be adapted by symbol)
 
 # ---------------- Estado ----------------
-last_signal_state = {s: None for s in SYMBOLS}
-last_signal_candle = {s: None for s in SYMBOLS}
-last_signal_time = {s: 0 for s in SYMBOLS}
-last_notify_time = {}  # throttle per-symbol tg messages
+last_signal_state = {s: None for s in SYMBOLS}        # "COMPRA"/"VENDA"
+last_signal_candle = {s: None for s in SYMBOLS}      # candle_id
+last_signal_time = {s: 0 for s in SYMBOLS}           # timestamp last signal
+last_notify_time = {}                                 # throttle per-symbol for normal messages
 
 # ---------------- Logging ----------------
 logger = logging.getLogger("indicador")
@@ -83,15 +87,15 @@ def log(msg: str, level: str = "info"):
         logger.debug(msg)
     print(msg, flush=True)
 
-# ---------------- Telegram helper (com bypass_throttle) ----------------
+# ---------------- Telegram helper (bypass option) ----------------
 def send_telegram(message: str, symbol: str = None, bypass_throttle: bool = False):
     """
-    Envia mensagem para o chat. Se 'symbol' informado, aplica throttle por símbolo (3s).
-    Se bypass_throttle=True, ignora o throttle por símbolo (útil para avisos de conexão).
+    Envia mensagem para o chat.
+    - Se 'symbol' informado, aplica throttle por símbolo (3s) a menos que bypass_throttle=True.
+    - Use bypass_throttle=True para avisos de conexão/histórico.
     """
     now = time.time()
 
-    # per-symbol small throttle to avoid duplicate trigger spam
     if symbol and not bypass_throttle:
         last = last_notify_time.get(symbol, 0)
         if now - last < 3:
@@ -111,6 +115,24 @@ def send_telegram(message: str, symbol: str = None, bypass_throttle: bool = Fals
             log(f"❌ Telegram retornou {r.status_code}: {r.text}", "error")
     except Exception as e:
         log(f"[TG] Erro ao enviar: {e}\n{traceback.format_exc()}", "error")
+
+# ---------------- Utilitários específicos por symbol ----------------
+def ema_sep_scale_for_symbol(symbol: str) -> float:
+    """
+    Retorna uma escala heurística para normalizar separação EMA20-EMA50.
+    Ajustamos para JPY e índices onde os preços têm magnitude grande.
+    """
+    # pares JPY têm preços ~100-200 -> escala maior
+    if "JPY" in symbol:
+        return 0.5  # por estar em escala ~100, um separador grande é aceitável
+    # pares com valores ~1 -> escala padrão pequena
+    if any(x in symbol for x in ["USDNOK", "USDSEK", "USDJPY", "GBPJPY", "EURJPY"]):
+        return 0.5
+    # default (EURUSD, GBPUSD, AUDUSD, etc.)
+    return DEFAULT_EMA_SEP_SCALE
+
+def human_pair(symbol: str) -> str:
+    return symbol.replace("frx", "")
 
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
@@ -134,8 +156,16 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# ---------------- Lógica — CORRIGIDA + FORÇA DO SINAL (Opção B) ----------------
+# ---------------- Lógica — CORRIGIDA + FORÇA DO SINAL (Opção B melhorada) ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
+    """
+    Retorna None ou dict {"tipo": "COMPRA"/"VENDA", "forca": int(0-100), "candle_id": ...}
+    Regras principais implementadas:
+      - 1 sinal por candle (last_signal_candle)
+      - cooldown global (MIN_SECONDS_BETWEEN_SIGNALS)
+      - bloqueio de sinais opostos por MIN_SECONDS_BETWEEN_OPPOSITE
+      - exigir separação mínima de EMA para evitar micro-ruído
+    """
     try:
         if len(df) < 3:
             return None
@@ -147,9 +177,11 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         close = float(now["close"])
         candle_id = epoch - (epoch % GRANULARITY_SECONDS)
 
+        # 1 sinal por candle
         if last_signal_candle.get(symbol) == candle_id:
             return None
 
+        # indicadores
         ema20_now, ema50_now = now["ema20"], now["ema50"]
         ema20_prev, ema50_prev = prev["ema20"], prev["ema50"]
         rsi_now = now["rsi"]
@@ -160,11 +192,13 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             log(f"[{symbol}] Indicadores incompletos (NaN) — aguardando mais candles.", "warning")
             return None
 
+        # Tendência / cruzamentos
         cruzou_up = (ema20_prev <= ema50_prev) and (ema20_now > ema50_now)
         cruzou_down = (ema20_prev >= ema50_prev) and (ema20_now < ema50_now)
         tendencia_up = ema20_now > ema50_now
         tendencia_down = ema20_now < ema50_now
 
+        # Bollinger proximidade
         range_bb = bb_upper - bb_lower
         if range_bb == 0 or math.isclose(range_bb, 0.0):
             return None
@@ -174,20 +208,46 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         perto_lower = close <= lim_inf
         perto_upper = close >= lim_sup
 
+        # RSI + MACD ok flags
         buy_rsi_ok = rsi_now <= RSI_BUY_MAX
         sell_rsi_ok = rsi_now >= RSI_SELL_MIN
-
         macd_buy_ok = True if (macd_diff is None or pd.isna(macd_diff)) else (macd_diff > -MACD_TOLERANCE)
         macd_sell_ok = True if (macd_diff is None or pd.isna(macd_diff)) else (macd_diff < MACD_TOLERANCE)
 
+        # Evitar micro-ruído: exigir EMA separation mínima (adaptativa)
+        ema_sep = abs(ema20_now - ema50_now)
+        sep_scale = ema_sep_scale_for_symbol(symbol)
+        # se escala for pequena (pares ~1), exigimos sep > scale * 0.0001 (heurística)
+        # para pares de magnitude grande (JPY) sep_scale já é maior (0.5)
+        required_sep = sep_scale if sep_scale >= 0.01 else 0.001  # fallback
+        # but keep a flexible check: require ema_sep absolute > required_sep * some factor
+        if ema_sep < required_sep * 0.1:
+            # muito pequeno — ignora sinais por micro variação
+            log(f"[{symbol}] EMA separation ({ema_sep:.6f}) < threshold ({required_sep*0.1:.6f}) — ignorando micro-ruído.", "info")
+            return None
+
+        # Condições combinadas
         cond_buy = (cruzou_up or tendencia_up) and perto_lower and buy_rsi_ok and macd_buy_ok
         cond_sell = (cruzou_down or tendencia_down) and perto_upper and sell_rsi_ok and macd_sell_ok
 
         if not (cond_buy or cond_sell):
             return None
 
+        # Evitar sinais opostos muito próximos
+        last_state = last_signal_state.get(symbol)
+        last_time = last_signal_time.get(symbol, 0)
+        now_ts = time.time()
+        if last_state is not None and last_state != ( "COMPRA" if cond_buy else "VENDA" ):
+            # se for sinal oposto e passou menos que MIN_SECONDS_BETWEEN_OPPOSITE, bloqueia
+            if now_ts - last_time < MIN_SECONDS_BETWEEN_OPPOSITE:
+                log(f"[{symbol}] Sinal oposto detectado mas dentro do cooldown oposto ({now_ts-last_time:.1f}s) — skip.", "warning")
+                return None
+
+        # Calcular força combinada (0..100) — adaptativa
         def calc_forca(is_buy: bool):
             score = 0.0
+
+            # Bollinger: proximidade até 40 pontos
             if is_buy:
                 dist = max(0.0, min(1.0, (lim_inf - close) / range_bb))
                 score += dist * 40.0
@@ -195,24 +255,30 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
                 dist = max(0.0, min(1.0, (close - lim_sup) / range_bb))
                 score += dist * 40.0
 
+            # RSI: até 25 pontos (um pouco menos para balancear)
             if is_buy:
                 rsi_strength = max(0.0, min(1.0, (RSI_BUY_MAX - rsi_now) / 20.0))
-                score += rsi_strength * 30.0
+                score += rsi_strength * 25.0
             else:
                 rsi_strength = max(0.0, min(1.0, (rsi_now - RSI_SELL_MIN) / 20.0))
-                score += rsi_strength * 30.0
+                score += rsi_strength * 25.0
 
-            ema_sep = abs(ema20_now - ema50_now)
-            scale = max(1e-6, 0.01)
-            sep_strength = max(0.0, min(1.0, ema_sep / scale))
-            score += sep_strength * 20.0
+            # EMA separation: até 25 pontos (adaptativo)
+            # normalizamos ema_sep com a escala definida
+            scale = ema_sep_scale_for_symbol(symbol)
+            if scale <= 0:
+                scale = DEFAULT_EMA_SEP_SCALE
+            sep_strength = max(0.0, min(1.0, ema_sep / (scale * 1.0)))
+            score += sep_strength * 25.0
 
+            # MACD: até 10 pontos
             if macd_diff is not None and not pd.isna(macd_diff):
                 macd_strength = max(0.0, min(1.0, abs(macd_diff) / (MACD_TOLERANCE * 5)))
                 score += macd_strength * 10.0
 
             return int(max(0, min(100, round(score))))
 
+        # Build result
         if cond_buy:
             force = calc_forca(is_buy=True)
             last_signal_candle[symbol] = candle_id
@@ -250,9 +316,9 @@ async def monitor_symbol(symbol: str):
             log(f"[{symbol}] Conectando ao WS (attempt {reconnect_attempt})...")
             async with websockets.connect(WS_URL, ping_interval=None) as ws:
                 log(f"[{symbol}] WS conectado.")
-                # enviar notificação de conexão sem throttle (bypass_throttle=True)
+                # notificar conexão (sem throttle)
                 try:
-                    send_telegram(f"🔌 [{symbol}] WebSocket conectado.", bypass_throttle=True)
+                    send_telegram(f"🔌 [{human_pair(symbol)}] WebSocket conectado.", bypass_throttle=True)
                 except Exception:
                     log(f"[{symbol}] Falha ao notificar Telegram sobre conexão.", "warning")
 
@@ -307,12 +373,12 @@ async def monitor_symbol(symbol: str):
                             raise
                         await asyncio.sleep(1.0 + random.random() * 2.0)
 
+                # process initial df
                 df = calcular_indicadores(df)
                 save_last_candles(df, symbol)
                 log(f"[{symbol}] Histórico inicial carregado ({len(df)} candles).")
-                # notificar histórico carregado (sem throttle)
                 try:
-                    send_telegram(f"📥 [{symbol}] Histórico inicial ({len(df)} candles) carregado.", bypass_throttle=True)
+                    send_telegram(f"📥 [{human_pair(symbol)}] Histórico inicial ({len(df)} candles) carregado.", bypass_throttle=True)
                 except Exception:
                     log(f"[{symbol}] Falha ao notificar Telegram sobre histórico.", "warning")
 
@@ -327,12 +393,13 @@ async def monitor_symbol(symbol: str):
                 await ws.send(json.dumps(sub_req))
                 log(f"[{symbol}] Inscrito em candles ao vivo.")
                 try:
-                    send_telegram(f"🔔 [{symbol}] Inscrito em candles ao vivo (M{CANDLE_INTERVAL}).", bypass_throttle=True)
+                    send_telegram(f"🔔 [{human_pair(symbol)}] Inscrito em candles ao vivo (M{CANDLE_INTERVAL}).", bypass_throttle=True)
                 except Exception:
                     log(f"[{symbol}] Falha ao notificar Telegram sobre inscrição.", "warning")
 
                 ultimo_candle_time = time.time()
 
+                # Loop de recebimento robusto
                 while True:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=180)
@@ -378,6 +445,7 @@ async def monitor_symbol(symbol: str):
                         log(f"[{symbol}] Candle com campos inválidos, ignorando: {candle}", "warning")
                         continue
 
+                    # Consider only closed candles aligned with granularity
                     if epoch % GRANULARITY_SECONDS != 0:
                         continue
 
@@ -419,7 +487,7 @@ async def monitor_symbol(symbol: str):
 
                             msg_final = (
                                 f"📊 *NOVO SINAL — M{CANDLE_INTERVAL}*\n"
-                                f"• Par: {symbol.replace('frx','')}\n"
+                                f"• Par: {human_pair(symbol)}\n"
                                 f"• Direção: {arrow} *{tipo}*\n"
                                 f"• Força do sinal: *{forca}%*\n"
                                 f"• Preço: {price:.5f}\n"
