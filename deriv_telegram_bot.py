@@ -1,6 +1,6 @@
 # ===============================================================
 # deriv_telegram_bot.py — LÓGICA B (AJUSTADA) + ML LEVE (RandomForest)
-# (CORREÇÃO 1 + ML leve por símbolo)
+# (CORREÇÃO 1 + ML leve por símbolo + melhorias: 3 velas entre sinais + trend momentum)
 # ===============================================================
 
 import asyncio
@@ -59,9 +59,12 @@ RSI_BUY_MAX = 52
 RSI_SELL_MIN = 48
 MACD_TOLERANCE = 0.002
 
-# Anti-spam / anti-duplicate
+# Anti-spam / anti-duplicate (tempo)
 MIN_SECONDS_BETWEEN_SIGNALS = 5           # reduzido para permitir mais sinais
 MIN_SECONDS_BETWEEN_OPPOSITE = 60         # evita compra->venda imediata (opposite cooldown)
+
+# Anti-duplicate (velas): aguarda N velas entre sinais para o mesmo par
+MIN_CANDLES_BETWEEN_SIGNALS = 3           # <-- sua melhoria solicitada (3 velas = 15min se CANDLE_INTERVAL=5)
 
 # EMA separation relative threshold (fraction of price)
 REL_EMA_SEP_PCT = 5e-05
@@ -78,7 +81,7 @@ ML_CONF_THRESHOLD = 0.55                  # probabilidade mínima para aceitar a
 
 # ---------------- Estado ----------------
 last_signal_state = {s: None for s in SYMBOLS}        # "COMPRA"/"VENDA"
-last_signal_candle = {s: None for s in SYMBOLS}      # candle_id
+last_signal_candle = {s: None for s in SYMBOLS}      # candle_id (epoch aligned)
 last_signal_time = {s: 0 for s in SYMBOLS}           # timestamp last signal (set WHEN SENT)
 last_notify_time = {}                                 # throttle per-symbol for normal messages
 
@@ -266,15 +269,18 @@ def ml_predict_prob(symbol: str, last_row: pd.Series) -> float:
         log(f"[ML {symbol}] Erro em ml_predict_prob: {e}\n{traceback.format_exc()}", "error")
         return None
 
-# ---------------- Lógica — CORRIGIDA + FORÇA DO SINAL ----------------
+# ---------------- Lógica — CORRIGIDA + FORÇA DO SINAL + MELHORIA DE TENDÊNCIA ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
     """
     Retorna None ou dict {"tipo": "COMPRA"/"VENDA", "forca": int(0-100), "candle_id": ...}
     Regras principais implementadas:
       - 1 sinal por candle (last_signal_candle)
+      - cooldown de N velas entre sinais do mesmo par (MIN_CANDLES_BETWEEN_SIGNALS)
       - cooldown global (MIN_SECONDS_BETWEEN_SIGNALS) aplicado NA HORA DO ENVIO
       - bloqueio de sinais opostos por MIN_SECONDS_BETWEEN_OPPOSITE
       - exigir separação mínima de EMA para evitar micro-ruído (checagem relativa)
+      - exigir momentum da EMA20 (sinal alinhado com direção da EMA20) para maior assertividade,
+        ou aceitar cruzamento (cruzou_up/down) mesmo que a EMA20 ainda não tenha momentum
       - ML filtra sinal (se treinado) antes do envio
     Nota importante da correção 1:
       -> Não atualizamos last_signal_time dentro de gerar_sinal (isso foi a causa do skip de 0.0s).
@@ -297,6 +303,15 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             log(f"[{symbol}] Já houve sinal nesse candle ({candle_id}), ignorando.", "debug")
             return None
 
+        # ------------------ nova checagem: gap de velas desde último sinal ------------------
+        last_candle = last_signal_candle.get(symbol)
+        if last_candle is not None:
+            # compute number of candles passed since last_candle
+            candles_passed = (candle_id - last_candle) // GRANULARITY_SECONDS
+            if candles_passed < MIN_CANDLES_BETWEEN_SIGNALS:
+                log(f"[{symbol}] Ignorando: só passaram {candles_passed} velas desde o último sinal (< {MIN_CANDLES_BETWEEN_SIGNALS}).", "info")
+                return None
+
         # indicadores
         ema20_now, ema50_now = now["ema20"], now["ema50"]
         ema20_prev, ema50_prev = prev["ema20"], prev["ema50"]
@@ -313,6 +328,9 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         cruzou_down = (ema20_prev >= ema50_prev) and (ema20_now < ema50_now)
         tendencia_up = ema20_now > ema50_now
         tendencia_down = ema20_now < ema50_now
+
+        # EMA20 momentum (sinaliza que EMA20 está subindo/descendo)
+        ema20_momentum = ema20_now - ema20_prev
 
         # Bollinger proximidade
         range_bb = bb_upper - bb_lower
@@ -338,12 +356,18 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             log(f"[{symbol}] Ignorando por micro-ruído: ema_sep={ema_sep:.6f}, close={close:.6f}, rel_sep={rel_sep:.6e} < REL_EMA_SEP_PCT={REL_EMA_SEP_PCT:.6e}", "info")
             return None
 
-        # Condições combinadas
-        cond_buy = (cruzou_up or tendencia_up) and perto_lower and buy_rsi_ok and macd_buy_ok
-        cond_sell = (cruzou_down or tendencia_down) and perto_upper and sell_rsi_ok and macd_sell_ok
+        # --------- reforço da assertividade: exigir momentum da EMA20 (ou cruzamento explícito) ----------
+        # Para COMPRA: aceitar se (cruzou_up) OU (tendencia_up E ema20_momentum > 0)
+        buy_trend_ok = cruzou_up or (tendencia_up and ema20_momentum > 0)
+        # Para VENDA: aceitar se (cruzou_down) OU (tendencia_down E ema20_momentum < 0)
+        sell_trend_ok = cruzou_down or (tendencia_down and ema20_momentum < 0)
+
+        # Condições combinadas (agora usando buy_trend_ok / sell_trend_ok)
+        cond_buy = buy_trend_ok and perto_lower and buy_rsi_ok and macd_buy_ok
+        cond_sell = sell_trend_ok and perto_upper and sell_rsi_ok and macd_sell_ok
 
         if not (cond_buy or cond_sell):
-            log(f"[{symbol}] Condições buy/sell não satisfeitas (cruzou_up={cruzou_up}, tendencia_up={tendencia_up}, perto_lower={perto_lower}, buy_rsi_ok={buy_rsi_ok}, macd_buy_ok={macd_buy_ok}).", "debug")
+            log(f"[{symbol}] Condições buy/sell não satisfeitas (buy_trend_ok={buy_trend_ok}, sell_trend_ok={sell_trend_ok}, perto_lower={perto_lower}, perto_upper={perto_upper}, buy_rsi_ok={buy_rsi_ok}, sell_rsi_ok={sell_rsi_ok}).", "debug")
             return None
 
         # Evitar sinais opostos muito próximos (usa last_signal_time, que é o momento do ÚLTIMO ENVIO)
@@ -584,9 +608,8 @@ async def monitor_symbol(symbol: str):
                         save_last_candles(df, symbol)
 
                         # Optionally: incremental retrain every N candles (light) - here we retrain every 200 new candles
-                        # (keeps model fresh). We'll retrain if we have >=200 and model is older than 200 rows.
+                        # (keeps model fresh). We'll retrain if we have >=200 and model is not ready.
                         try:
-                            # if we have >=200 rows and model not ready OR we haven't retrained recently, train
                             if len(df) >= 200 and (not ml_model_ready.get(symbol, False)):
                                 train_ml_for_symbol(df, symbol)
                         except Exception:
