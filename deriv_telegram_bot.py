@@ -39,7 +39,7 @@ SYMBOLS = [
     "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
     "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
     "frxEURAUD", "frxAUDJPY", "frxGBPAUD", "frxGBPCAD", "frxAUDNZD",
-    "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
+    "frxEURCAD"
 ]
 
 DATA_DIR = Path("./candles_data")
