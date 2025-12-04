@@ -1,6 +1,6 @@
 # ===============================================================
 # deriv_telegram_bot.py — LÓGICA B (AJUSTADA) + ML LEVE (RandomForest)
-# (CORREÇÃO 1 + ML leve por símbolo + melhorias: 3 velas entre sinais + trend momentum)
+# (Opção B — Filtro Moderado + ML leve + 3 velas entre sinais + trend momentum)
 # ===============================================================
 
 import asyncio
@@ -64,10 +64,14 @@ MIN_SECONDS_BETWEEN_SIGNALS = 5           # reduzido para permitir mais sinais
 MIN_SECONDS_BETWEEN_OPPOSITE = 60         # evita compra->venda imediata (opposite cooldown)
 
 # Anti-duplicate (velas): aguarda N velas entre sinais para o mesmo par
-MIN_CANDLES_BETWEEN_SIGNALS = 3           # <-- sua melhoria solicitada (3 velas = 15min se CANDLE_INTERVAL=5)
+MIN_CANDLES_BETWEEN_SIGNALS = 3           # 3 velas = 15min se CANDLE_INTERVAL=5
 
 # EMA separation relative threshold (fraction of price)
-REL_EMA_SEP_PCT = 5e-05
+# Opção B (Filtro Moderado): menos restritivo
+REL_EMA_SEP_PCT = 2e-05                   # was 5e-05 -> agora mais permissivo
+
+# Soft rule: se rel_sep < REL_EMA_SEP_PCT, permita sinal apenas se força >= threshold
+MICRO_FORCE_ALLOW_THRESHOLD = 55          # força mínima para permitir sinal mesmo com micro-sep
 
 # Require minimum EMA separation scale baseline (kept for fallback)
 DEFAULT_EMA_SEP_SCALE = 0.01
@@ -278,7 +282,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
       - cooldown de N velas entre sinais do mesmo par (MIN_CANDLES_BETWEEN_SIGNALS)
       - cooldown global (MIN_SECONDS_BETWEEN_SIGNALS) aplicado NA HORA DO ENVIO
       - bloqueio de sinais opostos por MIN_SECONDS_BETWEEN_OPPOSITE
-      - exigir separação mínima de EMA para evitar micro-ruído (checagem relativa)
+      - filtro antirruído moderado (soft): se rel_sep baixo, só permite se força >= MICRO_FORCE_ALLOW_THRESHOLD
       - exigir momentum da EMA20 (sinal alinhado com direção da EMA20) para maior assertividade,
         ou aceitar cruzamento (cruzou_up/down) mesmo que a EMA20 ainda não tenha momentum
       - ML filtra sinal (se treinado) antes do envio
@@ -349,12 +353,9 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         macd_buy_ok = True if (macd_diff is None or pd.isna(macd_diff)) else (macd_diff > -MACD_TOLERANCE)
         macd_sell_ok = True if (macd_diff is None or pd.isna(macd_diff)) else (macd_diff < MACD_TOLERANCE)
 
-        # Evitar micro-ruído: exigir EMA separation relativa (ema_sep / close)
+        # Evitar micro-ruído: calcular rel_sep (mas não bloquear imediatamente)
         ema_sep = abs(ema20_now - ema50_now)
         rel_sep = ema_sep / max(1e-12, abs(close))  # razão relativa
-        if rel_sep < REL_EMA_SEP_PCT:
-            log(f"[{symbol}] Ignorando por micro-ruído: ema_sep={ema_sep:.6f}, close={close:.6f}, rel_sep={rel_sep:.6e} < REL_EMA_SEP_PCT={REL_EMA_SEP_PCT:.6e}", "info")
-            return None
 
         # --------- reforço da assertividade: exigir momentum da EMA20 (ou cruzamento explícito) ----------
         # Para COMPRA: aceitar se (cruzou_up) OU (tendencia_up E ema20_momentum > 0)
@@ -413,17 +414,28 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         # Build result
         if cond_buy:
             force = calc_forca(is_buy=True)
+
+            # Soft micro-ruído rule (Opção B - moderada):
+            if rel_sep < REL_EMA_SEP_PCT and force < MICRO_FORCE_ALLOW_THRESHOLD:
+                log(f"[{symbol}] Bloqueado por micro-ruído moderado: rel_sep={rel_sep:.3e} < {REL_EMA_SEP_PCT:.3e} e força={force} < {MICRO_FORCE_ALLOW_THRESHOLD}.", "info")
+                return None
+
             # set candle & state but DON'T set last_signal_time here (correction 1)
             last_signal_candle[symbol] = candle_id
             last_signal_state[symbol] = "COMPRA"
-            log(f"[{symbol}] SINAL GERADO (pré-ML): COMPRA (força={force}%)", "info")
+            log(f"[{symbol}] SINAL GERADO (pré-ML): COMPRA (força={force}%, rel_sep={rel_sep:.3e})", "info")
             return {"tipo": "COMPRA", "forca": force, "candle_id": candle_id, "rel_sep": rel_sep}
 
         if cond_sell:
             force = calc_forca(is_buy=False)
+
+            if rel_sep < REL_EMA_SEP_PCT and force < MICRO_FORCE_ALLOW_THRESHOLD:
+                log(f"[{symbol}] Bloqueado por micro-ruído moderado: rel_sep={rel_sep:.3e} < {REL_EMA_SEP_PCT:.3e} e força={force} < {MICRO_FORCE_ALLOW_THRESHOLD}.", "info")
+                return None
+
             last_signal_candle[symbol] = candle_id
             last_signal_state[symbol] = "VENDA"
-            log(f"[{symbol}] SINAL GERADO (pré-ML): VENDA (força={force}%)", "info")
+            log(f"[{symbol}] SINAL GERADO (pré-ML): VENDA (força={force}%, rel_sep={rel_sep:.3e})", "info")
             return {"tipo": "VENDA", "forca": force, "candle_id": candle_id, "rel_sep": rel_sep}
 
         return None
@@ -607,8 +619,7 @@ async def monitor_symbol(symbol: str):
                         df = calcular_indicadores(df)
                         save_last_candles(df, symbol)
 
-                        # Optionally: incremental retrain every N candles (light) - here we retrain every 200 new candles
-                        # (keeps model fresh). We'll retrain if we have >=200 and model is not ready.
+                        # Optionally: incremental retrain every N candles (light) - here we retrain if model not ready and we have >=200
                         try:
                             if len(df) >= 200 and (not ml_model_ready.get(symbol, False)):
                                 train_ml_for_symbol(df, symbol)
@@ -714,7 +725,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Bot ativo — Lógica B (ajustada) — com força do sinal + ML leve"
+    return "Bot ativo — Lógica B (ajustada) — com força do sinal + ML leve (Filtro Moderado)"
 
 # ---------------- Execução ----------------
 def run_flask():
@@ -724,7 +735,7 @@ def run_flask():
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
     # startup notification (bypass so you always get it)
-    send_telegram("✅ Bot iniciado — Lógica B ajustada + Força do Sinal + ML leve", bypass_throttle=True)
+    send_telegram("✅ Bot iniciado — Lógica B ajustada + Força do Sinal + ML leve (Filtro Moderado)", bypass_throttle=True)
     if not SKLEARN_AVAILABLE:
         log("⚠️ scikit-learn não encontrado. ML desabilitado. Instale scikit-learn para habilitar ML.", "warning")
     await asyncio.gather(*(monitor_symbol(s) for s in SYMBOLS))
