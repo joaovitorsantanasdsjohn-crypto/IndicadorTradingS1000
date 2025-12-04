@@ -1,5 +1,6 @@
 # ===============================================================
-# deriv_telegram_bot.py — LÓGICA B (AJUSTADA) — COMPLETO (CORREÇÃO 1)
+# deriv_telegram_bot.py — LÓGICA B (AJUSTADA) + ML LEVE (RandomForest)
+# (CORREÇÃO 1 + ML leve por símbolo)
 # ===============================================================
 
 import asyncio
@@ -22,6 +23,13 @@ import logging
 import traceback
 import math
 
+# ML imports
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SKLEARN_AVAILABLE = False
+
 # ---------------- Inicialização ----------------
 load_dotenv()
 
@@ -39,7 +47,7 @@ SYMBOLS = [
     "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
     "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
     "frxEURAUD", "frxAUDJPY", "frxGBPAUD", "frxGBPCAD", "frxAUDNZD",
-    "frxEURCAD"
+    "frxEURCAD", "frxUSDNOK", "frxUSDSEK"
 ]
 
 DATA_DIR = Path("./candles_data")
@@ -56,17 +64,27 @@ MIN_SECONDS_BETWEEN_SIGNALS = 5           # reduzido para permitir mais sinais
 MIN_SECONDS_BETWEEN_OPPOSITE = 60         # evita compra->venda imediata (opposite cooldown)
 
 # EMA separation relative threshold (fraction of price)
-# 5e-05 == 0.005% relative separation required (ajuste para ser mais/menos sensível)
 REL_EMA_SEP_PCT = 5e-05
 
 # Require minimum EMA separation scale baseline (kept for fallback)
 DEFAULT_EMA_SEP_SCALE = 0.01
+
+# ML params
+ML_ENABLED = SKLEARN_AVAILABLE            # habilitado apenas se sklearn presente
+ML_N_ESTIMATORS = 40
+ML_MAX_DEPTH = 4
+ML_MIN_TRAINED_SAMPLES = 50               # mínimo de amostras para considerar o modelo válido
+ML_CONF_THRESHOLD = 0.55                  # probabilidade mínima para aceitar a predição do ML
 
 # ---------------- Estado ----------------
 last_signal_state = {s: None for s in SYMBOLS}        # "COMPRA"/"VENDA"
 last_signal_candle = {s: None for s in SYMBOLS}      # candle_id
 last_signal_time = {s: 0 for s in SYMBOLS}           # timestamp last signal (set WHEN SENT)
 last_notify_time = {}                                 # throttle per-symbol for normal messages
+
+# ML models per symbol
+ml_models = {}               # symbol -> sklearn model
+ml_model_ready = {}          # symbol -> bool (trained & valid)
 
 # ---------------- Logging ----------------
 logger = logging.getLogger("indicador")
@@ -93,7 +111,7 @@ def send_telegram(message: str, symbol: str = None, bypass_throttle: bool = Fals
     """
     Envia mensagem para o chat.
     - Se 'symbol' informado, aplica throttle por símbolo (3s) a menos que bypass_throttle=True.
-    - Use bypass_throttle=True para avisos de conexão/histórico.
+    - Use bypass_throttle=True para avisos de conexão/histórico/ML.
     """
     now = time.time()
 
@@ -150,7 +168,103 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_lower"] = bb.bollinger_lband()
     df["bb_mavg"] = bb.bollinger_mavg()
 
+    # additional helpers
+    df["bb_width"] = df["bb_upper"] - df["bb_lower"]
+    df["rel_sep"] = (df["ema20"] - df["ema50"]).abs() / df["close"].replace(0, 1e-12)
+
     return df
+
+# ---------------- ML: treino e predição ----------------
+def _build_ml_dataset(df: pd.DataFrame) -> (pd.DataFrame, pd.Series):
+    """
+    Constrói X,y para treinar o modelo:
+      - X: features do candle t
+      - y: direção do candle t+1 (1 se close_t+1 > close_t, else 0)
+    Usa colunas de indicadores já calculadas.
+    """
+    df2 = df.copy().reset_index(drop=True)
+    # require numeric columns present
+    features = [
+        "open", "high", "low", "close", "volume",
+        "ema20", "ema50", "rsi", "macd_diff",
+        "bb_upper", "bb_lower", "bb_mavg", "bb_width", "rel_sep"
+    ]
+    # fillna
+    for c in features:
+        if c not in df2.columns:
+            df2[c] = 0.0
+    df2 = df2[features].fillna(0.0)
+
+    # label: next close > current close
+    y = (df2["close"].shift(-1) > df2["close"]).astype(int)
+    X = df2.iloc[:-1].copy()
+    y = y.iloc[:-1].copy()
+
+    return X, y
+
+def train_ml_for_symbol(df: pd.DataFrame, symbol: str):
+    """
+    Treina (ou re-treina) um RandomForest leve para 'symbol'.
+    Retorna True se o modelo for treinado com sucesso e tem amostras suficientes.
+    """
+    if not ML_ENABLED:
+        log(f"[ML {symbol}] scikit-learn não disponível — ML desabilitado.", "warning")
+        ml_model_ready[symbol] = False
+        return False
+
+    try:
+        X, y = _build_ml_dataset(df)
+        if len(X) < ML_MIN_TRAINED_SAMPLES or len(y.unique()) < 2:
+            log(f"[ML {symbol}] Dados insuficientes para treinar ML (samples={len(X)}, classes={y.unique()}).", "info")
+            ml_model_ready[symbol] = False
+            return False
+
+        model = RandomForestClassifier(n_estimators=ML_N_ESTIMATORS, max_depth=ML_MAX_DEPTH, random_state=42)
+        model.fit(X, y)
+
+        ml_models[symbol] = (model, X.columns.tolist())
+        ml_model_ready[symbol] = True
+
+        log(f"[ML {symbol}] Modelo treinado (samples={len(X)}).", "info")
+        # notify once that ML is ready for this symbol
+        try:
+            send_telegram(f"🤖 ML treinado para {human_pair(symbol)} com {len(X)} amostras.", bypass_throttle=True)
+        except Exception:
+            log(f"[ML {symbol}] Falha ao notificar Telegram sobre treino.", "warning")
+        return True
+
+    except Exception as e:
+        log(f"[ML {symbol}] Erro ao treinar ML: {e}\n{traceback.format_exc()}", "error")
+        ml_model_ready[symbol] = False
+        return False
+
+def ml_predict_prob(symbol: str, last_row: pd.Series) -> float:
+    """
+    Retorna probabilidade prevista de 'alta' (float 0..1) para o próximo candle.
+    Se modelo não pronto, retorna None.
+    """
+    try:
+        if not ml_model_ready.get(symbol):
+            return None
+        model, cols = ml_models.get(symbol, (None, None))
+        if model is None or cols is None:
+            return None
+
+        # build feature vector in same order
+        Xrow = []
+        for c in cols:
+            # if col missing in last_row, use 0
+            Xrow.append(float(last_row.get(c, 0.0) if pd.notna(last_row.get(c, None)) else 0.0))
+
+        # model.predict_proba expects 2D
+        probs = model.predict_proba([Xrow])[0]
+        # probs: [prob_class0, prob_class1]
+        prob_up = float(probs[1])
+        return prob_up
+
+    except Exception as e:
+        log(f"[ML {symbol}] Erro em ml_predict_prob: {e}\n{traceback.format_exc()}", "error")
+        return None
 
 # ---------------- Lógica — CORRIGIDA + FORÇA DO SINAL ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
@@ -161,6 +275,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
       - cooldown global (MIN_SECONDS_BETWEEN_SIGNALS) aplicado NA HORA DO ENVIO
       - bloqueio de sinais opostos por MIN_SECONDS_BETWEEN_OPPOSITE
       - exigir separação mínima de EMA para evitar micro-ruído (checagem relativa)
+      - ML filtra sinal (se treinado) antes do envio
     Nota importante da correção 1:
       -> Não atualizamos last_signal_time dentro de gerar_sinal (isso foi a causa do skip de 0.0s).
          last_signal_time será atualizado somente quando a mensagem for realmente enviada.
@@ -277,15 +392,15 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             # set candle & state but DON'T set last_signal_time here (correction 1)
             last_signal_candle[symbol] = candle_id
             last_signal_state[symbol] = "COMPRA"
-            log(f"[{symbol}] SINAL GERADO: COMPRA (força={force}%)", "info")
-            return {"tipo": "COMPRA", "forca": force, "candle_id": candle_id}
+            log(f"[{symbol}] SINAL GERADO (pré-ML): COMPRA (força={force}%)", "info")
+            return {"tipo": "COMPRA", "forca": force, "candle_id": candle_id, "rel_sep": rel_sep}
 
         if cond_sell:
             force = calc_forca(is_buy=False)
             last_signal_candle[symbol] = candle_id
             last_signal_state[symbol] = "VENDA"
-            log(f"[{symbol}] SINAL GERADO: VENDA (força={force}%)", "info")
-            return {"tipo": "VENDA", "forca": force, "candle_id": candle_id}
+            log(f"[{symbol}] SINAL GERADO (pré-ML): VENDA (força={force}%)", "info")
+            return {"tipo": "VENDA", "forca": force, "candle_id": candle_id, "rel_sep": rel_sep}
 
         return None
 
@@ -301,7 +416,7 @@ def save_last_candles(df: pd.DataFrame, symbol: str):
     except Exception as e:
         log(f"[{symbol}] Erro ao salvar candles: {e}", "warning")
 
-# ---------------- Monitor WebSocket (com backoff e validação) ----------------
+# ---------------- Monitor WebSocket (com backoff, validação e ML) ----------------
 async def monitor_symbol(symbol: str):
     reconnect_attempt = 0
     while True:
@@ -375,6 +490,14 @@ async def monitor_symbol(symbol: str):
                     send_telegram(f"📥 [{human_pair(symbol)}] Histórico inicial ({len(df)} candles) carregado.", bypass_throttle=True)
                 except Exception:
                     log(f"[{symbol}] Falha ao notificar Telegram sobre histórico.", "warning")
+
+                # Train ML now with the initial history (non-blocking enough; fast)
+                try:
+                    trained = train_ml_for_symbol(df, symbol)
+                    if not trained and ML_ENABLED:
+                        log(f"[ML {symbol}] Modelo NÃO treinado (dados insuficientes).", "info")
+                except Exception as e:
+                    log(f"[ML {symbol}] Erro ao treinar inicial: {e}", "error")
 
                 # subscribe
                 sub_req = {
@@ -460,6 +583,15 @@ async def monitor_symbol(symbol: str):
                         df = calcular_indicadores(df)
                         save_last_candles(df, symbol)
 
+                        # Optionally: incremental retrain every N candles (light) - here we retrain every 200 new candles
+                        # (keeps model fresh). We'll retrain if we have >=200 and model is older than 200 rows.
+                        try:
+                            # if we have >=200 rows and model not ready OR we haven't retrained recently, train
+                            if len(df) >= 200 and (not ml_model_ready.get(symbol, False)):
+                                train_ml_for_symbol(df, symbol)
+                        except Exception:
+                            log(f"[ML {symbol}] Erro no retrain incremental.", "warning")
+
                         sinal = gerar_sinal(df, symbol)
 
                         if sinal:
@@ -474,11 +606,37 @@ async def monitor_symbol(symbol: str):
                             forca = sinal["forca"]
                             arrow = "🟢" if tipo == "COMPRA" else "🔴"
                             price = close_p
-
-                            br_tz = timezone(timedelta(hours=-3))
-                            entrada_br = candle_time_utc.astimezone(br_tz)
+                            entrada_br = candle_time_utc.astimezone(timezone(timedelta(hours=-3)))
                             entrada_str = entrada_br.strftime("%Y-%m-%d %H:%M:%S")
 
+                            # ML filter: if model ready, check probability
+                            ml_ok = True
+                            ml_prob = None
+                            if ML_ENABLED and ml_model_ready.get(symbol, False):
+                                try:
+                                    # pass the last row (with features) to ML
+                                    last_row = df.iloc[-1]
+                                    prob_up = ml_predict_prob(symbol, last_row)
+                                    ml_prob = prob_up
+                                    if prob_up is None:
+                                        ml_ok = True
+                                    else:
+                                        if tipo == "COMPRA":
+                                            if prob_up >= ML_CONF_THRESHOLD:
+                                                ml_ok = True
+                                            else:
+                                                ml_ok = False
+                                        else:  # VENDA
+                                            # prob_down = 1 - prob_up
+                                            if (1.0 - prob_up) >= ML_CONF_THRESHOLD:
+                                                ml_ok = True
+                                            else:
+                                                ml_ok = False
+                                except Exception as e:
+                                    log(f"[ML {symbol}] Erro ao avaliar ML: {e}", "error")
+                                    ml_ok = True  # fail-open: if ML errors, don't block
+
+                            # compose message
                             msg_final = (
                                 f"📊 *NOVO SINAL — M{CANDLE_INTERVAL}*\n"
                                 f"• Par: {human_pair(symbol)}\n"
@@ -488,9 +646,27 @@ async def monitor_symbol(symbol: str):
                                 f"• Horário de entrada (Brasília): {entrada_str}"
                             )
 
-                            # Agora sim: atualizamos last_signal_time no momento do ENVIO
+                            # add ML info in message if available
+                            if ml_prob is not None:
+                                prob_pct = int(round(ml_prob * 100))
+                                if tipo == "COMPRA":
+                                    msg_final += f"\n• ML prob subida: *{prob_pct}%* (threshold {int(ML_CONF_THRESHOLD*100)}%)"
+                                else:
+                                    msg_final += f"\n• ML prob descida: *{100-prob_pct}%* (threshold {int(ML_CONF_THRESHOLD*100)}%)"
+
+                            # If ML blocked the signal, log and optionally send a shortened message about block
+                            if ML_ENABLED and ml_model_ready.get(symbol, False) and not ml_ok:
+                                log(f"[{symbol}] ❌ ML bloqueou o sinal {tipo} (prob_up={ml_prob:.3f})", "warning")
+                                # send short notification about block (bypass_throttle True so you always see)
+                                try:
+                                    send_telegram(f"❌ [{human_pair(symbol)}] Sinal {tipo} bloqueado pelo ML (prob_up={ml_prob:.3f}).", bypass_throttle=True)
+                                except Exception:
+                                    log(f"[{symbol}] Falha ao notificar Telegram sobre bloqueio ML.", "warning")
+                                # DO NOT update last_signal_time because not sent
+                                continue
+
+                            # Now send the final signal (ML ok or ML disabled)
                             last_signal_time[symbol] = time.time()
-                            # sinais usam throttle por símbolo (não bypass)
                             try:
                                 send_telegram(msg_final, symbol=symbol, bypass_throttle=False)
                                 log(f"[{symbol}] Mensagem enviada ao Telegram.", "info")
@@ -515,7 +691,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Bot ativo — Lógica B (ajustada) — com força do sinal"
+    return "Bot ativo — Lógica B (ajustada) — com força do sinal + ML leve"
 
 # ---------------- Execução ----------------
 def run_flask():
@@ -525,7 +701,9 @@ def run_flask():
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
     # startup notification (bypass so you always get it)
-    send_telegram("✅ Bot iniciado — Lógica B ajustada + Força do Sinal", bypass_throttle=True)
+    send_telegram("✅ Bot iniciado — Lógica B ajustada + Força do Sinal + ML leve", bypass_throttle=True)
+    if not SKLEARN_AVAILABLE:
+        log("⚠️ scikit-learn não encontrado. ML desabilitado. Instale scikit-learn para habilitar ML.", "warning")
     await asyncio.gather(*(monitor_symbol(s) for s in SYMBOLS))
 
 if __name__ == "__main__":
