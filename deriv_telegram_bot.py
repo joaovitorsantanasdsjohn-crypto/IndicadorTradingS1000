@@ -1,8 +1,12 @@
 # ===============================================================
-# deriv_telegram_bot.py — LÓGICA B (AJUSTADA) + ML LEVE (RandomForest)
-# (Opção B — Filtro Moderado + ML leve + 3 velas entre sinais + trend momentum)
-# Correções: não marcar candle antes de ML, cooldown aplicado APÓS ML,
-# tendência menos restritiva, micro-ruído mais permissivo.
+# deriv_telegram_bot.py — LÓGICA C (Opção C — Filtro Leve + ML atualizado por candle)
+# Ajustes aplicados:
+# 1) Micro-ruído menos restritivo
+# 2) Força mínima reduzida (FORCE_MIN default 50)
+# 3) ML leve re-treinado incrementalmente por candle (retrain quando >= ML_MIN_TRAINED_SAMPLES)
+# 4) Tendência moderada permitida (aceita tendência OU cruzamento)
+# 5) Não marcar candle antes do ML; cooldown aplicado APÓS ML aprovar
+# 6) Modo fallback adaptativo para garantir mínimo de sinais/hora
 # ===============================================================
 
 import asyncio
@@ -24,6 +28,7 @@ import random
 import logging
 import traceback
 import math
+from collections import deque
 
 # ML imports
 try:
@@ -63,27 +68,39 @@ MACD_TOLERANCE = 0.002
 
 # Anti-spam / anti-duplicate (tempo)
 MIN_SECONDS_BETWEEN_SIGNALS = 5           # cooldown entre envios (aplicado APÓS ML aprovar)
-MIN_SECONDS_BETWEEN_OPPOSITE = 60         # evita compra->venda imediata (opposite cooldown)
+MIN_SECONDS_BETWEEN_OPPOSITE = 60        # evita compra->venda imediata (opposite cooldown)
 
 # Anti-duplicate (velas): aguarda N velas entre sinais para o mesmo par
 MIN_CANDLES_BETWEEN_SIGNALS = 3           # 3 velas = 15min se CANDLE_INTERVAL=5
 
 # EMA separation relative threshold (fraction of price)
 # Ajustado para ser mais permissivo (menos bloqueios por micro-ruído)
-REL_EMA_SEP_PCT = 8e-06                   # menos restritivo que 2e-05/5e-05
+REL_EMA_SEP_PCT = 8e-06                   # permissivo
 
 # Soft rule: se rel_sep < REL_EMA_SEP_PCT, permita sinal apenas se força >= threshold
 MICRO_FORCE_ALLOW_THRESHOLD = 40          # reduzido para permitir mais sinais
 
-# Require minimum EMA separation scale baseline (kept for fallback)
-DEFAULT_EMA_SEP_SCALE = 0.01
+# Força mínima absoluta para envio (reduzido para mais sinais)
+FORCE_MIN = 50                            # mínimo de força pra enviar sinal (ajustável)
 
 # ML params
 ML_ENABLED = SKLEARN_AVAILABLE            # habilitado apenas se sklearn presente
 ML_N_ESTIMATORS = 40
 ML_MAX_DEPTH = 4
-ML_MIN_TRAINED_SAMPLES = 50               # mínimo de amostras para considerar o modelo válido
+ML_MIN_TRAINED_SAMPLES = 300              # re-training threshold (200 -> 300 conforme solicitado)
 ML_CONF_THRESHOLD = 0.55                  # probabilidade mínima para aceitar a predição do ML
+
+# Garantir mínimo de sinais por hora (fallback adaptativo)
+MIN_SIGNALS_PER_HOUR = 4
+FALLBACK_WINDOW_SEC = 3600                # 1 hora
+# Quando em fallback (poucos sinais na última hora), relaxamos thresholds temporariamente:
+FALLBACK_FORCE_MIN = 40
+FALLBACK_MICRO_FORCE_ALLOW_THRESHOLD = 25
+FALLBACK_REL_EMA_SEP_PCT = 2e-05
+FALLBACK_DURATION_SECONDS = 15 * 60      # aplica fallback por 15 minutos após detecção
+
+# Require minimum EMA separation scale baseline (kept for fallback)
+DEFAULT_EMA_SEP_SCALE = 0.01
 
 # ---------------- Estado ----------------
 last_signal_state = {s: None for s in SYMBOLS}        # "COMPRA"/"VENDA"
@@ -92,8 +109,12 @@ last_signal_time = {s: 0 for s in SYMBOLS}           # timestamp last signal (se
 last_notify_time = {}                                 # throttle per-symbol for normal messages
 
 # ML models per symbol
-ml_models = {}               # symbol -> sklearn model
+ml_models = {}               # symbol -> (model, cols)
 ml_model_ready = {}          # symbol -> bool (trained & valid)
+
+# track sent timestamps globally to enforce MIN_SIGNALS_PER_HOUR fallback
+sent_timestamps = deque()    # timestamps of sent signals (floats)
+fallback_active_until = 0.0  # global timestamp until which fallback relax is active
 
 # ---------------- Logging ----------------
 logger = logging.getLogger("indicador")
@@ -148,7 +169,6 @@ def send_telegram(message: str, symbol: str = None, bypass_throttle: bool = Fals
 def ema_sep_scale_for_symbol(symbol: str) -> float:
     """
     Retorna uma escala heurística para normalizar separação EMA20-EMA50.
-    Mantive para compatibilidade, mas agora usamos checagem relativa (ema_sep/price).
     """
     if "JPY" in symbol or any(x in symbol for x in ["USDNOK", "USDSEK", "USDJPY", "GBPJPY", "EURJPY"]):
         return 0.5
@@ -185,20 +205,12 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------- ML: treino e predição ----------------
 def _build_ml_dataset(df: pd.DataFrame) -> (pd.DataFrame, pd.Series):
-    """
-    Constrói X,y para treinar o modelo:
-      - X: features do candle t
-      - y: direção do candle t+1 (1 se close_t+1 > close_t, else 0)
-    Usa colunas de indicadores já calculadas.
-    """
     df2 = df.copy().reset_index(drop=True)
-    # require numeric columns present
     features = [
         "open", "high", "low", "close", "volume",
         "ema20", "ema50", "rsi", "macd_diff",
         "bb_upper", "bb_lower", "bb_mavg", "bb_width", "rel_sep"
     ]
-    # fillna
     for c in features:
         if c not in df2.columns:
             df2[c] = 0.0
@@ -214,7 +226,6 @@ def _build_ml_dataset(df: pd.DataFrame) -> (pd.DataFrame, pd.Series):
 def train_ml_for_symbol(df: pd.DataFrame, symbol: str):
     """
     Treina (ou re-treina) um RandomForest leve para 'symbol'.
-    Retorna True se o modelo for treinado com sucesso e tem amostras suficientes.
     """
     if not ML_ENABLED:
         log(f"[ML {symbol}] scikit-learn não disponível — ML desabilitado.", "warning")
@@ -224,7 +235,7 @@ def train_ml_for_symbol(df: pd.DataFrame, symbol: str):
     try:
         X, y = _build_ml_dataset(df)
         if len(X) < ML_MIN_TRAINED_SAMPLES or len(y.unique()) < 2:
-            log(f"[ML {symbol}] Dados insuficientes para treinar ML (samples={len(X)}, classes={y.unique()}).", "info")
+            log(f"[ML {symbol}] Dados insuficientes para treinar ML (samples={len(X)}, classes={list(y.unique())}).", "info")
             ml_model_ready[symbol] = False
             return False
 
@@ -235,7 +246,6 @@ def train_ml_for_symbol(df: pd.DataFrame, symbol: str):
         ml_model_ready[symbol] = True
 
         log(f"[ML {symbol}] Modelo treinado (samples={len(X)}).", "info")
-        # notify once that ML is ready for this symbol
         try:
             send_telegram(f"🤖 ML treinado para {human_pair(symbol)} com {len(X)} amostras.", bypass_throttle=True)
         except Exception:
@@ -248,10 +258,6 @@ def train_ml_for_symbol(df: pd.DataFrame, symbol: str):
         return False
 
 def ml_predict_prob(symbol: str, last_row: pd.Series) -> float:
-    """
-    Retorna probabilidade prevista de 'alta' (float 0..1) para o próximo candle.
-    Se modelo não pronto, retorna None.
-    """
     try:
         if not ml_model_ready.get(symbol):
             return None
@@ -259,15 +265,11 @@ def ml_predict_prob(symbol: str, last_row: pd.Series) -> float:
         if model is None or cols is None:
             return None
 
-        # build feature vector in same order
         Xrow = []
         for c in cols:
-            # if col missing in last_row, use 0
             Xrow.append(float(last_row.get(c, 0.0) if pd.notna(last_row.get(c, None)) else 0.0))
 
-        # model.predict_proba expects 2D
         probs = model.predict_proba([Xrow])[0]
-        # probs: [prob_class0, prob_class1]
         prob_up = float(probs[1])
         return prob_up
 
@@ -275,18 +277,30 @@ def ml_predict_prob(symbol: str, last_row: pd.Series) -> float:
         log(f"[ML {symbol}] Erro em ml_predict_prob: {e}\n{traceback.format_exc()}", "error")
         return None
 
-# ---------------- Lógica — CORRIGIDA + FORÇA DO SINAL + MELHORIA DE TENDÊNCIA ----------------
+# ---------------- Helpers de fallback / contagem ----------------
+def prune_sent_timestamps():
+    """Remove timestamps fora da janela de 1 hora"""
+    cutoff = time.time() - FALLBACK_WINDOW_SEC
+    while sent_timestamps and sent_timestamps[0] < cutoff:
+        sent_timestamps.popleft()
+
+def check_and_activate_fallback():
+    """Se tivemos menos que MIN_SIGNALS_PER_HOUR na última hora, ativa fallback temporário."""
+    prune_sent_timestamps()
+    if len(sent_timestamps) < MIN_SIGNALS_PER_HOUR:
+        global fallback_active_until
+        # ativa fallback por FALLBACK_DURATION_SECONDS a partir de agora
+        fallback_active_until = time.time() + FALLBACK_DURATION_SECONDS
+        log(f"[FALLBACK] Ativado fallback adaptativo por pouca atividade (sinais última hora={len(sent_timestamps)}).", "warning")
+
+def is_fallback_active():
+    return time.time() < fallback_active_until
+
+# ---------------- Lógica principal de geração de sinal ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
     """
     Retorna None ou dict {"tipo": "COMPRA"/"VENDA", "forca": int(0-100), "candle_id": ...}
-    Regras principais implementadas:
-      - 1 sinal por candle (last_signal_candle)
-      - cooldown de N velas entre sinais do mesmo par (MIN_CANDLES_BETWEEN_SIGNALS)
-      - cooldown global (MIN_SECONDS_BETWEEN_SIGNALS) aplicado SOMENTE APÓS ML aprovar
-      - bloqueio de sinais opostos por MIN_SECONDS_BETWEEN_OPPOSITE (usa last_signal_time)
-      - filtro antirruído moderado (soft): se rel_sep baixo, só permite se força >= MICRO_FORCE_ALLOW_THRESHOLD
-      - tendência aceita OR (tendencia OR cruzamento) para ser menos restritivo
-      - NÃO atualiza estado do sinal aqui (apenas retorna). Estado só é atualizado no monitor_symbol após ML + envio.
+    Não marca estado aqui; apenas avalia e retorna.
     """
     try:
         if len(df) < 3:
@@ -305,10 +319,9 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             log(f"[{symbol}] Já houve sinal nesse candle ({candle_id}), ignorando.", "debug")
             return None
 
-        # ------------------ nova checagem: gap de velas desde último sinal ------------------
+        # gap de velas desde último sinal
         last_candle = last_signal_candle.get(symbol)
         if last_candle is not None:
-            # compute number of candles passed since last_candle
             candles_passed = (candle_id - last_candle) // GRANULARITY_SECONDS
             if candles_passed < MIN_CANDLES_BETWEEN_SIGNALS:
                 log(f"[{symbol}] Ignorando: só passaram {candles_passed} velas desde o último sinal (< {MIN_CANDLES_BETWEEN_SIGNALS}).", "info")
@@ -331,7 +344,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         tendencia_up = ema20_now > ema50_now
         tendencia_down = ema20_now < ema50_now
 
-        # EMA20 momentum (sinaliza que EMA20 está subindo/descendo)
+        # EMA20 momentum
         ema20_momentum = ema20_now - ema20_prev
 
         # Bollinger proximidade
@@ -351,15 +364,14 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         macd_buy_ok = True if (macd_diff is None or pd.isna(macd_diff)) else (macd_diff > -MACD_TOLERANCE)
         macd_sell_ok = True if (macd_diff is None or pd.isna(macd_diff)) else (macd_diff < MACD_TOLERANCE)
 
-        # Evitar micro-ruído: calcular rel_sep (mas não bloquear imediatamente)
+        # rel_sep
         ema_sep = abs(ema20_now - ema50_now)
         rel_sep = ema_sep / max(1e-12, abs(close))  # razão relativa
 
-        # --------- reforço da assertividade: aceitar tendencia OR cruzamento ----------
+        # aceitar tendencia OR cruzamento (menos restritivo)
         buy_trend_ok = tendencia_up or cruzou_up
         sell_trend_ok = tendencia_down or cruzou_down
 
-        # Condições combinadas (agora usando buy_trend_ok / sell_trend_ok)
         cond_buy = buy_trend_ok and perto_lower and buy_rsi_ok and macd_buy_ok
         cond_sell = sell_trend_ok and perto_upper and sell_rsi_ok and macd_sell_ok
 
@@ -367,7 +379,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             log(f"[{symbol}] Condições buy/sell não satisfeitas (buy_trend_ok={buy_trend_ok}, sell_trend_ok={sell_trend_ok}, perto_lower={perto_lower}, perto_upper={perto_upper}, buy_rsi_ok={buy_rsi_ok}, sell_rsi_ok={sell_rsi_ok}).", "debug")
             return None
 
-        # Evitar sinais opostos muito próximos (usa last_signal_time, que é o momento do ÚLTIMO ENVIO)
+        # Evitar sinais opostos muito próximos
         last_state = last_signal_state.get(symbol)
         last_time = last_signal_time.get(symbol, 0)
         now_ts = time.time()
@@ -376,10 +388,9 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
                 log(f"[{symbol}] Sinal oposto detectado mas dentro do cooldown oposto ({now_ts-last_time:.1f}s) — skip.", "warning")
                 return None
 
-        # Calcular força combinada (0..100) — adaptativa
+        # Calcular força combinada (0..100)
         def calc_forca(is_buy: bool):
             score = 0.0
-
             # Bollinger: proximidade até 40 pontos
             if is_buy:
                 dist = max(0.0, min(1.0, (lim_inf - close) / range_bb))
@@ -397,7 +408,6 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
                 score += rsi_strength * 25.0
 
             # EMA separation: até 25 pontos (normalizamos por preço)
-            # evitar divisão por zero (REL_EMA_SEP_PCT pode ser muito pequeno)
             denom = max(REL_EMA_SEP_PCT * 10, 1e-12)
             sep_strength = max(0.0, min(1.0, rel_sep / denom))
             score += sep_strength * 25.0
@@ -409,13 +419,20 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
 
             return int(max(0, min(100, round(score))))
 
-        # Build result (IMPORTANT: NÃO atualiza last_signal_candle/state/time aqui)
+        # Build result (NÃO atualiza estado aqui)
         if cond_buy:
             force = calc_forca(is_buy=True)
+            # aplica micro-ruído com possibilidade de fallback
+            rel_thresh = FALLBACK_REL_EMA_SEP_PCT if is_fallback_active() else REL_EMA_SEP_PCT
+            micro_force_thresh = FALLBACK_MICRO_FORCE_ALLOW_THRESHOLD if is_fallback_active() else MICRO_FORCE_ALLOW_THRESHOLD
+            force_min_effective = FALLBACK_FORCE_MIN if is_fallback_active() else FORCE_MIN
 
-            # Soft micro-ruído rule (moderada):
-            if rel_sep < REL_EMA_SEP_PCT and force < MICRO_FORCE_ALLOW_THRESHOLD:
-                log(f"[{symbol}] Bloqueado por micro-ruído moderado: rel_sep={rel_sep:.3e} < {REL_EMA_SEP_PCT:.3e} e força={force} < {MICRO_FORCE_ALLOW_THRESHOLD}.", "info")
+            if rel_sep < rel_thresh and force < micro_force_thresh:
+                log(f"[{symbol}] Bloqueado por micro-ruído moderado: rel_sep={rel_sep:.3e} < {rel_thresh:.3e} e força={force} < {micro_force_thresh}.", "info")
+                return None
+
+            if force < force_min_effective:
+                log(f"[{symbol}] Força {force}% abaixo do mínimo efetivo {force_min_effective}% — ignorando.", "debug")
                 return None
 
             log(f"[{symbol}] SINAL GERADO (pré-ML): COMPRA (força={force}%, rel_sep={rel_sep:.3e})", "info")
@@ -423,9 +440,16 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
 
         if cond_sell:
             force = calc_forca(is_buy=False)
+            rel_thresh = FALLBACK_REL_EMA_SEP_PCT if is_fallback_active() else REL_EMA_SEP_PCT
+            micro_force_thresh = FALLBACK_MICRO_FORCE_ALLOW_THRESHOLD if is_fallback_active() else MICRO_FORCE_ALLOW_THRESHOLD
+            force_min_effective = FALLBACK_FORCE_MIN if is_fallback_active() else FORCE_MIN
 
-            if rel_sep < REL_EMA_SEP_PCT and force < MICRO_FORCE_ALLOW_THRESHOLD:
-                log(f"[{symbol}] Bloqueado por micro-ruído moderado: rel_sep={rel_sep:.3e} < {REL_EMA_SEP_PCT:.3e} e força={force} < {MICRO_FORCE_ALLOW_THRESHOLD}.", "info")
+            if rel_sep < rel_thresh and force < micro_force_thresh:
+                log(f"[{symbol}] Bloqueado por micro-ruído moderado: rel_sep={rel_sep:.3e} < {rel_thresh:.3e} e força={force} < {micro_force_thresh}.", "info")
+                return None
+
+            if force < force_min_effective:
+                log(f"[{symbol}] Força {force}% abaixo do mínimo efetivo {force_min_effective}% — ignorando.", "debug")
                 return None
 
             log(f"[{symbol}] SINAL GERADO (pré-ML): VENDA (força={force}%, rel_sep={rel_sep:.3e})", "info")
@@ -454,7 +478,6 @@ async def monitor_symbol(symbol: str):
             log(f"[{symbol}] Conectando ao WS (attempt {reconnect_attempt})...")
             async with websockets.connect(WS_URL, ping_interval=None) as ws:
                 log(f"[{symbol}] WS conectado.")
-                # enviar notificação de conexão sem throttle (bypass_throttle=True)
                 try:
                     send_telegram(f"🔌 [{human_pair(symbol)}] WebSocket conectado.", bypass_throttle=True)
                 except Exception:
@@ -478,7 +501,7 @@ async def monitor_symbol(symbol: str):
                     try:
                         req_hist = {
                             "ticks_history": symbol,
-                            "count": 200,
+                            "count": 500,
                             "end": "latest",
                             "granularity": GRANULARITY_SECONDS,
                             "style": "candles"
@@ -514,13 +537,12 @@ async def monitor_symbol(symbol: str):
                 df = calcular_indicadores(df)
                 save_last_candles(df, symbol)
                 log(f"[{symbol}] Histórico inicial carregado ({len(df)} candles).")
-                # notificar histórico carregado (sem throttle)
                 try:
                     send_telegram(f"📥 [{human_pair(symbol)}] Histórico inicial ({len(df)} candles) carregado.", bypass_throttle=True)
                 except Exception:
                     log(f"[{symbol}] Falha ao notificar Telegram sobre histórico.", "warning")
 
-                # Train ML now with the initial history (non-blocking enough; fast)
+                # initial train if possible
                 try:
                     trained = train_ml_for_symbol(df, symbol)
                     if not trained and ML_ENABLED:
@@ -612,12 +634,22 @@ async def monitor_symbol(symbol: str):
                         df = calcular_indicadores(df)
                         save_last_candles(df, symbol)
 
-                        # incremental retrain if needed
+                        # incremental retrain: re-treina quando atingirmos ML_MIN_TRAINED_SAMPLES ou a cada N candles adicionais
                         try:
-                            if len(df) >= 200 and (not ml_model_ready.get(symbol, False)):
-                                train_ml_for_symbol(df, symbol)
+                            if ML_ENABLED:
+                                # se ainda não tem modelo e temos >= threshold -> treina
+                                if len(df) >= ML_MIN_TRAINED_SAMPLES and (not ml_model_ready.get(symbol, False)):
+                                    train_ml_for_symbol(df, symbol)
+                                # opcional: retrain periódico (ex: a cada 500 candles) - mantenho leve: retrain quando múltiplo de ML_MIN_TRAINED_SAMPLES
+                                elif len(df) >= ML_MIN_TRAINED_SAMPLES and len(df) % ML_MIN_TRAINED_SAMPLES == 0:
+                                    train_ml_for_symbol(df, symbol)
                         except Exception:
                             log(f"[ML {symbol}] Erro no retrain incremental.", "warning")
+
+                        # Antes de gerar sinal, verificar fallback global (para garantir mínimo de sinais/hora)
+                        prune_sent_timestamps()
+                        if len(sent_timestamps) < MIN_SIGNALS_PER_HOUR:
+                            check_and_activate_fallback()
 
                         sinal = gerar_sinal(df, symbol)
 
@@ -646,7 +678,7 @@ async def monitor_symbol(symbol: str):
                                             ml_ok = (1.0 - prob_up) >= ML_CONF_THRESHOLD
                                 except Exception as e:
                                     log(f"[ML {symbol}] Erro ao avaliar ML: {e}", "error")
-                                    ml_ok = True  # fail-open: se der erro no ML, não bloquear
+                                    ml_ok = True  # fail-open
 
                             if not ml_ok:
                                 # NÃO marcar last_signal_candle — liberar para tentar novamente
@@ -667,6 +699,10 @@ async def monitor_symbol(symbol: str):
                             last_signal_time[symbol] = now_ts
                             last_signal_candle[symbol] = sinal["candle_id"]
                             last_signal_state[symbol] = tipo
+
+                            # registrar timestamp global de envio (para fallback)
+                            sent_timestamps.append(time.time())
+                            prune_sent_timestamps()
 
                             msg_final = (
                                 f"📊 *NOVO SINAL — M{CANDLE_INTERVAL}*\n"
@@ -708,7 +744,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Bot ativo — Lógica B (ajustada) — com força do sinal + ML leve (Filtro Moderado)"
+    return "Bot ativo — Lógica C (ajustada) — Força do Sinal + ML leve (retrain incremental)"
 
 # ---------------- Execução ----------------
 def run_flask():
@@ -717,8 +753,8 @@ def run_flask():
 
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
-    # startup notification (bypass so you always get it)
-    send_telegram("✅ Bot iniciado — Lógica B ajustada + Força do Sinal + ML leve (Filtro Moderado)", bypass_throttle=True)
+    # startup notification
+    send_telegram("✅ Bot iniciado — Lógica C (Filtro Leve) + ML leve (retrain incremental)", bypass_throttle=True)
     if not SKLEARN_AVAILABLE:
         log("⚠️ scikit-learn não encontrado. ML desabilitado. Instale scikit-learn para habilitar ML.", "warning")
     await asyncio.gather(*(monitor_symbol(s) for s in SYMBOLS))
