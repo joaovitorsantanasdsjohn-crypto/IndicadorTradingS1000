@@ -1,13 +1,13 @@
 # ===============================================================
-# deriv_telegram_bot.py — LÓGICA C (Opção C — Filtro Leve + ML atualizado por candle)
-# Ajustes aplicados:
-# 1) Micro-ruído menos restritivo
-# 2) Força mínima reduzida (FORCE_MIN default 50)
-# 3) ML leve re-treinado incrementalmente por candle (retrain quando >= ML_MIN_TRAINED_SAMPLES)
-# 4) Tendência moderada permitida (aceita tendência OU cruzamento)
-# 5) Não marcar candle antes do ML; cooldown aplicado APÓS ML aprovar
-# 6) Modo fallback adaptativo para garantir mínimo de sinais/hora
-# 7) **Precisão de entrada:** sinal gerado no fechamento da vela, enviado **na abertura da vela seguinte**
+# deriv_telegram_bot.py — LÓGICA A (Opção A — Precisão Profissional para FOREX M5)
+# Melhorias aplicadas:
+# - Triple EMA (9,20,200)
+# - ATR (Average True Range) e filtro de volatilidade
+# - Detecção de consolidação (anti-lateral)
+# - Price Action (corpo + wicks) como gatilho no candle fechado
+# - Sinal gerado no fechamento -> pendente -> enviado na abertura da próxima vela
+# - ML leve (RandomForest) re-treinado incrementalmente
+# - Fallback adaptativo, cooldowns e proteção anti-opostos
 # ===============================================================
 
 import asyncio
@@ -16,7 +16,7 @@ import json
 import pandas as pd
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
-from ta.volatility import BollingerBands
+from ta.volatility import BollingerBands, AverageTrueRange
 import requests
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
@@ -62,7 +62,7 @@ SYMBOLS = [
 DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# ---------------- Parâmetros ----------------
+# ---------------- Parâmetros (ajustáveis) ----------------
 BB_PROXIMITY_PCT = 0.20
 RSI_BUY_MAX = 52
 RSI_SELL_MIN = 48
@@ -76,9 +76,7 @@ MIN_SECONDS_BETWEEN_OPPOSITE = 60        # evita compra->venda imediata (opposit
 MIN_CANDLES_BETWEEN_SIGNALS = 3           # 3 velas = 15min se CANDLE_INTERVAL=5
 
 # EMA separation relative threshold (fraction of price)
-REL_EMA_SEP_PCT = 8e-06                   # permissivo
-
-# Soft rule: se rel_sep < REL_EMA_SEP_PCT, permita sinal apenas se força >= threshold
+REL_EMA_SEP_PCT = 8e-06                   # permissivo fallback
 MICRO_FORCE_ALLOW_THRESHOLD = 40
 
 # Força mínima absoluta para envio
@@ -100,6 +98,28 @@ FALLBACK_REL_EMA_SEP_PCT = 2e-05
 FALLBACK_DURATION_SECONDS = 15 * 60
 
 DEFAULT_EMA_SEP_SCALE = 0.01
+
+# --- Novos parâmetros Profissionais (Opção A)
+EMA_FAST = 9
+EMA_MID = 20
+EMA_SLOW = 200
+
+ATR_WINDOW = 14
+# definir mínimo relativo de ATR para evitar mercados muito "mortos"
+ATR_PCT_MIN = 0.00025   # 0.025% do preço (ajustar por par)
+ATR_PCT_MAX = 0.02      # evita momentos de notícias extremas (20% do preço é absurdo, apenas limite safety)
+
+# consolidação: se SMA do range (high-low) nas últimas N velas muito pequeno => lateral
+CONSOL_WINDOW = 12      # quantas velas olhar para medir lateralização
+CONSOL_RANGE_PCT = 0.00018  # se avg(range)/price < CONSOL_RANGE_PCT ==> consolidando (ajustar por par)
+
+# exigência de alinhamento das EMAs: quanto mais baixo, mais permissivo
+EMA_ALIGNMENT_STRICTNESS = 0.00005  # diferença mínima relativa entre EMAs para considerar "aligned"
+
+# price action thresholds
+MIN_BODY_PCT = 0.00012    # body / price mínimo para considerar corpo "significativo"
+MAX_WICK_BODY_RATIO = 0.6 # sombra não deve ser muito maior que corpo (evitar doji)
+REQUIRE_CLOSE_OUTSIDE_BB = False  # opcional: exigir close fora/interno das bandas (mantive False)
 
 # ---------------- Estado ----------------
 last_signal_state = {s: None for s in SYMBOLS}
@@ -161,10 +181,9 @@ def send_telegram(message: str, symbol: str = None, bypass_throttle: bool = Fals
         return
 
     try:
-        # escape message for HTML
-        safe_msg = message  # message should already be HTML-escaped where necessary
+        # message expected as already escaped HTML
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": safe_msg, "parse_mode": "HTML"}
+        payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
         r = requests.post(url, data=payload, timeout=10)
         if r.status_code != 200:
             log(f"❌ Telegram retornou {r.status_code}: {r.text}", "error")
@@ -183,25 +202,57 @@ def human_pair(symbol: str) -> str:
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("epoch").reset_index(drop=True)
+    df["open"] = df["open"].astype(float)
+    df["high"] = df["high"].astype(float)
+    df["low"] = df["low"].astype(float)
     df["close"] = df["close"].astype(float)
+    df["volume"] = df.get("volume", 0.0).astype(float) if "volume" in df.columns else 0.0
 
-    df["ema20"] = EMAIndicator(df["close"], 20).ema_indicator()
-    df["ema50"] = EMAIndicator(df["close"], 50).ema_indicator()
+    # EMAs
+    df[f"ema{EMA_FAST}"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
+    df[f"ema{EMA_MID}"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
+    df[f"ema{EMA_SLOW}"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
+
+    # RSI and MACD
     df["rsi"] = RSIIndicator(df["close"], 14).rsi()
-
     try:
         macd = MACD(df["close"], 26, 12, 9)
         df["macd_diff"] = macd.macd_diff()
     except Exception:
         df["macd_diff"] = pd.NA
 
+    # Bollinger
     bb = BollingerBands(df["close"], window=20, window_dev=2)
     df["bb_upper"] = bb.bollinger_hband()
     df["bb_lower"] = bb.bollinger_lband()
     df["bb_mavg"] = bb.bollinger_mavg()
-
     df["bb_width"] = df["bb_upper"] - df["bb_lower"]
-    df["rel_sep"] = (df["ema20"] - df["ema50"]).abs() / df["close"].replace(0, 1e-12)
+
+    # ATR
+    try:
+        atr = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=ATR_WINDOW)
+        df["atr"] = atr.average_true_range()
+        # relative ATR (ATR / price)
+        df["atr_pct"] = df["atr"] / df["close"].replace(0, 1e-12)
+    except Exception:
+        df["atr"] = pd.NA
+        df["atr_pct"] = pd.NA
+
+    # Candle micro features: body, wicks
+    df["body"] = (df["close"] - df["open"]).abs()
+    df["body_pct"] = df["body"] / df["close"].replace(0, 1e-12)
+    df["upper_wick"] = df["high"] - df[["close", "open"]].max(axis=1)
+    df["lower_wick"] = df[["close", "open"]].min(axis=1) - df["low"]
+    df["upper_wick_pct"] = df["upper_wick"] / df["close"].replace(0, 1e-12)
+    df["lower_wick_pct"] = df["lower_wick"] / df["close"].replace(0, 1e-12)
+
+    # rel_sep: EMA mid vs slow
+    df["rel_sep"] = (df[f"ema{EMA_MID}"] - df[f"ema{EMA_SLOW}"]).abs() / df["close"].replace(0, 1e-12)
+
+    # Range helpers for consolidation detection
+    df["range"] = df["high"] - df["low"]
+    df["range_pct"] = df["range"] / df["close"].replace(0, 1e-12)
+    df["range_sma"] = df["range_pct"].rolling(CONSOL_WINDOW, min_periods=1).mean()
 
     return df
 
@@ -210,8 +261,10 @@ def _build_ml_dataset(df: pd.DataFrame) -> (pd.DataFrame, pd.Series):
     df2 = df.copy().reset_index(drop=True)
     features = [
         "open", "high", "low", "close", "volume",
-        "ema20", "ema50", "rsi", "macd_diff",
-        "bb_upper", "bb_lower", "bb_mavg", "bb_width", "rel_sep"
+        f"ema{EMA_FAST}", f"ema{EMA_MID}", f"ema{EMA_SLOW}",
+        "rsi", "macd_diff",
+        "bb_upper", "bb_lower", "bb_mavg", "bb_width",
+        "atr", "atr_pct", "body", "body_pct", "upper_wick", "lower_wick", "rel_sep", "range_pct", "range_sma"
     ]
     for c in features:
         if c not in df2.columns:
@@ -292,10 +345,15 @@ def check_and_activate_fallback():
 def is_fallback_active():
     return time.time() < fallback_active_until
 
-# ---------------- Lógica principal de geração de sinal ----------------
+# ---------------- Lógica principal de geração de sinal (Opção A) ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
+    """
+    Retorna None ou dict {"tipo": "COMPRA"/"VENDA", "forca": int(0-100), "candle_id": ...}
+    Implementa triple-EMA trend + ATR volatility + price-action gating.
+    Não marca estado aqui; apenas retorna.
+    """
     try:
-        if len(df) < 3:
+        if len(df) < max(EMA_SLOW, ATR_WINDOW) + 5:
             log(f"[{symbol}] Dados insuficientes para gerar sinal.", "info")
             return None
 
@@ -304,6 +362,9 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
 
         epoch = int(now["epoch"])
         close = float(now["close"])
+        open_p = float(now["open"])
+        high = float(now["high"])
+        low = float(now["low"])
         candle_id = epoch - (epoch % GRANULARITY_SECONDS)
 
         # 1 sinal por candle (não marcar aqui; só evitar gerar duas vezes no mesmo candle)
@@ -319,57 +380,134 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
                 log(f"[{symbol}] Ignorando: só passaram {candles_passed} velas desde o último sinal (< {MIN_CANDLES_BETWEEN_SIGNALS}).", "info")
                 return None
 
-        # indicadores
-        ema20_now, ema50_now = now["ema20"], now["ema50"]
-        ema20_prev, ema50_prev = prev["ema20"], prev["ema50"]
-        rsi_now = now["rsi"]
-        bb_upper, bb_lower = now["bb_upper"], now["bb_lower"]
-        macd_diff = now.get("macd_diff")
+        # basic indicators exist?
+        for col in [f"ema{EMA_FAST}", f"ema{EMA_MID}", f"ema{EMA_SLOW}", "atr", "atr_pct", "range_sma", "body_pct", "upper_wick_pct", "lower_wick_pct", "rsi"]:
+            if col not in now or pd.isna(now.get(col, None)):
+                log(f"[{symbol}] Indicador {col} incompleto (NaN) — aguardando mais candles.", "warning")
+                return None
 
-        if any(pd.isna([ema20_now, ema50_now, ema20_prev, ema50_prev, rsi_now, bb_upper, bb_lower])):
-            log(f"[{symbol}] Indicadores incompletos (NaN) — aguardando mais candles.", "warning")
+        # ---------- 1) Trend: Triple EMA alignment ----------
+        ema_fast = float(now[f"ema{EMA_FAST}"])
+        ema_mid = float(now[f"ema{EMA_MID}"])
+        ema_slow = float(now[f"ema{EMA_SLOW}"])
+
+        # compute relative diffs
+        rel_diff_fast_mid = abs(ema_fast - ema_mid) / max(1e-12, abs(close))
+        rel_diff_mid_slow = abs(ema_mid - ema_slow) / max(1e-12, abs(close))
+
+        triple_up = (ema_fast > ema_mid) and (ema_mid > ema_slow) and (ema_mid - ema_slow) / max(1e-12, abs(close)) >= EMA_ALIGNMENT_STRICTNESS
+        triple_down = (ema_fast < ema_mid) and (ema_mid < ema_slow) and (ema_slow - ema_mid) / max(1e-12, abs(close)) >= EMA_ALIGNMENT_STRICTNESS
+
+        # allow moderate alignment also if fallback active (be more permissive)
+        if is_fallback_active():
+            # relax strictness slightly
+            triple_up = (ema_fast >= ema_mid) and (ema_mid >= ema_slow)
+            triple_down = (ema_fast <= ema_mid) and (ema_mid <= ema_slow)
+
+        # ---------- 2) Volatility filter (ATR) ----------
+        atr = float(now["atr"])
+        atr_pct = float(now["atr_pct"]) if not pd.isna(now["atr_pct"]) else 0.0
+
+        # if ATR is too small -> market too quiet; if too large -> news / erratic
+        if atr_pct < ATR_PCT_MIN and not is_fallback_active():
+            log(f"[{symbol}] ATR muito baixo (atr_pct={atr_pct:.6f} < {ATR_PCT_MIN}) — evita sinais em mercado fraco.", "info")
+            return None
+        if atr_pct > ATR_PCT_MAX:
+            log(f"[{symbol}] ATR muito alto (atr_pct={atr_pct:.6f} > {ATR_PCT_MAX}) — mercado volátil demais, evita.", "warning")
             return None
 
-        # Tendência / cruzamentos
-        cruzou_up = (ema20_prev <= ema50_prev) and (ema20_now > ema50_now)
-        cruzou_down = (ema20_prev >= ema50_prev) and (ema20_now < ema50_now)
-        tendencia_up = ema20_now > ema50_now
-        tendencia_down = ema20_now < ema50_now
+        # ---------- 3) Consolidation (anti-lateral) ----------
+        range_sma = float(now.get("range_sma", 0.0))
+        if range_sma < CONSOL_RANGE_PCT and not is_fallback_active():
+            log(f"[{symbol}] Zona de consolidação detectada (range_sma={range_sma:.6f} < {CONSOL_RANGE_PCT}) — evitando sinais.", "info")
+            return None
 
-        ema20_momentum = ema20_now - ema20_prev
+        # ---------- 4) Price action gating on the closed candle ----------
+        body = float(now["body"])
+        body_pct = float(now["body_pct"])
+        upper_wick_pct = float(now["upper_wick_pct"])
+        lower_wick_pct = float(now["lower_wick_pct"])
 
-        # Bollinger proximidade
+        # body must be significant
+        if body_pct < MIN_BODY_PCT and not is_fallback_active():
+            log(f"[{symbol}] Candle fraco (body_pct={body_pct:.6f} < {MIN_BODY_PCT}) — ignora.", "debug")
+            return None
+
+        # Avoid doji-like candles: wick must not be huge relative to body
+        if body > 0:
+            max_wick = max(upper_wick_pct, lower_wick_pct)
+            if max_wick / (body_pct + 1e-12) > (1.0 / MAX_WICK_BODY_RATIO) and not is_fallback_active():
+                # if wick >> body, it's a rejection/don't trust
+                log(f"[{symbol}] Candle com wick grande vs body (wick/body ratio alto) — ignora.", "debug")
+                return None
+
+        # Bollinger optional: require closings near outer band in some configs (kept off)
+        # perto_lower/p_perto_upper by your existing logic:
+        bb_upper = float(now["bb_upper"])
+        bb_lower = float(now["bb_lower"])
         range_bb = bb_upper - bb_lower
-        if range_bb == 0 or math.isclose(range_bb, 0.0):
+        if range_bb <= 0 or math.isclose(range_bb, 0.0):
             log(f"[{symbol}] Bollinger range zero — ignorando.", "warning")
             return None
         lim_inf = bb_lower + range_bb * BB_PROXIMITY_PCT
         lim_sup = bb_upper - range_bb * BB_PROXIMITY_PCT
-
         perto_lower = close <= lim_inf
         perto_upper = close >= lim_sup
 
-        # RSI + MACD ok flags
-        buy_rsi_ok = rsi_now <= RSI_BUY_MAX
-        sell_rsi_ok = rsi_now >= RSI_SELL_MIN
+        # ---------- 5) Build logical conditions ----------
+        # For BUY:
+        # - triple_up (EMA9>20>200) AND
+        # - last candle bullish (close>open) AND perto_lower (retrace to lower band) OR strong momentum
+        # - RSI and MACD supportive
+        # For SELL: mirrored.
+
+        candle_bullish = now["close"] > now["open"]
+        candle_bearish = now["close"] < now["open"]
+
+        rsi_now = float(now["rsi"]) if not pd.isna(now["rsi"]) else 50.0
+        macd_diff = now.get("macd_diff")
         macd_buy_ok = True if (macd_diff is None or pd.isna(macd_diff)) else (macd_diff > -MACD_TOLERANCE)
         macd_sell_ok = True if (macd_diff is None or pd.isna(macd_diff)) else (macd_diff < MACD_TOLERANCE)
+        buy_rsi_ok = rsi_now <= RSI_BUY_MAX
+        sell_rsi_ok = rsi_now >= RSI_SELL_MIN
 
-        # rel_sep
-        ema_sep = abs(ema20_now - ema50_now)
-        rel_sep = ema_sep / max(1e-12, abs(close))
+        # strong momentum check using EMA fast momentum vs mid
+        ema_fast_prev = float(prev.get(f"ema{EMA_FAST}", ema_fast))
+        ema_fast_mom = ema_fast - ema_fast_prev
 
-        buy_trend_ok = tendencia_up or cruzou_up
-        sell_trend_ok = tendencia_down or cruzou_down
+        strong_momentum_buy = ema_fast_mom > (atr * 0.1)  # heuristic
+        strong_momentum_sell = ema_fast_mom < -(atr * 0.1)
 
-        cond_buy = buy_trend_ok and perto_lower and buy_rsi_ok and macd_buy_ok
-        cond_sell = sell_trend_ok and perto_upper and sell_rsi_ok and macd_sell_ok
+        # Conditions for buy and sell
+        cond_buy = (
+            triple_up
+            and (candle_bullish or strong_momentum_buy)
+            and (perto_lower or strong_momentum_buy)
+            and buy_rsi_ok
+            and macd_buy_ok
+        )
+
+        cond_sell = (
+            triple_down
+            and (candle_bearish or strong_momentum_sell)
+            and (perto_upper or strong_momentum_sell)
+            and sell_rsi_ok
+            and macd_sell_ok
+        )
+
+        # allow fallback relaxations
+        if is_fallback_active():
+            # accept also mid_slow alignment only
+            if not cond_buy and (ema_mid > ema_slow) and candle_bullish:
+                cond_buy = True
+            if not cond_sell and (ema_mid < ema_slow) and candle_bearish:
+                cond_sell = True
 
         if not (cond_buy or cond_sell):
-            log(f"[{symbol}] Condições buy/sell não satisfeitas (buy_trend_ok={buy_trend_ok}, sell_trend_ok={sell_trend_ok}, perto_lower={perto_lower}, perto_upper={perto_upper}, buy_rsi_ok={buy_rsi_ok}, sell_rsi_ok={sell_rsi_ok}).", "debug")
+            log(f"[{symbol}] Condições buy/sell não satisfeitas (triple_up={triple_up}, triple_down={triple_down}, perto_lower={perto_lower}, perto_upper={perto_upper}, buy_rsi_ok={buy_rsi_ok}, sell_rsi_ok={sell_rsi_ok}).", "debug")
             return None
 
-        # Evitar sinais opostos muito próximos (usa last_signal_time)
+        # Evitar sinais opostos muito próximos
         last_state = last_signal_state.get(symbol)
         last_time = last_signal_time.get(symbol, 0)
         now_ts = time.time()
@@ -378,50 +516,45 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
                 log(f"[{symbol}] Sinal oposto detectado mas dentro do cooldown oposto ({now_ts-last_time:.1f}s) — skip.", "warning")
                 return None
 
-        # Calcular força combinada (0..100)
+        # ---------- 6) Força do sinal (scoring) ----------
         def calc_forca(is_buy: bool):
             score = 0.0
+            # EMA alignment
+            score += min(25.0, rel_diff_mid_slow / (EMA_ALIGNMENT_STRICTNESS + 1e-12) * 25.0)
+            # ATR: more ATR (to a point) gives confidence (but clipped)
+            score += min(20.0, (atr_pct / max(1e-12, ATR_PCT_MIN)) * 10.0)
+            # Body strength
+            score += min(30.0, body_pct / (MIN_BODY_PCT + 1e-12) * 30.0)
+            # proximity to BB (retracement preference)
             if is_buy:
                 dist = max(0.0, min(1.0, (lim_inf - close) / range_bb))
-                score += dist * 40.0
+                score += dist * 15.0
             else:
                 dist = max(0.0, min(1.0, (close - lim_sup) / range_bb))
-                score += dist * 40.0
-
-            if is_buy:
-                rsi_strength = max(0.0, min(1.0, (RSI_BUY_MAX - rsi_now) / 20.0))
-                score += rsi_strength * 25.0
-            else:
-                rsi_strength = max(0.0, min(1.0, (rsi_now - RSI_SELL_MIN) / 20.0))
-                score += rsi_strength * 25.0
-
-            denom = max(REL_EMA_SEP_PCT * 10, 1e-12)
-            sep_strength = max(0.0, min(1.0, rel_sep / denom))
-            score += sep_strength * 25.0
-
+                score += dist * 15.0
+            # MACD small bonus
             if macd_diff is not None and not pd.isna(macd_diff):
                 macd_strength = max(0.0, min(1.0, abs(macd_diff) / (MACD_TOLERANCE * 5)))
                 score += macd_strength * 10.0
-
+            # cap and normalize
             return int(max(0, min(100, round(score))))
 
-        # Build result (NÃO atualiza estado aqui)
         if cond_buy:
             force = calc_forca(is_buy=True)
             rel_thresh = FALLBACK_REL_EMA_SEP_PCT if is_fallback_active() else REL_EMA_SEP_PCT
             micro_force_thresh = FALLBACK_MICRO_FORCE_ALLOW_THRESHOLD if is_fallback_active() else MICRO_FORCE_ALLOW_THRESHOLD
             force_min_effective = FALLBACK_FORCE_MIN if is_fallback_active() else FORCE_MIN
 
-            if rel_sep < rel_thresh and force < micro_force_thresh:
-                log(f"[{symbol}] Bloqueado por micro-ruído moderado: rel_sep={rel_sep:.3e} < {rel_thresh:.3e} e força={force} < {micro_force_thresh}.", "info")
+            if now["rel_sep"] < rel_thresh and force < micro_force_thresh:
+                log(f"[{symbol}] Bloqueado por micro-ruído: rel_sep={now['rel_sep']:.3e} < {rel_thresh:.3e} e força={force} < {micro_force_thresh}.", "info")
                 return None
 
             if force < force_min_effective:
                 log(f"[{symbol}] Força {force}% abaixo do mínimo efetivo {force_min_effective}% — ignorando.", "debug")
                 return None
 
-            log(f"[{symbol}] SINAL GERADO (pré-pendência): COMPRA (força={force}%, rel_sep={rel_sep:.3e})", "info")
-            return {"tipo": "COMPRA", "forca": force, "candle_id": candle_id, "rel_sep": rel_sep}
+            log(f"[{symbol}] SINAL GERADO (pré-pendência - Profissional): COMPRA (força={force}%, atr_pct={atr_pct:.5f}, body_pct={body_pct:.5f})", "info")
+            return {"tipo": "COMPRA", "forca": force, "candle_id": candle_id, "rel_sep": now["rel_sep"]}
 
         if cond_sell:
             force = calc_forca(is_buy=False)
@@ -429,16 +562,16 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             micro_force_thresh = FALLBACK_MICRO_FORCE_ALLOW_THRESHOLD if is_fallback_active() else MICRO_FORCE_ALLOW_THRESHOLD
             force_min_effective = FALLBACK_FORCE_MIN if is_fallback_active() else FORCE_MIN
 
-            if rel_sep < rel_thresh and force < micro_force_thresh:
-                log(f"[{symbol}] Bloqueado por micro-ruído moderado: rel_sep={rel_sep:.3e} < {rel_thresh:.3e} e força={force} < {micro_force_thresh}.", "info")
+            if now["rel_sep"] < rel_thresh and force < micro_force_thresh:
+                log(f"[{symbol}] Bloqueado por micro-ruído: rel_sep={now['rel_sep']:.3e} < {rel_thresh:.3e} e força={force} < {micro_force_thresh}.", "info")
                 return None
 
             if force < force_min_effective:
                 log(f"[{symbol}] Força {force}% abaixo do mínimo efetivo {force_min_effective}% — ignorando.", "debug")
                 return None
 
-            log(f"[{symbol}] SINAL GERADO (pré-pendência): VENDA (força={force}%, rel_sep={rel_sep:.3e})", "info")
-            return {"tipo": "VENDA", "forca": force, "candle_id": candle_id, "rel_sep": rel_sep}
+            log(f"[{symbol}] SINAL GERADO (pré-pendência - Profissional): VENDA (força={force}%, atr_pct={atr_pct:.5f}, body_pct={body_pct:.5f})", "info")
+            return {"tipo": "VENDA", "forca": force, "candle_id": candle_id, "rel_sep": now["rel_sep"]}
 
         return None
 
@@ -486,7 +619,7 @@ async def monitor_symbol(symbol: str):
                     try:
                         req_hist = {
                             "ticks_history": symbol,
-                            "count": 500,
+                            "count": 800,
                             "end": "latest",
                             "granularity": GRANULARITY_SECONDS,
                             "style": "candles"
@@ -721,7 +854,6 @@ async def monitor_symbol(symbol: str):
                                         del pending_signals[symbol]
 
                         # --- 2) Em seguida: avaliar se geramos um novo sinal a partir da vela que acabou de fechar
-                        # (o sinal ficará pendente até a próxima vela abrir)
                         novo_sinal = gerar_sinal(df, symbol)
                         if novo_sinal:
                             # armazena como pending — será enviado quando a próxima vela abrir
@@ -733,9 +865,8 @@ async def monitor_symbol(symbol: str):
                             log(f"[{symbol}] Pending signal criado para candle_id={novo_sinal['candle_id']} (aguardando próxima vela para enviar).", "info")
 
                         # --- 3) limpeza de pendings antigos (expiração)
-                        # remove pendings com mais de `max_age_candles` passadas
                         to_remove = []
-                        for sym, p in pending_signals.items():
+                        for sym, p in list(pending_signals.items()):
                             age_candles = (epoch - p["sinal"]["candle_id"]) // GRANULARITY_SECONDS
                             if age_candles > p.get("max_age_candles", 2):
                                 to_remove.append(sym)
@@ -761,7 +892,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Bot ativo — Lógica C (ajustada) — Força do Sinal + ML leve (retrain incremental) — envio na abertura da próxima vela"
+    return "Bot ativo — Lógica A (Precisão Profissional) — Triple EMA + ATR + Price Action + ML leve"
 
 # ---------------- Execução ----------------
 def run_flask():
@@ -770,7 +901,7 @@ def run_flask():
 
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
-    send_telegram(html.escape("✅ Bot iniciado — Lógica C (Filtro Leve) + ML leve (retrain incremental) — envio na abertura da próxima vela"), bypass_throttle=True)
+    send_telegram(html.escape("✅ Bot iniciado — Lógica A (Precisão Profissional) — Triple EMA + ATR + Price Action + ML leve"), bypass_throttle=True)
     if not SKLEARN_AVAILABLE:
         log("⚠️ scikit-learn não encontrado. ML desabilitado. Instale scikit-learn para habilitar ML.", "warning")
     await asyncio.gather(*(monitor_symbol(s) for s in SYMBOLS))
