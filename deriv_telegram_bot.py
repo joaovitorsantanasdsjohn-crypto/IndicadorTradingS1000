@@ -1,25 +1,3 @@
-===============================================================
-
-deriv_telegram_bot.py — LÓGICA C (Opção C — Filtro Leve + ML atualizado por candle)
-
-Ajustes aplicados:
-
-1) Micro-ruído menos restritivo
-
-2) Força mínima reduzida (FORCE_MIN default 50)
-
-3) ML leve re-treinado incrementalmente por candle (retrain quando >= ML_MIN_TRAINED_SAMPLES)
-
-4) Tendência moderada permitida (aceita tendência OU cruzamento)
-
-5) Não marcar candle antes do ML; cooldown aplicado APÓS ML aprovar
-
-6) Modo fallback adaptativo para garantir mínimo de sinais/hora
-
-7) Precisão de entrada: sinal gerado no fechamento da vela, enviado na abertura da vela seguinte
-
-===============================================================
-
 import asyncio
 import websockets
 import json
