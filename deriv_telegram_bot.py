@@ -858,7 +858,8 @@ async def monitor_symbol(symbol: str):
                                     # entry price = abertura da vela atual
                                     entry_price = open_p
                                     entrada_br = candle_time_utc.astimezone(timezone(timedelta(hours=-3)))
-                                    entrada_str = entrada_br.strftime("%Y-%m-%d %H:%M:%S")
+                                    # apenas horário (HH:MM:SS) conforme solicitado
+                                    entrada_str = entrada_br.strftime("%H:%M:%S")
 
                                     # ML filter (avaliado no momento da abertura da vela seguinte para maior precisão)
                                     ml_ok = True
@@ -885,7 +886,7 @@ async def monitor_symbol(symbol: str):
                                             notify_once(symbol, "ml_blocked_"+str(epoch), f"❌ [{human_pair(symbol)}] Sinal {tipo} bloqueado pelo ML (prob_up={ml_prob:.3f}).", bypass=True)
                                         except Exception:
                                             log(f"[{symbol}] Falha ao notificar Telegram sobre bloqueio ML (pending).", "warning")
-                                        # remove pending and continue (não marcar last_signal_time)
+                                        # remove pending e continue (não marcar last_signal_time)
                                         del pending_signals[symbol]
                                     else:
                                         # cooldown global APÓS ML aprovar
@@ -902,28 +903,33 @@ async def monitor_symbol(symbol: str):
                                             sent_timestamps.append(time.time())
                                             prune_sent_timestamps()
 
-                                            # construir mensagem HTML (escape)
-                                            pair = html.escape(human_pair(symbol))
-                                            tipo_str = "COMPRA" if tipo == "COMPRA" else "VENDA"
-                                            arrow = "🟢" if tipo == "COMPRA" else "🔴"
-                                            msg_final = (
-                                                f"📊 <b>NOVO SINAL — M{CANDLE_INTERVAL}</b>\n"
-                                                f"• Par: <b>{pair}</b>\n"
-                                                f"• Direção: {arrow} <b>{tipo_str}</b>\n"
-                                                f"• Força do sinal: <b>{forca}%</b>\n"
-                                                f"• Preço de entrada (open próxima vela): <b>{entry_price:.5f}</b>\n"
-                                                f"• Horário de entrada (Brasília): <b>{entrada_str}</b>"
-                                            )
-
-                                            if ml_prob is not None:
+                                            # montar campos da mensagem conforme template solicitado
+                                            pair = human_pair(symbol)
+                                            direction = "COMPRA" if tipo == "COMPRA" else "VENDA"
+                                            strength = forca
+                                            price = f"{entry_price:.5f}"
+                                            entry_time = entrada_str
+                                            if ml_prob is None:
+                                                prob_str = "N/A"
+                                            else:
                                                 prob_pct = int(round(ml_prob * 100))
-                                                if tipo == "COMPRA":
-                                                    msg_final += f"\n• ML prob subida: <b>{prob_pct}%</b> (threshold {int(ML_CONF_THRESHOLD*100)}%)"
-                                                else:
-                                                    msg_final += f"\n• ML prob descida: <b>{100-prob_pct}%</b> (threshold {int(ML_CONF_THRESHOLD*100)}%)"
+                                                prob_str = str(prob_pct)
+
+                                            # montar mensagem no formato pedido (sem data, apenas horário)
+                                            message = f"""
+📊 NOVO SINAL — M{CANDLE_INTERVAL}
+• Par: {pair}
+• Direção: {direction}
+• Força do sinal: {strength}%
+• Preço: {price}
+• Horário de entrada: {entry_time}
+• ML prob: {prob_str}%
+"""
+                                            # escapar antes de enviar para Telegram (parse_mode=HTML)
+                                            message_escaped = html.escape(message)
 
                                             try:
-                                                send_telegram(msg_final, symbol=symbol, bypass_throttle=False)
+                                                send_telegram(message_escaped, symbol=symbol, bypass_throttle=False)
                                                 log(f"[{symbol}] Pending: mensagem enviada ao Telegram (entry open).", "info")
                                             except Exception:
                                                 log(f"[{symbol}] Falha ao enviar sinal pending ao Telegram.", "warning")
@@ -970,7 +976,7 @@ async def monitor_symbol(symbol: str):
         jitter = random.uniform(0.8, 1.2)
         sleep_time = backoff * jitter
         log(f"[{symbol}] Reconectando em {sleep_time:.1f}s (attempt {reconnect_attempt})...", "info")
-        # small sleep before reconnect
+        # small sleep antes de reconectar
         await asyncio.sleep(sleep_time)
         # hint GC between reconnects
         gc.collect()
