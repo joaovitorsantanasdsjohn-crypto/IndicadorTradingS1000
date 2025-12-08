@@ -3,6 +3,8 @@
 # Modificações: histórico adaptado para Render FREE (count=500), ML com mais amostras e retrain mais frequente,
 # parâmetros mais permissivos para aumentar volume de sinais (com proteções).
 # Removido envio para Telegram de mensagens "sinal bloqueado pelo ML" — agora só log.
+# Adicionado: quando histórico inicial falhar 5 vezes, pausa 10 minutos e tenta novamente (infinito).
+# Alterado: espaçamento entre sinais aumentado para 4 velas.
 
 import asyncio
 import websockets
@@ -68,7 +70,7 @@ MIN_SECONDS_BETWEEN_SIGNALS = 3           # cooldown entre envios (aplicado APÓ
 MIN_SECONDS_BETWEEN_OPPOSITE = 45        # evita compra->venda imediata (opposite cooldown)
 
 # Anti-duplicate (velas): aguarda N velas entre sinais para o mesmo par
-MIN_CANDLES_BETWEEN_SIGNALS = 1           # mais permissivo: 1 vela entre sinais
+MIN_CANDLES_BETWEEN_SIGNALS = 4           # atualizado para 4 velas conforme solicitado
 
 # EMA separation relative threshold (fraction of price)
 REL_EMA_SEP_PCT = 3e-06                   # relaxado para aumentar volume
@@ -99,7 +101,7 @@ FALLBACK_DURATION_SECONDS = 15 * 60
 DEFAULT_EMA_SEP_SCALE = 0.01
 
 # Initial history fetch count (ajustado para Render FREE; evita vazio mas mantém segurança)
-INITIAL_HISTORY_COUNT = 500  # <-- **OPÇÃO B** recomendada para Render FREE
+INITIAL_HISTORY_COUNT = 500  # recomendado para Render FREE
 
 # --- Novos parâmetros Profissionais (Opção A)
 EMA_FAST = 9
@@ -654,18 +656,28 @@ async def monitor_symbol(symbol: str):
 
                             except asyncio.TimeoutError:
                                 log(f"[{symbol}] Timeout ao solicitar histórico (tentativa {history_tries}).", "warning")
+                                # se já tentou muitas vezes, não levantar exceção que trava a task:
                                 if history_tries >= 5:
-                                    raise Exception("Falha ao obter histórico após múltiplas tentativas")
+                                    log(f"[{symbol}] Erro no histórico inicial — sem resposta após {history_tries} tentativas. Pausando 10 minutos antes de tentar novamente (somente log).", "warning")
+                                    # pausa longa (10min) para evitar spam/reconexão agressiva
+                                    await asyncio.sleep(10 * 60)
+                                    history_tries = 0
+                                    continue
                                 await asyncio.sleep(1.0 + random.random() * 2.0)
                             except asyncio.CancelledError:
                                 log(f"[{symbol}] asyncio.CancelledError ao obter histórico — reconectar.", "warning")
                                 raise
                             except Exception as e:
                                 log(f"[{symbol}] Erro ao obter histórico: {e}", "error")
+                                # se já tentou muitas vezes, pausa antes de tentar de novo (não desativa o par)
                                 if history_tries >= 5:
-                                    raise
+                                    log(f"[{symbol}] Erro no histórico inicial — servidor Deriv retornou erro após {history_tries} tentativas. Pausando 10 minutos antes de nova tentativa (somente log).", "warning")
+                                    await asyncio.sleep(10 * 60)
+                                    history_tries = 0
+                                    continue
                                 await asyncio.sleep(1.0 + random.random() * 2.0)
 
+                        # após sucesso no histórico
                         df = calcular_indicadores(df)
                         if len(df) > MAX_CANDLES:
                             df = df.tail(MAX_CANDLES).reset_index(drop=True)
@@ -929,3 +941,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         log("Encerrando...", "info")
+```0
