@@ -3,8 +3,7 @@
 # Modificações: histórico adaptado para Render FREE (count=500), ML com mais amostras e retrain mais frequente,
 # parâmetros mais permissivos para aumentar volume de sinais (com proteções).
 # Removido envio para Telegram de mensagens "sinal bloqueado pelo ML" — agora só log.
-# Adicionado: quando histórico inicial falhar 5 vezes, pausa 10 minutos e tenta novamente (infinito).
-# Alterado: espaçamento entre sinais aumentado para 4 velas.
+# Histórico inicial: tenta 5 vezes; se falhar, faz log e aguarda 10 minutos antes de tentar novamente (Opção 1).
 
 import asyncio
 import websockets
@@ -70,7 +69,7 @@ MIN_SECONDS_BETWEEN_SIGNALS = 3           # cooldown entre envios (aplicado APÓ
 MIN_SECONDS_BETWEEN_OPPOSITE = 45        # evita compra->venda imediata (opposite cooldown)
 
 # Anti-duplicate (velas): aguarda N velas entre sinais para o mesmo par
-MIN_CANDLES_BETWEEN_SIGNALS = 4           # atualizado para 4 velas conforme solicitado
+MIN_CANDLES_BETWEEN_SIGNALS = 4           # aumentado para 4 conforme solicitado
 
 # EMA separation relative threshold (fraction of price)
 REL_EMA_SEP_PCT = 3e-06                   # relaxado para aumentar volume
@@ -102,6 +101,10 @@ DEFAULT_EMA_SEP_SCALE = 0.01
 
 # Initial history fetch count (ajustado para Render FREE; evita vazio mas mantém segurança)
 INITIAL_HISTORY_COUNT = 500  # recomendado para Render FREE
+
+# Histórico inicial: tentativas até N antes de pausar (por par)
+HISTORY_MAX_TRIES = 5
+HISTORY_RETRY_PAUSE_SEC = 10 * 60  # 10 minutos
 
 # --- Novos parâmetros Profissionais (Opção A)
 EMA_FAST = 9
@@ -145,6 +148,9 @@ ml_trained_samples = {s: 0 for s in SYMBOLS}
 notify_flags = {s: {"connected": False, "history": False, "ml": False, "subscribed": False} for s in SYMBOLS}
 if "global" not in notify_flags:
     notify_flags["global"] = {}
+
+# Contador de falhas consecutivas de histórico por símbolo (para logging claro)
+history_fail_count = {s: 0 for s in SYMBOLS}
 
 # ---------------- Limites para memória ----------------
 MAX_CANDLES = 300   # mantém só as últimas N velas na memória
@@ -615,6 +621,7 @@ async def monitor_symbol(symbol: str):
                     notify_once(symbol, "connected", f"🔌 [{human_pair(symbol)}] WebSocket conectado.", bypass=True)
                     reconnect_attempt = 0
 
+                    # authorize
                     try:
                         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                         auth_raw = await asyncio.wait_for(ws.recv(), timeout=60)
@@ -625,6 +632,7 @@ async def monitor_symbol(symbol: str):
                         log(f"[{symbol}] Falha ao autorizar/receber authorize: {e}", "error")
                         raise
 
+                    # HISTÓRICO INICIAL: tentativas controladas
                     if not historical_loaded.get(symbol, False):
                         history_tries = 0
                         while True:
@@ -632,7 +640,7 @@ async def monitor_symbol(symbol: str):
                             try:
                                 req_hist = {
                                     "ticks_history": symbol,
-                                    "count": INITIAL_HISTORY_COUNT,  # ajustado para Render FREE (500)
+                                    "count": INITIAL_HISTORY_COUNT,
                                     "end": "latest",
                                     "granularity": GRANULARITY_SECONDS,
                                     "style": "candles"
@@ -656,11 +664,13 @@ async def monitor_symbol(symbol: str):
 
                             except asyncio.TimeoutError:
                                 log(f"[{symbol}] Timeout ao solicitar histórico (tentativa {history_tries}).", "warning")
-                                # se já tentou muitas vezes, não levantar exceção que trava a task:
-                                if history_tries >= 5:
-                                    log(f"[{symbol}] Erro no histórico inicial — sem resposta após {history_tries} tentativas. Pausando 10 minutos antes de tentar novamente (somente log).", "warning")
-                                    # pausa longa (10min) para evitar spam/reconexão agressiva
-                                    await asyncio.sleep(10 * 60)
+                                # não lançar direto — controla via contador
+                                if history_tries >= HISTORY_MAX_TRIES:
+                                    # registra falha, pausa e tenta novamente depois de HISTORY_RETRY_PAUSE_SEC
+                                    history_fail_count[symbol] += 1
+                                    log(f"[{symbol}] Erro no histórico inicial — servidor Deriv retornou TIMEOUT. Tentando novamente em {HISTORY_RETRY_PAUSE_SEC//60} minutos. (fail #{history_fail_count[symbol]})", "warning")
+                                    await asyncio.sleep(HISTORY_RETRY_PAUSE_SEC)
+                                    # reiniciar tentativas após pausa
                                     history_tries = 0
                                     continue
                                 await asyncio.sleep(1.0 + random.random() * 2.0)
@@ -669,15 +679,17 @@ async def monitor_symbol(symbol: str):
                                 raise
                             except Exception as e:
                                 log(f"[{symbol}] Erro ao obter histórico: {e}", "error")
-                                # se já tentou muitas vezes, pausa antes de tentar de novo (não desativa o par)
-                                if history_tries >= 5:
-                                    log(f"[{symbol}] Erro no histórico inicial — servidor Deriv retornou erro após {history_tries} tentativas. Pausando 10 minutos antes de nova tentativa (somente log).", "warning")
-                                    await asyncio.sleep(10 * 60)
+                                # se atingiu o máximo de tentativas, faz pausa longa e recomeça (sem matar task)
+                                if history_tries >= HISTORY_MAX_TRIES:
+                                    history_fail_count[symbol] += 1
+                                    log(f"[{symbol}] Erro no histórico inicial — {str(e)}. Tentando novamente em {HISTORY_RETRY_PAUSE_SEC//60} minutos. (fail #{history_fail_count[symbol]})", "warning")
+                                    # pausa 10 minutos antes de reiniciar tentativas (não spamma Telegram)
+                                    await asyncio.sleep(HISTORY_RETRY_PAUSE_SEC)
                                     history_tries = 0
                                     continue
                                 await asyncio.sleep(1.0 + random.random() * 2.0)
 
-                        # após sucesso no histórico
+                        # ao sair do loop com df válido
                         df = calcular_indicadores(df)
                         if len(df) > MAX_CANDLES:
                             df = df.tail(MAX_CANDLES).reset_index(drop=True)
@@ -686,11 +698,13 @@ async def monitor_symbol(symbol: str):
                         log(f"[{symbol}] Histórico inicial carregado ({len(df)} candles).")
                         notify_once(symbol, "history", f"📥 [{human_pair(symbol)}] Histórico inicial ({len(df)} candles) carregado.", bypass=True)
 
+                    # initial train if possible
                     try:
                         await asyncio.get_event_loop().run_in_executor(None, train_ml_for_symbol, df, symbol)
                     except Exception as e:
                         log(f"[ML {symbol}] Erro ao treinar inicial: {e}", "error")
 
+                    # subscribe: only once per process
                     if not live_subscribed.get(symbol, False):
                         sub_req = {
                             "ticks_history": symbol,
@@ -709,6 +723,7 @@ async def monitor_symbol(symbol: str):
 
                     ultimo_candle_time = time.time()
 
+                    # Main receive loop
                     while True:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=600)
@@ -757,6 +772,7 @@ async def monitor_symbol(symbol: str):
                             log(f"[{symbol}] Candle com campos inválidos, ignorando: {candle}", "warning")
                             continue
 
+                        # Consider only closed candles aligned with granularity
                         if epoch % GRANULARITY_SECONDS != 0:
                             continue
 
@@ -767,6 +783,7 @@ async def monitor_symbol(symbol: str):
                         last_epoch_in_df = int(df.iloc[-1]["epoch"]) if not df.empty else None
                         is_new_candle = df.empty or last_epoch_in_df != epoch
                         if is_new_candle:
+                            # append and trim to MAX_CANDLES for memory safety
                             df.loc[len(df)] = {
                                 "epoch": epoch,
                                 "open": open_p,
@@ -776,40 +793,50 @@ async def monitor_symbol(symbol: str):
                                 "volume": volume_p
                             }
 
+                            # trim in-place
                             if len(df) > MAX_CANDLES:
                                 df = df.tail(MAX_CANDLES).reset_index(drop=True)
 
                             df = calcular_indicadores(df)
                             save_last_candles(df, symbol)
 
+                            # incremental retrain: retrain if we gained ML_RETRAIN_INTERVAL new samples
                             try:
                                 samples = len(df)
                                 last_trained = ml_trained_samples.get(symbol, 0)
                                 if ML_ENABLED and (samples >= ML_MIN_TRAINED_SAMPLES) and (samples >= last_trained + ML_RETRAIN_INTERVAL):
+                                    # run in executor to avoid blocking
                                     await asyncio.get_event_loop().run_in_executor(None, train_ml_for_symbol, df, symbol)
+                                    # try to free memory after heavy op
                                     gc.collect()
                             except Exception:
                                 log(f"[ML {symbol}] Erro no retrain incremental.", "warning")
 
+                            # Antes de gerar sinal, verificar fallback global
                             prune_sent_timestamps()
                             if len(sent_timestamps) < MIN_SIGNALS_PER_HOUR:
                                 check_and_activate_fallback()
 
-                            # --- pending handling ---
+                            # --- 1) Primeiro: checar se existe um pending signal para este symbol aguardando a abertura desta vela.
                             pending = pending_signals.get(symbol)
                             if pending:
+                                # Se o novo candle (atual) tem epoch > candle_id do pending, então é a vela seguinte:
                                 pending_candle_id = pending["sinal"]["candle_id"]
                                 if epoch > pending_candle_id:
+                                    # avaliar ML e cooldown usando os dados já atualizados (usamos a nova vela como entrada)
                                     tipo = pending["sinal"]["tipo"]
                                     forca = pending["sinal"]["forca"]
+                                    # entry price = abertura da vela atual
                                     entry_price = open_p
+                                    # somente horário (Brasília) — sem data
                                     entrada_br = candle_time_utc.astimezone(timezone(timedelta(hours=-3)))
                                     entrada_time_only = entrada_br.strftime("%H:%M:%S")
 
+                                    # ML filter (avaliado no momento da abertura da vela seguinte para maior precisão)
                                     ml_ok = True
                                     ml_prob = None
 
-                                    # try to train quickly if ML not ready
+                                    # if ML not ready, try to train quickly (to avoid N/A)
                                     if ML_ENABLED and not ml_model_ready.get(symbol, False):
                                         try:
                                             log(f"[ML {symbol}] ML não pronto (pending) — tentando treinar rápido antes de avaliar prob.")
@@ -840,18 +867,21 @@ async def monitor_symbol(symbol: str):
                                         # remove pending and continue (não marcar last_signal_time)
                                         del pending_signals[symbol]
                                     else:
+                                        # cooldown global APÓS ML aprovar
                                         now_ts = time.time()
                                         if now_ts - last_signal_time.get(symbol, 0) < MIN_SECONDS_BETWEEN_SIGNALS:
                                             log(f"[{symbol}] Cooldown global ainda ativo (pending) ({now_ts-last_signal_time.get(symbol,0):.1f}s) — descarta pending.", "warning")
                                             del pending_signals[symbol]
                                         else:
+                                            # enviar o sinal usando entry_price (abertura da vela atual)
                                             last_signal_time[symbol] = now_ts
-                                            last_signal_candle[symbol] = pending_candle_id
+                                            last_signal_candle[symbol] = pending_candle_id  # sinal originou da vela anterior
                                             last_signal_state[symbol] = tipo
 
                                             sent_timestamps.append(time.time())
                                             prune_sent_timestamps()
 
+                                            # construir mensagem no modelo pedido (sem data, só horário)
                                             pair = html.escape(human_pair(symbol))
                                             direction = "COMPRA" if tipo == "COMPRA" else "VENDA"
                                             strength = forca
@@ -877,19 +907,21 @@ async def monitor_symbol(symbol: str):
                                             except Exception:
                                                 log(f"[{symbol}] Falha ao enviar sinal pending ao Telegram.", "warning")
 
+                                            # remove pending after send
                                             del pending_signals[symbol]
 
-                            # --- gerar novo sinal a partir da vela fechada ---
+                            # --- 2) Em seguida: avaliar se geramos um novo sinal a partir da vela que acabou de fechar
                             novo_sinal = gerar_sinal(df, symbol)
                             if novo_sinal:
+                                # armazena como pending — será enviado quando a próxima vela abrir
                                 pending_signals[symbol] = {
                                     "sinal": novo_sinal,
                                     "created_at": time.time(),
-                                    "max_age_candles": 2
+                                    "max_age_candles": 2  # expira se não enviado em 2 velas
                                 }
                                 log(f"[{symbol}] Pending signal criado para candle_id={novo_sinal['candle_id']} (aguardando próxima vela para enviar).", "info")
 
-                            # limpeza de pendings antigos (expiração)
+                            # --- 3) limpeza de pendings antigos (expiração)
                             to_remove = []
                             for sym, p in list(pending_signals.items()):
                                 age_candles = (epoch - p["sinal"]["candle_id"]) // GRANULARITY_SECONDS
@@ -902,11 +934,13 @@ async def monitor_symbol(symbol: str):
             except websockets.InvalidStatusCode as e:
                 log(f"[WS {symbol}] InvalidStatusCode ao conectar: {e}", "warning")
             except Exception as e:
+                # qualquer exceção no contexto de conexão cai aqui
                 log(f"[WS {symbol}] erro na sessão WS: {e}\n{traceback.format_exc()}", "error")
 
         except Exception as e:
             log(f"[{symbol}] erro no ciclo principal: {e}\n{traceback.format_exc()}", "error")
 
+        # backoff antes de tentar reconectar — menos agressivo e com jitter
         reconnect_attempt = min(reconnect_attempt + 1, 10)
         base = [3, 8, 15, 30]
         idx = min(reconnect_attempt - 1, len(base) - 1)
@@ -914,7 +948,9 @@ async def monitor_symbol(symbol: str):
         jitter = random.uniform(0.8, 1.2)
         sleep_time = backoff * jitter
         log(f"[{symbol}] Reconectando em {sleep_time:.1f}s (attempt {reconnect_attempt})...", "info")
+        # small sleep before reconnect
         await asyncio.sleep(sleep_time)
+        # hint GC between reconnects
         gc.collect()
 
 # ---------------- Flask ----------------
