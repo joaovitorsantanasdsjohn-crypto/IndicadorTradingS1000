@@ -1,6 +1,6 @@
 # deriv_telegram_bot.py — LÓGICA A (Opção A — Precisão Profissional para FOREX M5)
 # Ajustes técnicos: limites de memória, GC, robustez WS, limites ML.
-# NÃO mexi na sua lógica de sinais — somente estabilidade / memória.
+# NÃO mexi na sua lógica de sinais — somente estabilidade / memória e mensagens.
 
 import asyncio
 import websockets
@@ -62,34 +62,34 @@ RSI_SELL_MIN = 48
 MACD_TOLERANCE = 0.002
 
 # Anti-spam / anti-duplicate (tempo)
-MIN_SECONDS_BETWEEN_SIGNALS = 5           # cooldown entre envios (aplicado APÓS ML aprovar)
-MIN_SECONDS_BETWEEN_OPPOSITE = 60        # evita compra->venda imediata (opposite cooldown)
+MIN_SECONDS_BETWEEN_SIGNALS = 3           # cooldown entre envios (aplicado APÓS ML aprovar) — reduzido para aumentar volume
+MIN_SECONDS_BETWEEN_OPPOSITE = 45        # evita compra->venda imediata (opposite cooldown) — levemente reduzido
 
 # Anti-duplicate (velas): aguarda N velas entre sinais para o mesmo par
-MIN_CANDLES_BETWEEN_SIGNALS = 3           # 3 velas = 15min se CANDLE_INTERVAL=5
+MIN_CANDLES_BETWEEN_SIGNALS = 2           # reduzido de 3 para 2 para mais sinais
 
 # EMA separation relative threshold (fraction of price)
-REL_EMA_SEP_PCT = 8e-06
-MICRO_FORCE_ALLOW_THRESHOLD = 40
+REL_EMA_SEP_PCT = 5e-06                   # relaxado um pouco
+MICRO_FORCE_ALLOW_THRESHOLD = 25          # reduzido para permitir sinais menores
 
 # Força mínima absoluta para envio
-FORCE_MIN = 50
+FORCE_MIN = 35                            # reduzido de 50 para aumentar volume
 
 # ML params
 ML_ENABLED = SKLEARN_AVAILABLE
 ML_N_ESTIMATORS = 40
 ML_MAX_DEPTH = 4
-ML_MIN_TRAINED_SAMPLES = 300
+ML_MIN_TRAINED_SAMPLES = 200             # reduzido de 300 para permitir treinar mais cedo
 ML_CONF_THRESHOLD = 0.55
 
 # ML memory safety: cap de amostras para treinar
 ML_MAX_SAMPLES = 500
 
 # Fallback adaptativo (garantir sinais/hora)
-MIN_SIGNALS_PER_HOUR = 4
+MIN_SIGNALS_PER_HOUR = 3                 # reduzido (fallback menos frequente)
 FALLBACK_WINDOW_SEC = 3600
-FALLBACK_FORCE_MIN = 40
-FALLBACK_MICRO_FORCE_ALLOW_THRESHOLD = 25
+FALLBACK_FORCE_MIN = 30
+FALLBACK_MICRO_FORCE_ALLOW_THRESHOLD = 20
 FALLBACK_REL_EMA_SEP_PCT = 2e-05
 FALLBACK_DURATION_SECONDS = 15 * 60
 
@@ -185,7 +185,7 @@ def send_telegram(message: str, symbol: str = None, bypass_throttle: bool = Fals
         return
 
     try:
-        # message expected as already escaped HTML
+        # message expected as already escaped HTML or plain text (no HTML tags in new template)
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
         r = requests.post(url, data=payload, timeout=10)
@@ -661,7 +661,8 @@ async def monitor_symbol(symbol: str):
                     try:
                         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                         # try to read auth response but don't block forever
-                        auth_raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                        # aumentado timeout de authorize para 60s
+                        auth_raw = await asyncio.wait_for(ws.recv(), timeout=60)
                     except asyncio.CancelledError:
                         log(f"[{symbol}] asyncio.CancelledError durante authorize — reconectar.", "warning")
                         raise
@@ -677,13 +678,14 @@ async def monitor_symbol(symbol: str):
                             try:
                                 req_hist = {
                                     "ticks_history": symbol,
-                                    "count": 800,
+                                    "count": 1200,  # tentei solicitar mais candles para garantir histórico
                                     "end": "latest",
                                     "granularity": GRANULARITY_SECONDS,
                                     "style": "candles"
                                 }
                                 await ws.send(json.dumps(req_hist))
-                                raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                                # aumentado timeout para receber histórico
+                                raw = await asyncio.wait_for(ws.recv(), timeout=60)
                                 data = json.loads(raw)
 
                                 if isinstance(data, dict) and "history" in data and isinstance(data["history"], dict):
@@ -701,7 +703,7 @@ async def monitor_symbol(symbol: str):
 
                             except asyncio.TimeoutError:
                                 log(f"[{symbol}] Timeout ao solicitar histórico (tentativa {history_tries}).", "warning")
-                                if history_tries >= 3:
+                                if history_tries >= 5:
                                     raise Exception("Falha ao obter histórico após múltiplas tentativas")
                                 await asyncio.sleep(1.0 + random.random() * 2.0)
                             except asyncio.CancelledError:
@@ -709,7 +711,7 @@ async def monitor_symbol(symbol: str):
                                 raise
                             except Exception as e:
                                 log(f"[{symbol}] Erro ao obter histórico: {e}", "error")
-                                if history_tries >= 3:
+                                if history_tries >= 5:
                                     raise
                                 await asyncio.sleep(1.0 + random.random() * 2.0)
 
@@ -751,7 +753,8 @@ async def monitor_symbol(symbol: str):
                     # Main receive loop
                     while True:
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=180)
+                            # aumentado timeout para evitar reconexões desnecessárias
+                            raw = await asyncio.wait_for(ws.recv(), timeout=600)
                         except asyncio.TimeoutError:
                             # allow some idle time; only force reconnect if long idle
                             if time.time() - ultimo_candle_time > 300:
@@ -832,7 +835,7 @@ async def monitor_symbol(symbol: str):
                             try:
                                 samples = len(df)
                                 last_trained = ml_trained_samples.get(symbol, 0)
-                                # retrain if not trained or if we have >= last_trained + ML_MIN_TRAINED_SAMPLES
+                                # retrain se temos amostras suficientes ou aumento significativo
                                 if ML_ENABLED and (samples >= ML_MIN_TRAINED_SAMPLES) and (samples >= last_trained + ML_MIN_TRAINED_SAMPLES):
                                     # run in executor to avoid blocking
                                     await asyncio.get_event_loop().run_in_executor(None, train_ml_for_symbol, df, symbol)
@@ -857,9 +860,9 @@ async def monitor_symbol(symbol: str):
                                     forca = pending["sinal"]["forca"]
                                     # entry price = abertura da vela atual
                                     entry_price = open_p
+                                    # somente horário (Brasília) — sem data
                                     entrada_br = candle_time_utc.astimezone(timezone(timedelta(hours=-3)))
-                                    # apenas horário (HH:MM:SS) conforme solicitado
-                                    entrada_str = entrada_br.strftime("%H:%M:%S")
+                                    entrada_time_only = entrada_br.strftime("%H:%M:%S")
 
                                     # ML filter (avaliado no momento da abertura da vela seguinte para maior precisão)
                                     ml_ok = True
@@ -886,7 +889,7 @@ async def monitor_symbol(symbol: str):
                                             notify_once(symbol, "ml_blocked_"+str(epoch), f"❌ [{human_pair(symbol)}] Sinal {tipo} bloqueado pelo ML (prob_up={ml_prob:.3f}).", bypass=True)
                                         except Exception:
                                             log(f"[{symbol}] Falha ao notificar Telegram sobre bloqueio ML (pending).", "warning")
-                                        # remove pending e continue (não marcar last_signal_time)
+                                        # remove pending and continue (não marcar last_signal_time)
                                         del pending_signals[symbol]
                                     else:
                                         # cooldown global APÓS ML aprovar
@@ -903,19 +906,17 @@ async def monitor_symbol(symbol: str):
                                             sent_timestamps.append(time.time())
                                             prune_sent_timestamps()
 
-                                            # montar campos da mensagem conforme template solicitado
-                                            pair = human_pair(symbol)
+                                            # construir mensagem no modelo pedido (sem data, só horário)
+                                            pair = html.escape(human_pair(symbol))
                                             direction = "COMPRA" if tipo == "COMPRA" else "VENDA"
                                             strength = forca
                                             price = f"{entry_price:.5f}"
-                                            entry_time = entrada_str
-                                            if ml_prob is None:
-                                                prob_str = "N/A"
-                                            else:
+                                            entry_time = entrada_time_only
+                                            if ml_prob is not None:
                                                 prob_pct = int(round(ml_prob * 100))
-                                                prob_str = str(prob_pct)
+                                            else:
+                                                prob_pct = "N/A"
 
-                                            # montar mensagem no formato pedido (sem data, apenas horário)
                                             message = f"""
 📊 NOVO SINAL — M{CANDLE_INTERVAL}
 • Par: {pair}
@@ -923,13 +924,10 @@ async def monitor_symbol(symbol: str):
 • Força do sinal: {strength}%
 • Preço: {price}
 • Horário de entrada: {entry_time}
-• ML prob: {prob_str}%
+• ML prob: {prob_pct}%
 """
-                                            # escapar antes de enviar para Telegram (parse_mode=HTML)
-                                            message_escaped = html.escape(message)
-
                                             try:
-                                                send_telegram(message_escaped, symbol=symbol, bypass_throttle=False)
+                                                send_telegram(message, symbol=symbol, bypass_throttle=False)
                                                 log(f"[{symbol}] Pending: mensagem enviada ao Telegram (entry open).", "info")
                                             except Exception:
                                                 log(f"[{symbol}] Falha ao enviar sinal pending ao Telegram.", "warning")
@@ -976,7 +974,7 @@ async def monitor_symbol(symbol: str):
         jitter = random.uniform(0.8, 1.2)
         sleep_time = backoff * jitter
         log(f"[{symbol}] Reconectando em {sleep_time:.1f}s (attempt {reconnect_attempt})...", "info")
-        # small sleep antes de reconectar
+        # small sleep before reconnect
         await asyncio.sleep(sleep_time)
         # hint GC between reconnects
         gc.collect()
