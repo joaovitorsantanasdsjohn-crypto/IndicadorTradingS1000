@@ -1,6 +1,7 @@
 # deriv_telegram_bot.py — LÓGICA A (Opção A — Precisão Profissional para FOREX M5)
 # Ajustes técnicos: limites de memória, GC, robustez WS, limites ML.
-# NÃO mexi na sua lógica de sinais — somente estabilidade / memória e mensagens.
+# Modificações: mais histórico (count=3000), ML com mais amostras e retrain mais frequente,
+# parâmetros mais permissivos para aumentar volume de sinais (com proteções).
 
 import asyncio
 import websockets
@@ -62,31 +63,32 @@ RSI_SELL_MIN = 48
 MACD_TOLERANCE = 0.002
 
 # Anti-spam / anti-duplicate (tempo)
-MIN_SECONDS_BETWEEN_SIGNALS = 3           # cooldown entre envios (aplicado APÓS ML aprovar) — reduzido para aumentar volume
-MIN_SECONDS_BETWEEN_OPPOSITE = 45        # evita compra->venda imediata (opposite cooldown) — levemente reduzido
+MIN_SECONDS_BETWEEN_SIGNALS = 3           # cooldown entre envios (aplicado APÓS ML aprovar)
+MIN_SECONDS_BETWEEN_OPPOSITE = 45        # evita compra->venda imediata (opposite cooldown)
 
 # Anti-duplicate (velas): aguarda N velas entre sinais para o mesmo par
-MIN_CANDLES_BETWEEN_SIGNALS = 2           # reduzido de 3 para 2 para mais sinais
+MIN_CANDLES_BETWEEN_SIGNALS = 1           # mais permissivo: 1 vela entre sinais
 
 # EMA separation relative threshold (fraction of price)
-REL_EMA_SEP_PCT = 5e-06                   # relaxado um pouco
-MICRO_FORCE_ALLOW_THRESHOLD = 25          # reduzido para permitir sinais menores
+REL_EMA_SEP_PCT = 3e-06                   # relaxado para aumentar volume
+MICRO_FORCE_ALLOW_THRESHOLD = 15          # permite sinais menores
 
 # Força mínima absoluta para envio
-FORCE_MIN = 35                            # reduzido de 50 para aumentar volume
+FORCE_MIN = 30                            # reduzido para aumentar volume
 
 # ML params
 ML_ENABLED = SKLEARN_AVAILABLE
 ML_N_ESTIMATORS = 40
 ML_MAX_DEPTH = 4
-ML_MIN_TRAINED_SAMPLES = 200             # reduzido de 300 para permitir treinar mais cedo
-ML_CONF_THRESHOLD = 0.55
+ML_MIN_TRAINED_SAMPLES = 50               # reduzido para treinar cedo (mais prob)
+ML_CONF_THRESHOLD = 0.55                  # 55% conforme você pediu
 
 # ML memory safety: cap de amostras para treinar
-ML_MAX_SAMPLES = 500
+ML_MAX_SAMPLES = 2000                     # limite para não estourar memória
+ML_RETRAIN_INTERVAL = 50                  # retrain quando houver X samples a mais
 
 # Fallback adaptativo (garantir sinais/hora)
-MIN_SIGNALS_PER_HOUR = 3                 # reduzido (fallback menos frequente)
+MIN_SIGNALS_PER_HOUR = 3
 FALLBACK_WINDOW_SEC = 3600
 FALLBACK_FORCE_MIN = 30
 FALLBACK_MICRO_FORCE_ALLOW_THRESHOLD = 20
@@ -94,6 +96,9 @@ FALLBACK_REL_EMA_SEP_PCT = 2e-05
 FALLBACK_DURATION_SECONDS = 15 * 60
 
 DEFAULT_EMA_SEP_SCALE = 0.01
+
+# Initial history fetch count (aumentado para ML ter muitos dados)
+INITIAL_HISTORY_COUNT = 3000
 
 # --- Novos parâmetros Profissionais (Opção A)
 EMA_FAST = 9
@@ -140,7 +145,7 @@ if "global" not in notify_flags:
     notify_flags["global"] = {}
 
 # ---------------- Limites para memória ----------------
-MAX_CANDLES = 300   # <-- controla uso de memória (mantém só as últimas N velas)
+MAX_CANDLES = 300   # mantém só as últimas N velas na memória
 
 # ---------------- Logging ----------------
 logger = logging.getLogger("indicador")
@@ -328,10 +333,10 @@ def train_ml_for_symbol(df: pd.DataFrame, symbol: str):
             ml_model_ready[symbol] = False
             return False
 
-        # If we already trained with same or more samples, skip retrain
         last_trained = ml_trained_samples.get(symbol, 0)
-        if last_trained >= samples:
-            log(f"[ML {symbol}] Já treinado com {last_trained} samples — pula retrain.", "info")
+        # retrain only if we have enough additional samples (ML_RETRAIN_INTERVAL) or never trained
+        if last_trained > 0 and samples < last_trained + ML_RETRAIN_INTERVAL:
+            log(f"[ML {symbol}] Já treinado recentemente (samples={last_trained}); pula retrain (samples atuais={samples}).", "info")
             ml_model_ready[symbol] = True
             return True
 
@@ -411,7 +416,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         low = float(now["low"])
         candle_id = epoch - (epoch % GRANULARITY_SECONDS)
 
-        # 1 sinal por candle (não marcar aqui; só evitar gerar duas vezes no mesmo candle)
+        # 1 sinal por candle
         if last_signal_candle.get(symbol) == candle_id:
             log(f"[{symbol}] Já houve sinal nesse candle ({candle_id}), ignorando.", "debug")
             return None
@@ -678,7 +683,7 @@ async def monitor_symbol(symbol: str):
                             try:
                                 req_hist = {
                                     "ticks_history": symbol,
-                                    "count": 1200,  # tentei solicitar mais candles para garantir histórico
+                                    "count": INITIAL_HISTORY_COUNT,  # mais histórico solicitado
                                     "end": "latest",
                                     "granularity": GRANULARITY_SECONDS,
                                     "style": "candles"
@@ -831,12 +836,11 @@ async def monitor_symbol(symbol: str):
                             df = calcular_indicadores(df)
                             save_last_candles(df, symbol)
 
-                            # incremental retrain: only retrain when sample count increased meaningfully
+                            # incremental retrain: retrain if we gained ML_RETRAIN_INTERVAL new samples
                             try:
                                 samples = len(df)
                                 last_trained = ml_trained_samples.get(symbol, 0)
-                                # retrain se temos amostras suficientes ou aumento significativo
-                                if ML_ENABLED and (samples >= ML_MIN_TRAINED_SAMPLES) and (samples >= last_trained + ML_MIN_TRAINED_SAMPLES):
+                                if ML_ENABLED and (samples >= ML_MIN_TRAINED_SAMPLES) and (samples >= last_trained + ML_RETRAIN_INTERVAL):
                                     # run in executor to avoid blocking
                                     await asyncio.get_event_loop().run_in_executor(None, train_ml_for_symbol, df, symbol)
                                     # try to free memory after heavy op
@@ -867,6 +871,15 @@ async def monitor_symbol(symbol: str):
                                     # ML filter (avaliado no momento da abertura da vela seguinte para maior precisão)
                                     ml_ok = True
                                     ml_prob = None
+
+                                    # if ML not ready, try to train quickly (to avoid N/A)
+                                    if ML_ENABLED and not ml_model_ready.get(symbol, False):
+                                        try:
+                                            log(f"[ML {symbol}] ML não pronto (pending) — tentando treinar rápido antes de avaliar prob.")
+                                            await asyncio.get_event_loop().run_in_executor(None, train_ml_for_symbol, df, symbol)
+                                        except Exception:
+                                            log(f"[ML {symbol}] Falha ao tentar treinar rápido (pending).", "warning")
+
                                     if ML_ENABLED and ml_model_ready.get(symbol, False):
                                         try:
                                             last_row = df.iloc[-1]
@@ -963,7 +976,7 @@ async def monitor_symbol(symbol: str):
                 log(f"[WS {symbol}] erro na sessão WS: {e}\n{traceback.format_exc()}", "error")
 
         except Exception as e:
-            # outer loop catches autorize/hist fetch/timeouts etc.
+            # outer loop catches authorize/hist fetch/timeouts etc.
             log(f"[{symbol}] erro no ciclo principal: {e}\n{traceback.format_exc()}", "error")
 
         # backoff antes de tentar reconectar — menos agressivo e com jitter
@@ -984,7 +997,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def index():
-    return "Bot ativo — Lógica A (Precisão Profissional) — Triple EMA + ATR + Price Action + ML leve"
+    return "Bot ativo — Lógica A (Precisão Profissional) — Triple EMA + ATR + Price Action + ML leve (hist=3000, ML samples up to 2000)"
 
 # ---------------- Execução ----------------
 def run_flask():
@@ -994,7 +1007,7 @@ def run_flask():
 async def main():
     threading.Thread(target=run_flask, daemon=True).start()
     # start message (one-shot)
-    notify_once("global", "started", "✅ Bot iniciado — Lógica A (Precisão Profissional) — Triple EMA + ATR + Price Action + ML leve", bypass=True)
+    notify_once("global", "started", "✅ Bot iniciado — Lógica A (Precisão Profissional) — Triple EMA + ATR + Price Action + ML leve (hist=3000)", bypass=True)
     if not SKLEARN_AVAILABLE:
         log("⚠️ scikit-learn não encontrado. ML desabilitado. Instale scikit-learn para habilitar ML.", "warning")
     # start one monitor task per symbol
