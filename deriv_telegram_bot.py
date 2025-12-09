@@ -1,8 +1,8 @@
 # deriv_telegram_bot.py — LÓGICA A (Opção A — Precisão Profissional para FOREX M5)
-# Versão FINAL: filtros de PRICE ACTION e ATR removidos para mais sinais
-# Corrigido erro 'float' object has no attribute 'astype'; adicionado mensagem de START e novo formato de sinal (ML em % inteiro)
-# *** ATUALIZAÇÃO PEDIDA PELO USUÁRIO ***
-# Horário enviado no Telegram agora é automaticamente convertido de UTC -> Horário de Brasília (BRT/BRST)
+# Versão FINAL (unificada) — Melhoria 1 + Melhoria 3 implementadas
+# - Evita sinais duplicados no mesmo candle
+# - Envia sinal exatamente na abertura da próxima vela (precision)
+# - Mensagem de start e formato de sinal (par, direção, horário em Brasília, ML %)
 
 import asyncio
 import websockets
@@ -97,12 +97,15 @@ last_signal_time = {s: 0 for s in SYMBOLS}
 last_notify_time = {}
 ml_models = {}
 ml_model_ready = {}
+ml_trained_samples = {s: 0 for s in SYMBOLS}
 sent_timestamps = deque()
 fallback_active_until = 0.0
 historical_loaded = {s: False for s in SYMBOLS}
 live_subscribed = {s: False for s in SYMBOLS}
-ml_trained_samples = {s: 0 for s in SYMBOLS}
 notify_flags = {s: {"connected": False, "history": False, "ml": False, "subscribed": False} for s in SYMBOLS}
+
+# pending_signals: guarda sinal gerado na vela fechada, envia na próxima abertura
+pending_signals = {}  # chave: symbol -> {"sinal": {...}, "created_at": ts, "max_age_candles": int}
 
 # ---------------- Logging ----------------
 logger = logging.getLogger("indicador")
@@ -146,6 +149,19 @@ def send_telegram(message: str, symbol: str = None, bypass_throttle: bool = Fals
     except Exception as e:
         log(f"[TG] Erro ao enviar: {e}\n{traceback.format_exc()}", "error")
 
+def notify_once(symbol: str, key: str, message: str, bypass=False):
+    if symbol not in notify_flags:
+        notify_flags[symbol] = {}
+    flags = notify_flags.get(symbol, {})
+    if flags.get(key):
+        return
+    try:
+        send_telegram(html.escape(message), bypass_throttle=bypass)
+    except Exception:
+        log(f"[{symbol}] Falha ao notificar Telegram (notify_once).", "warning")
+    flags[key] = True
+    notify_flags[symbol] = flags
+
 # ---------------- Utilitários ----------------
 def human_pair(symbol: str) -> str:
     return symbol.replace("frx", "")
@@ -155,24 +171,29 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     df = df.sort_values("epoch").reset_index(drop=True)
 
-    for c in ["open","high","low","close","volume"]:
+    # Colunas essenciais
+    for c in ["open", "high", "low", "close", "volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
         else:
             df[c] = 0.0
 
+    # Indicadores EMA
     df[f"ema{EMA_FAST}"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     df[f"ema{EMA_MID}"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df[f"ema{EMA_SLOW}"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
 
+    # RSI
     df["rsi"] = RSIIndicator(df["close"], 14).rsi().fillna(50.0)
 
+    # MACD
     try:
         macd = MACD(df["close"], 26, 12, 9)
         df["macd_diff"] = macd.macd_diff().fillna(0.0)
-    except:
+    except Exception:
         df["macd_diff"] = 0.0
 
+    # Bollinger Bands
     bb = BollingerBands(df["close"], window=20, window_dev=2)
     df["bb_upper"] = bb.bollinger_hband().fillna(df["close"])
     df["bb_lower"] = bb.bollinger_lband().fillna(df["close"])
@@ -181,10 +202,10 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     df["rel_sep"] = (df[f"ema{EMA_MID}"] - df[f"ema{EMA_SLOW}"]).abs() / df["close"].replace(0, 1e-12)
 
+    # Garantir colunas usadas pelo ML
     ml_cols = ["open","high","low","close","volume",
                f"ema{EMA_FAST}", f"ema{EMA_MID}", f"ema{EMA_SLOW}",
                "rsi","macd_diff","bb_upper","bb_lower","bb_mavg","bb_width","rel_sep"]
-
     for c in ml_cols:
         if c not in df.columns:
             df[c] = 0.0
@@ -198,18 +219,14 @@ def _build_ml_dataset(df: pd.DataFrame):
     features = ["open","high","low","close","volume",
                 f"ema{EMA_FAST}", f"ema{EMA_MID}", f"ema{EMA_SLOW}",
                 "rsi","macd_diff","bb_upper","bb_lower","bb_mavg","bb_width","rel_sep"]
-
     for c in features:
         df2[c] = df2.get(c, 0.0)
-
     y = (df2["close"].shift(-1) > df2["close"]).astype(int)
     X = df2.iloc[:-1].copy()
     y = y.iloc[:-1].copy()
-
     if len(X) > ML_MAX_SAMPLES:
         X = X.tail(ML_MAX_SAMPLES).reset_index(drop=True)
         y = y.tail(ML_MAX_SAMPLES).reset_index(drop=True)
-
     return X, y
 
 def train_ml_for_symbol(df: pd.DataFrame, symbol: str):
@@ -226,7 +243,7 @@ def train_ml_for_symbol(df: pd.DataFrame, symbol: str):
         ml_models[symbol] = (model, X.columns.tolist())
         ml_model_ready[symbol] = True
         return True
-    except:
+    except Exception:
         ml_model_ready[symbol] = False
         return False
 
@@ -235,16 +252,15 @@ def ml_predict_prob(symbol: str, last_row: pd.Series) -> float:
         if not ml_model_ready.get(symbol):
             return None
         model, cols = ml_models.get(symbol, (None, None))
-        if model is None:
+        if model is None or cols is None:
             return None
-
         Xrow = [float(last_row.get(c, 0.0)) for c in cols]
         prob_up = float(model.predict_proba([Xrow])[0][1])
         return prob_up
-    except:
+    except Exception:
         return None
 
-# ---------------- Fallback ----------------
+# ---------------- Fallback / contagem ----------------
 def prune_sent_timestamps():
     cutoff = time.time() - FALLBACK_WINDOW_SEC
     while sent_timestamps and sent_timestamps[0] < cutoff:
@@ -266,8 +282,17 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             return None
         now = df.iloc[-1]
         candle_id = int(now["epoch"]) - (int(now["epoch"]) % GRANULARITY_SECONDS)
+
+        # evita gerar 2 sinais no mesmo candle (melhoria 1)
         if last_signal_candle.get(symbol) == candle_id:
             return None
+
+        # também respeitar MIN_CANDLES_BETWEEN_SIGNALS
+        last_candle = last_signal_candle.get(symbol)
+        if last_candle is not None:
+            passed = (candle_id - last_candle) // GRANULARITY_SECONDS
+            if passed < MIN_CANDLES_BETWEEN_SIGNALS:
+                return None
 
         ema_fast = float(now[f"ema{EMA_FAST}"])
         ema_mid = float(now[f"ema{EMA_MID}"])
@@ -288,7 +313,6 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
 
         rsi_now = float(now["rsi"]) if not pd.isna(now["rsi"]) else 50.0
         macd_diff = now.get("macd_diff")
-
         macd_buy_ok = True if macd_diff is None or pd.isna(macd_diff) else (macd_diff > -MACD_TOLERANCE)
         macd_sell_ok = True if macd_diff is None or pd.isna(macd_diff) else (macd_diff < MACD_TOLERANCE)
 
@@ -305,28 +329,22 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             return None
 
         tipo = "COMPRA" if buy_ok else "VENDA"
-        last_signal_state[symbol] = tipo
-        last_signal_candle[symbol] = candle_id
+
+        # não envia aqui — cria pending para enviar na próxima vela (melhoria 3)
         return {"tipo": tipo, "candle_id": candle_id}
-    except:
+    except Exception:
         return None
 
 # ---------------- Persistência ----------------
 def save_last_candles(df: pd.DataFrame, symbol: str):
     try:
         df.tail(MAX_CANDLES).to_csv(DATA_DIR / f"candles_{symbol}.csv", index=False)
-    except:
+    except Exception:
         pass
 
-# ---------------- MENSAGENS ----------------
-
+# ---------------- Mensagens e conversões ----------------
 def convert_utc_to_brasilia(dt_utc: datetime) -> str:
-    """
-    Converte datetime UTC → Horário de Brasília automaticamente.
-    Brasília pode estar em UTC-3 ou UTC-2 (horário de verão, se existir).
-    Para 2025: UTC-3 fixo.
-    """
-    # UTC-3
+    # Para 2025 e geral: Brasília = UTC-3
     brasilia = dt_utc - timedelta(hours=3)
     return brasilia.strftime("%H:%M:%S") + " BRT"
 
@@ -334,34 +352,27 @@ def format_start_message() -> str:
     return (
         "🟢 <b>BOT INICIADO!</b>\n\n"
         "O sistema está ativo e monitorando os pares configurados.\n"
-        "Os horários enviados serão ajustados automaticamente para <b>Horário de Brasília</b>."
+        "Horários enviados serão ajustados automaticamente para <b>Horário de Brasília</b>."
     )
 
-def format_signal_message(symbol: str, tipo: str, entry_dt_utc: datetime, ml_prob: float | None) -> str:
-    """
-    Agora converte o horário UTC para o horário de Brasília.
-    """
+def format_signal_message(symbol: str, tipo: str, entry_dt_utc: datetime, ml_prob: float | None, price_open: float | None = None) -> str:
     pair = html.escape(human_pair(symbol))
-    direction_emoji = "🟢" if tipo == "COMPRA" else "🔴"
-    direction_label = "COMPRA" if tipo == "COMPRA" else "VENDA"
-
-    # *** ALTERAÇÃO PEDIDA ***
+    emoji = "🟢" if tipo == "COMPRA" else "🔴"
+    label = "COMPRA" if tipo == "COMPRA" else "VENDA"
     entry_brasilia = convert_utc_to_brasilia(entry_dt_utc)
-
-    if ml_prob is None:
-        ml_text = "N/A"
-    else:
-        ml_text = f"{int(round(ml_prob * 100))}%"
+    ml_text = "N/A" if ml_prob is None else f"{int(round(ml_prob*100))}%"
+    price_text = f"{price_open:.5f}" if price_open is not None else "N/A"
 
     text = (
         f"💱 <b>{pair}</b>\n\n"
-        f"📈 DIREÇÃO: <b>{direction_emoji} {direction_label}</b>\n"
-        f"⏱ ENTRADA: <b>{entry_brasilia}</b>\n\n"
+        f"📈 DIREÇÃO: <b>{emoji} {label}</b>\n"
+        f"⏱ ENTRADA (BRT): <b>{entry_brasilia}</b>\n"
+        f"💲 PREÇO (open): <b>{price_text}</b>\n\n"
         f"🤖 ML: <b>{ml_text}</b>"
     )
     return text
 
-# ---------------- MONITOR WEBSOCKET ----------------
+# ---------------- Monitor WebSocket (com pending send) ----------------
 async def monitor_symbol(symbol: str):
     df = pd.DataFrame()
     csv_path = DATA_DIR / f"candles_{symbol}.csv"
@@ -372,15 +383,22 @@ async def monitor_symbol(symbol: str):
             if len(df) > MAX_CANDLES:
                 df = df.tail(MAX_CANDLES).reset_index(drop=True)
             historical_loaded[symbol] = True
-        except:
+        except Exception:
             pass
 
+    reconnect_attempt = 0
     while True:
         try:
+            reconnect_attempt += 1
             async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=10) as ws:
+                reconnect_attempt = 0
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-                await asyncio.wait_for(ws.recv(), timeout=60)
+                try:
+                    await asyncio.wait_for(ws.recv(), timeout=60)
+                except asyncio.TimeoutError:
+                    log(f"[{symbol}] Timeout durante authorize.", "warning")
 
+                # Histórico inicial
                 if not historical_loaded.get(symbol, False):
                     for attempt in range(HISTORY_MAX_TRIES):
                         await ws.send(json.dumps({
@@ -397,7 +415,7 @@ async def monitor_symbol(symbol: str):
                             continue
                         try:
                             data = json.loads(raw)
-                        except:
+                        except Exception:
                             await asyncio.sleep(1 + random.random()*2)
                             continue
 
@@ -416,6 +434,7 @@ async def monitor_symbol(symbol: str):
                     historical_loaded[symbol] = True
                     save_last_candles(df, symbol)
 
+                # Subscribe candles
                 if not live_subscribed.get(symbol, False):
                     await ws.send(json.dumps({
                         "ticks_history": symbol,
@@ -426,14 +445,17 @@ async def monitor_symbol(symbol: str):
                     }))
                     live_subscribed[symbol] = True
 
-                # Recepção contínua
+                ultimo_candle_time = time.time()
+
+                # Loop de recepção de mensagens
                 while True:
                     raw = await asyncio.wait_for(ws.recv(), timeout=600)
                     try:
                         msg = json.loads(raw)
-                    except:
+                    except Exception:
                         continue
 
+                    # extrai candle
                     candle = None
                     if "candle" in msg and isinstance(msg["candle"], dict):
                         candle = msg["candle"]
@@ -449,24 +471,43 @@ async def monitor_symbol(symbol: str):
 
                     try:
                         epoch = int(candle.get("epoch"))
-                        if epoch % GRANULARITY_SECONDS != 0:
-                            continue
+                    except Exception:
+                        continue
+
+                    # aceitar apenas candles alinhadas com a granularity
+                    if epoch % GRANULARITY_SECONDS != 0:
+                        continue
+
+                    try:
                         open_p = float(candle.get("open", 0.0))
                         high_p = float(candle.get("high", 0.0))
                         low_p = float(candle.get("low", 0.0))
                         close_p = float(candle.get("close", 0.0))
-                        volume_p = float(candle.get("volume", 0.0)) if candle.get("volume") else 0.0
-                    except:
+                        volume_p = float(candle.get("volume", 0.0)) if candle.get("volume") is not None else 0.0
+                    except Exception:
                         continue
 
-                    df.loc[len(df)] = {
-                        "epoch": epoch,
-                        "open": open_p,
-                        "high": high_p,
-                        "low": low_p,
-                        "close": close_p,
-                        "volume": volume_p
-                    }
+                    # adiciona/atualiza candle no df
+                    is_new_candle = df.empty or int(df.iloc[-1]["epoch"]) != epoch
+                    if is_new_candle:
+                        df.loc[len(df)] = {
+                            "epoch": epoch,
+                            "open": open_p,
+                            "high": high_p,
+                            "low": low_p,
+                            "close": close_p,
+                            "volume": volume_p
+                        }
+                    else:
+                        # substitui o último se for atualização
+                        df.iloc[-1] = {
+                            "epoch": epoch,
+                            "open": open_p,
+                            "high": high_p,
+                            "low": low_p,
+                            "close": close_p,
+                            "volume": volume_p
+                        }
 
                     if len(df) > MAX_CANDLES:
                         df = df.tail(MAX_CANDLES).reset_index(drop=True)
@@ -474,44 +515,79 @@ async def monitor_symbol(symbol: str):
                     df = calcular_indicadores(df)
                     save_last_candles(df, symbol)
 
-                    # ML incremental
-                    try:
-                        samples = len(df)
-                        last_trained = ml_trained_samples.get(symbol, 0)
-                        if ML_ENABLED and samples >= ML_MIN_TRAINED_SAMPLES and samples >= last_trained + ML_RETRAIN_INTERVAL:
-                            loop = asyncio.get_event_loop()
-                            await loop.run_in_executor(None, train_ml_for_symbol, df.copy(), symbol)
-                            ml_trained_samples[symbol] = samples
-                    except:
-                        pass
+                    # --- PROCESSAR PENDING (envia na ABERTURA da próxima vela) ---
+                    # Se houver pending do símbolo e a vela atual é posterior ao candle_id do pending, então enviar
+                    pending = pending_signals.get(symbol)
+                    if pending:
+                        pending_candle_id = pending["sinal"]["candle_id"]
+                        # Se o epoch atual é maior que o candle_id do sinal, significa que esta vela é a próxima abertura
+                        if epoch > pending_candle_id:
+                            tipo = pending["sinal"]["tipo"]
+                            # calcula ML prob se disponível
+                            ml_prob = None
+                            if ML_ENABLED and ml_model_ready.get(symbol, False):
+                                try:
+                                    # usar a última linha do df (esta vela aberta) para predizer
+                                    ml_prob = ml_predict_prob(symbol, df.iloc[-1])
+                                except Exception:
+                                    ml_prob = None
 
-                    sinal = gerar_sinal(df, symbol)
-                    if sinal:
-                        ml_prob = None
-                        if ML_ENABLED and ml_model_ready.get(symbol):
+                            # hora de entrada = início desta vela (epoch em UTC)
+                            entry_dt_utc = datetime.utcfromtimestamp(epoch).replace(tzinfo=timezone.utc)
+
+                            # formata e envia mensagem (usa preço de abertura)
+                            msg_text = format_signal_message(symbol, tipo, entry_dt_utc, ml_prob, price_open=open_p)
+                            send_telegram(msg_text, symbol=symbol)
+
+                            # atualiza estados e logs
+                            last_signal_time[symbol] = time.time()
+                            last_signal_candle[symbol] = pending_candle_id  # marca como enviado para o candle fechado que originou pending
+                            sent_timestamps.append(time.time())
+                            prune_sent_timestamps()
+                            check_and_activate_fallback()
+
+                            # remove pending
                             try:
-                                ml_prob = ml_predict_prob(symbol, df.iloc[-1])
-                            except:
-                                ml_prob = None
+                                del pending_signals[symbol]
+                            except KeyError:
+                                pass
 
-                        entry_dt_utc = datetime.utcfromtimestamp(epoch).replace(tzinfo=timezone.utc)
+                    # --- tentar gerar novo sinal a partir da vela fechada (nesta implementação,
+                    # geramos sinal com a vela atual já fechada — e então aguardamos a próxima vela para enviar) ---
+                    novo_sinal = gerar_sinal(df, symbol)
+                    if novo_sinal:
+                        # cria pending (se já houver um pending, não sobrescreve para evitar concorrência)
+                        if symbol not in pending_signals:
+                            pending_signals[symbol] = {
+                                "sinal": novo_sinal,
+                                "created_at": time.time(),
+                                "max_age_candles": 2
+                            }
+                            log(f"[{symbol}] Pending signal criado para candle_id={novo_sinal['candle_id']} (aguardando próxima vela para enviar).", "info")
 
-                        msg_text = format_signal_message(symbol, sinal["tipo"], entry_dt_utc, ml_prob)
+                    # limpar pendings antigos
+                    to_remove = []
+                    for sym, p in list(pending_signals.items()):
+                        age_candles = (epoch - p["sinal"]["candle_id"]) // GRANULARITY_SECONDS
+                        if age_candles > p.get("max_age_candles", 2):
+                            to_remove.append(sym)
+                    for sym in to_remove:
+                        log(f"[{sym}] Pending sinal expirou (não enviado em tempo) — removendo.", "warning")
+                        try:
+                            del pending_signals[sym]
+                        except KeyError:
+                            pass
 
-                        send_telegram(msg_text, symbol=symbol)
-
-                        last_signal_time[symbol] = time.time()
-                        last_signal_candle[symbol] = sinal["candle_id"]
-                        sent_timestamps.append(time.time())
-                        prune_sent_timestamps()
-                        check_and_activate_fallback()
-
+        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed) as e:
+            log(f"[{symbol}] Conexão fechada ou timeout, reconectando... ({e})", "warning")
+            await asyncio.sleep(min(30, 2 ** reconnect_attempt))
         except Exception as e:
             log(f"[{symbol}] Erro: {e}\n{traceback.format_exc()}", "error")
             await asyncio.sleep(5)
 
 # ---------------- LOOP PRINCIPAL ----------------
 async def main():
+    # envia mensagem de start (apenas uma vez)
     start_msg = format_start_message()
     send_telegram(start_msg, bypass_throttle=True)
 
