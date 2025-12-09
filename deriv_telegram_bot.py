@@ -1,5 +1,6 @@
 # deriv_telegram_bot.py — LÓGICA A (Opção A — Precisão Profissional para FOREX M5)
 # Versão ATUALIZADA: filtros de PRICE ACTION e ATR removidos para mais sinais
+# Corrigido erro 'float' object has no attribute 'astype' e garantida consistência de ML
 
 import asyncio
 import websockets
@@ -147,34 +148,45 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     df = df.sort_values("epoch").reset_index(drop=True)
 
-    # Corrigido: conversão segura de colunas para float
-    for c in ["open", "high", "low", "close"]:
+    # Colunas essenciais
+    for c in ["open", "high", "low", "close", "volume"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
         else:
             df[c] = 0.0
 
-    if "volume" in df.columns:
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
-    else:
-        df["volume"] = 0.0
-
+    # Indicadores EMA
     df[f"ema{EMA_FAST}"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     df[f"ema{EMA_MID}"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df[f"ema{EMA_SLOW}"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
-    df["rsi"] = RSIIndicator(df["close"], 14).rsi()
+
+    # RSI
+    df["rsi"] = RSIIndicator(df["close"], 14).rsi().fillna(50.0)
+
+    # MACD
     try:
         macd = MACD(df["close"], 26, 12, 9)
-        df["macd_diff"] = macd.macd_diff()
+        df["macd_diff"] = macd.macd_diff().fillna(0.0)
     except Exception:
-        df["macd_diff"] = pd.NA
+        df["macd_diff"] = 0.0
 
+    # Bollinger Bands
     bb = BollingerBands(df["close"], window=20, window_dev=2)
-    df["bb_upper"] = bb.bollinger_hband()
-    df["bb_lower"] = bb.bollinger_lband()
-    df["bb_mavg"] = bb.bollinger_mavg()
+    df["bb_upper"] = bb.bollinger_hband().fillna(df["close"])
+    df["bb_lower"] = bb.bollinger_lband().fillna(df["close"])
+    df["bb_mavg"] = bb.bollinger_mavg().fillna(df["close"])
     df["bb_width"] = df["bb_upper"] - df["bb_lower"]
     df["rel_sep"] = (df[f"ema{EMA_MID}"] - df[f"ema{EMA_SLOW}"]).abs() / df["close"].replace(0, 1e-12)
+
+    # Garantir colunas usadas pelo ML
+    ml_features = ["open","high","low","close","volume",
+                   f"ema{EMA_FAST}", f"ema{EMA_MID}", f"ema{EMA_SLOW}",
+                   "rsi","macd_diff","bb_upper","bb_lower","bb_mavg","bb_width","rel_sep"]
+    for c in ml_features:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
     return df
 
 # ---------------- ML ----------------
