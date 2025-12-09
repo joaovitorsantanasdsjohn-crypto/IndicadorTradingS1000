@@ -1,7 +1,4 @@
-# deriv_telegram_bot.py — LÓGICA A (Opção A — Precisão Profissional para FOREX M5)
-# Versão FINAL: filtros de PRICE ACTION e ATR removidos para mais sinais
-# Corrigido erro 'float' object has no attribute 'astype'; adicionado mensagem de START e novo formato de sinal (ML em % inteiro)
-# Flask integrado para manter o serviço online (PORT via env ou 10000)
+#Indicador Trading S1000#
 
 import asyncio
 import websockets
