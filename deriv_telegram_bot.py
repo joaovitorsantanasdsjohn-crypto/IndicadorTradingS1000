@@ -1,11 +1,4 @@
-# deriv_telegram_bot.py — LÓGICA A (Opção A — Precisão Profissional para FOREX M5)
-# Versão FINAL com:
-# - Entrada marcada para a ABERTURA DA PRÓXIMA VELA (M5)
-# - Logs profissionais detalhados
-# - Bloqueio de duplicados e intervalo mínimo de velas
-# - ML bloqueando prob < ML_CONF_THRESHOLD (default 0.55)
-# - Mensagem de START e formato de sinal em horário de Brasília
-# - Flask integrado para manter o serviço online (PORT via env ou 10000)
+# Indicador Trading S1000 #
 
 import asyncio
 import websockets
