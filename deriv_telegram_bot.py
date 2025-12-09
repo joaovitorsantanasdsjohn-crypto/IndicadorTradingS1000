@@ -1,6 +1,7 @@
-# ============================================
-#  deriv_telegram_bot.py — LÓGICA A + FLASK
-# ============================================
+# deriv_telegram_bot.py — LÓGICA A (Opção A — Precisão Profissional para FOREX M5)
+# Versão FINAL: filtros de PRICE ACTION e ATR removidos para mais sinais
+# Corrigido erro 'float' object has no attribute 'astype'; adicionado mensagem de START e novo formato de sinal (ML em % inteiro)
+# Flask integrado para manter o serviço online (PORT via env ou 10000)
 
 import asyncio
 import websockets
@@ -259,8 +260,17 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             return None
         now = df.iloc[-1]
         candle_id = int(now["epoch"]) - (int(now["epoch"]) % GRANULARITY_SECONDS)
+
+        # 1) evita enviar 2 sinais na mesma vela para o mesmo par
         if last_signal_candle.get(symbol) == candle_id:
             return None
+
+        # 2) respeitar intervalo de N velas entre sinais (MIN_CANDLES_BETWEEN_SIGNALS)
+        last_candle = last_signal_candle.get(symbol)
+        if last_candle is not None:
+            candles_passed = (candle_id - last_candle) // GRANULARITY_SECONDS
+            if candles_passed < MIN_CANDLES_BETWEEN_SIGNALS:
+                return None
 
         ema_fast = float(now[f"ema{EMA_FAST}"])
         ema_mid = float(now[f"ema{EMA_MID}"])
@@ -298,8 +308,11 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             return None
 
         tipo = "COMPRA" if buy_ok else "VENDA"
+
+        # marcar sinal (impede duplicate) — será atualizado novamente após envio
         last_signal_state[symbol] = tipo
         last_signal_candle[symbol] = candle_id
+
         return {"tipo": tipo, "candle_id": candle_id}
     except:
         return None
@@ -329,7 +342,6 @@ def format_signal_message(symbol: str, tipo: str, entry_dt_utc: datetime, ml_pro
     direction_emoji = "🟢" if tipo == "COMPRA" else "🔴"
     direction_label = "COMPRA" if tipo == "COMPRA" else "VENDA"
     entry_brasilia = convert_utc_to_brasilia(entry_dt_utc)
-
     ml_text = "N/A" if ml_prob is None else f"{int(round(ml_prob * 100))}%"
 
     text = (
@@ -452,6 +464,7 @@ async def monitor_symbol(symbol: str):
                     df = calcular_indicadores(df)
                     save_last_candles(df, symbol)
 
+                    # ML incremental (retrain background)
                     try:
                         samples = len(df)
                         last_trained = ml_trained_samples.get(symbol, 0)
@@ -464,6 +477,7 @@ async def monitor_symbol(symbol: str):
 
                     sinal = gerar_sinal(df, symbol)
                     if sinal:
+                        # calcula prob ML (se disponível) e bloqueia sinais com prob < ML_CONF_THRESHOLD (fail-open logic)
                         ml_prob = None
                         if ML_ENABLED and ml_model_ready.get(symbol):
                             try:
@@ -471,12 +485,25 @@ async def monitor_symbol(symbol: str):
                             except:
                                 ml_prob = None
 
-                        entry_dt_utc = datetime.utcfromtimestamp(epoch).replace(tzinfo=timezone.utc)
+                        # Se houver ML e ela estiver pronta, bloqueia sinais com prob abaixo do threshold
+                        if ml_prob is not None:
+                            if sinal["tipo"] == "COMPRA":
+                                if ml_prob < ML_CONF_THRESHOLD:
+                                    log(f"[{symbol}] ML bloqueou sinal COMPRA (prob_up={ml_prob:.2f})", "warning")
+                                    continue
+                            else:
+                                if (1.0 - ml_prob) < ML_CONF_THRESHOLD:
+                                    log(f"[{symbol}] ML bloqueou sinal VENDA (prob_up={ml_prob:.2f})", "warning")
+                                    continue
 
+                        # horário de entrada: abertura da próxima vela — calculado a partir do epoch recebido
+                        entry_dt_utc = datetime.utcfromtimestamp(epoch).replace(tzinfo=timezone.utc)  # início da vela atual -> usamos esse epoch
+
+                        # Formata e envia
                         msg_text = format_signal_message(symbol, sinal["tipo"], entry_dt_utc, ml_prob)
-
                         send_telegram(msg_text, symbol=symbol)
 
+                        # marca último sinal (para evitar duplicados)
                         last_signal_time[symbol] = time.time()
                         last_signal_candle[symbol] = sinal["candle_id"]
                         sent_timestamps.append(time.time())
@@ -503,11 +530,17 @@ def home():
     return "BOT ONLINE", 200
 
 def run_flask():
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+# ---------------- STARTUP ----------------
+def start_bot():
+    asyncio.run(main())
 
 if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
+    # start Flask first (daemon thread) so platform health checks see HTTP quickly
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    asyncio.run(main())
+    # then start the bot (blocking)
+    start_bot()
