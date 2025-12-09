@@ -146,9 +146,18 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     df = df.sort_values("epoch").reset_index(drop=True)
+
+    # Corrigido: conversão segura de colunas para float
     for c in ["open", "high", "low", "close"]:
-        df[c] = df[c].astype(float) if c in df.columns else 0.0
-    df["volume"] = df.get("volume", 0.0).astype(float)
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        else:
+            df[c] = 0.0
+
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+    else:
+        df["volume"] = 0.0
 
     df[f"ema{EMA_FAST}"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     df[f"ema{EMA_MID}"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
