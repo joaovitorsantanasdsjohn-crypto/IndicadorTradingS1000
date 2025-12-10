@@ -1,5 +1,4 @@
-# indicador_trading_s1000.py
-# Versão completa com reconexão WS, ML, fallback, Telegram e Flask
+# Indicador Trading S1000 #
 
 import asyncio
 import websockets
@@ -219,6 +218,14 @@ def format_signal_message(symbol:str,tipo:str,entry_dt_utc:datetime,ml_prob:floa
           f"🤖 ML: <b>{ml_text}</b>")
     return text
 
+def format_start_message() -> str:
+    return (
+        "🟢 <b>BOT INICIADO!</b>\n\n"
+        "O sistema está ativo e monitorando os pares configurados.\n"
+        "Os horários enviados serão ajustados automaticamente para <b>Horário de Brasília</b>.\n"
+        "Entradas serão disparadas para a <b>abertura da próxima vela</b> (M5)."
+    )
+
 # ---------------- Geração de sinais ----------------
 def gerar_sinal(df:pd.DataFrame,symbol:str):
     if len(df)<EMA_SLOW+5: return None
@@ -267,7 +274,6 @@ async def monitor_symbol(symbol:str):
             async with websockets.connect(WS_URL,ping_interval=30,ping_timeout=10) as ws:
                 await ws.send(json.dumps({"authorize":DERIV_TOKEN}))
                 await asyncio.wait_for(ws.recv(),timeout=60)
-                # subscribe histórico
                 subscribe_msg={"ticks_history":symbol,"adjust_start_time":1,"count":INITIAL_HISTORY_COUNT,"end":"latest","style":"candles","granularity":GRANULARITY_SECONDS}
                 await ws.send(json.dumps(subscribe_msg))
                 while True:
@@ -320,6 +326,8 @@ async def monitor_symbol(symbol:str):
 
 # ---------------- LOOP PRINCIPAL ----------------
 async def main():
+    start_msg = format_start_message()
+    send_telegram(start_msg, bypass_throttle=True)
     tasks=[monitor_symbol(s) for s in SYMBOLS]
     await asyncio.gather(*tasks)
 
@@ -332,6 +340,7 @@ def run_flask():
     port=int(os.getenv("PORT",10000))
     app.run(host="0.0.0.0",port=port)
 
+# ---------------- STARTUP ----------------
 if __name__=="__main__":
     flask_thread=threading.Thread(target=run_flask,daemon=True)
     flask_thread.start()
