@@ -376,13 +376,13 @@ async def monitor_symbol(symbol: str):
                 try:
                     auth_raw = await asyncio.wait_for(ws.recv(), timeout=60)
                     log(f"[{symbol}] Resposta de autorização recebida.", "info")
-                except asyncio
-         # Continuação do monitor_symbol (recepção contínua e envio de sinais)
+                except asyncio.TimeoutError:
+    log(f"[{symbol}] Timeout de autorização — reconectar.", "warning")
+    continue
+    
 
-                    # Histórico inicial e subscribe já tratados acima...
-
-                    # Recepção contínua de candles
-                    while True:
+                    
+                        while True:
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=600)
                         except asyncio.TimeoutError:
