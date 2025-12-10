@@ -1,4 +1,4 @@
-# Indicador Trading S1000 - Versão com reconexão robusta e logs informativos
+# Indicador Trading S1000 - Versão melhorada (reconexão robusta, logs e ML)
 import asyncio
 import websockets
 import json
