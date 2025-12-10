@@ -282,8 +282,11 @@ async def monitor_symbol(symbol:str):
                 subscribe_msg={"ticks_history":symbol,"adjust_start_time":1,"count":INITIAL_HISTORY_COUNT,"end":"latest","style":"candles","granularity":GRANULARITY_SECONDS}
                 await ws.send(json.dumps(subscribe_msg))
                 while True:
-                    try: raw=await asyncio.wait_for(ws.recv(),timeout=600)
-                    except asyncio.TimeoutError: raise Exception("Timeout prolongado, reconectar")
+                    try:
+                        raw=await asyncio.wait_for(ws.recv(),timeout=600)
+                    except asyncio.TimeoutError: 
+                        raise Exception("Timeout prolongado, reconectar")
+                    
                     msg=json.loads(raw)
                     candle=None
                     if "candle" in msg: candle=msg["candle"]
@@ -291,6 +294,7 @@ async def monitor_symbol(symbol:str):
                     elif "history" in msg and "candles" in msg["history"]: candle=msg["history"]["candles"][-1]
                     elif "candles" in msg and msg["candles"]: candle=msg["candles"][-1]
                     if not candle: continue
+                    
                     try:
                         epoch=int(candle.get("epoch"))
                         if epoch%GRANULARITY_SECONDS!=0: continue
@@ -302,7 +306,11 @@ async def monitor_symbol(symbol:str):
                     except: continue
 
                     new_row = {"epoch":epoch,"open":open_p,"high":high_p,"low":low_p,"close":close_p,"volume":volume_p}
-                    if set(new_row.keys()) <= set(df.columns):
+                    
+                    # Adiciona linha apenas se DataFrame não estiver vazio e colunas corretas
+                    if df.empty:
+                        df = pd.DataFrame([new_row])
+                    elif set(new_row.keys()) <= set(df.columns):
                         df.loc[len(df)] = new_row
                     else:
                         log(f"{symbol} | Linha do candle inválida: {new_row}", "warning")
