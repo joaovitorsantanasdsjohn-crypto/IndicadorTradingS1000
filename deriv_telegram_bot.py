@@ -1,4 +1,4 @@
-# Indicador Trading S1000 - Corrigido #
+# Indicador Trading S1000 #
 
 import asyncio
 import websockets
