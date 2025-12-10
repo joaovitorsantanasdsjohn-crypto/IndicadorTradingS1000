@@ -1,5 +1,4 @@
-# indicador_trading_s1000.py
-# Versão completa otimizada com ML ativo, fallback inteligente e logs essenciais
+# Indicador Trading S1000 - Corrigido #
 
 import asyncio
 import websockets
@@ -16,6 +15,7 @@ from pathlib import Path
 import time
 import random
 import logging
+import traceback
 from collections import deque
 import html
 from flask import Flask
@@ -49,17 +49,17 @@ DATA_DIR.mkdir(exist_ok=True)
 
 # ---------------- Parâmetros ----------------
 BB_PROXIMITY_PCT = 0.20
-RSI_BUY_MAX = 55   # levemente mais flexível
-RSI_SELL_MIN = 45
-MACD_TOLERANCE = 0.003
-MIN_CANDLES_BETWEEN_SIGNALS = int(os.getenv("MIN_CANDLES_BETWEEN_SIGNALS","2"))
+RSI_BUY_MAX = 52
+RSI_SELL_MIN = 48
+MACD_TOLERANCE = 0.002
+MIN_CANDLES_BETWEEN_SIGNALS = int(os.getenv("MIN_CANDLES_BETWEEN_SIGNALS","4"))
 EMA_FAST = 9
 EMA_MID = 20
 EMA_SLOW = 200
 
 ML_ENABLED = SKLEARN_AVAILABLE
-ML_N_ESTIMATORS = 50
-ML_MAX_DEPTH = 5
+ML_N_ESTIMATORS = 40
+ML_MAX_DEPTH = 4
 ML_MIN_TRAINED_SAMPLES = 200
 ML_MAX_SAMPLES = 2000
 ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD","0.55"))
@@ -68,7 +68,7 @@ ML_RETRAIN_INTERVAL = 50
 MIN_SIGNALS_PER_HOUR = 5
 FALLBACK_WINDOW_SEC = 3600
 FALLBACK_DURATION_SECONDS = 15*60
-INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT","800"))
+INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT","500"))
 MAX_CANDLES = 300
 
 # ---------------- Estado ----------------
@@ -222,8 +222,8 @@ def format_start_message() -> str:
     return (
         "🟢 <b>BOT INICIADO!</b>\n\n"
         "O sistema está ativo e monitorando os pares configurados.\n"
-        "Horários ajustados para <b>Horário de Brasília</b>.\n"
-        "Entradas disparadas para a <b>abertura da próxima vela</b> (M5)."
+        "Os horários enviados serão ajustados automaticamente para <b>Horário de Brasília</b>.\n"
+        "Entradas serão disparadas para a <b>abertura da próxima vela</b> (M5)."
     )
 
 # ---------------- Geração de sinais ----------------
@@ -251,7 +251,6 @@ def gerar_sinal(df:pd.DataFrame,symbol:str):
     macd_sell_ok=True if macd_diff is None or pd.isna(macd_diff) else macd_diff<MACD_TOLERANCE
     buy_ok=triple_up and (bullish or perto_lower) and rsi_now<=RSI_BUY_MAX and macd_buy_ok
     sell_ok=triple_down and (bearish or perto_upper) and rsi_now>=RSI_SELL_MIN and macd_sell_ok
-    # fallback ativo
     if is_fallback_active():
         if not buy_ok and ema_mid>ema_slow and bullish: buy_ok=True
         if not sell_ok and ema_mid<ema_slow and bearish: sell_ok=True
@@ -261,24 +260,27 @@ def gerar_sinal(df:pd.DataFrame,symbol:str):
 
 # ---------------- Monitor WebSocket ----------------
 async def monitor_symbol(symbol:str):
-    df=pd.DataFrame()
+    columns = ["epoch","open","high","low","close","volume"]
+    df = pd.DataFrame(columns=columns)
+
     csv_path=DATA_DIR/f"candles_{symbol}.csv"
     if csv_path.exists():
         try:
-            df=pd.read_csv(csv_path)
-            df=calcular_indicadores(df)
-            if len(df)>MAX_CANDLES: df=df.tail(MAX_CANDLES).reset_index(drop=True)
-        except: pass
+            tmp=pd.read_csv(csv_path)
+            if not tmp.empty:
+                df=pd.DataFrame(tmp, columns=columns)
+                df=calcular_indicadores(df)
+                if len(df)>MAX_CANDLES: df=df.tail(MAX_CANDLES).reset_index(drop=True)
+        except Exception as e:
+            log(f"{symbol} | ERRO ao ler CSV histórico: {e}", "error")
 
     while True:
         try:
             async with websockets.connect(WS_URL,ping_interval=30,ping_timeout=10) as ws:
-                log(f"{symbol} | WS conectado")
                 await ws.send(json.dumps({"authorize":DERIV_TOKEN}))
                 await asyncio.wait_for(ws.recv(),timeout=60)
                 subscribe_msg={"ticks_history":symbol,"adjust_start_time":1,"count":INITIAL_HISTORY_COUNT,"end":"latest","style":"candles","granularity":GRANULARITY_SECONDS}
                 await ws.send(json.dumps(subscribe_msg))
-                log(f"{symbol} | Histórico solicitado ({INITIAL_HISTORY_COUNT} candles)")
                 while True:
                     try: raw=await asyncio.wait_for(ws.recv(),timeout=600)
                     except asyncio.TimeoutError: raise Exception("Timeout prolongado, reconectar")
@@ -298,10 +300,17 @@ async def monitor_symbol(symbol:str):
                         close_p=float(candle.get("close",0.0))
                         volume_p=float(candle.get("volume",0.0) if candle.get("volume") else 0.0)
                     except: continue
-                    df.loc[len(df)]={"epoch":epoch,"open":open_p,"high":high_p,"low":low_p,"close":close_p,"volume":volume_p}
+
+                    new_row = {"epoch":epoch,"open":open_p,"high":high_p,"low":low_p,"close":close_p,"volume":volume_p}
+                    if set(new_row.keys()) <= set(df.columns):
+                        df.loc[len(df)] = new_row
+                    else:
+                        log(f"{symbol} | Linha do candle inválida: {new_row}", "warning")
+
                     if len(df)>MAX_CANDLES: df=df.tail(MAX_CANDLES).reset_index(drop=True)
                     df=calcular_indicadores(df)
                     save_last_candles(df,symbol)
+
                     # ML incremental
                     samples=len(df)
                     last_trained=ml_trained_samples.get(symbol,0)
@@ -309,16 +318,13 @@ async def monitor_symbol(symbol:str):
                         loop=asyncio.get_event_loop()
                         await loop.run_in_executor(None,train_ml_for_symbol,df.copy(),symbol)
                         ml_trained_samples[symbol]=samples
-                        log(f"{symbol} | ML treinado ({samples} candles)")
+
                     # Sinal
                     sinal=gerar_sinal(df,symbol)
                     if sinal:
                         ml_prob=None
                         if ML_ENABLED and ml_model_ready.get(symbol):
                             ml_prob=ml_predict_prob(symbol,df.iloc[-1])
-                            # Filtra pelo threshold
-                            if ml_prob is not None and ml_prob<ML_CONF_THRESHOLD:
-                                continue
                         next_candle_epoch=epoch+GRANULARITY_SECONDS
                         entry_dt_utc=datetime.fromtimestamp(next_candle_epoch,tz=timezone.utc)
                         msg_text=format_signal_message(symbol,sinal["tipo"],entry_dt_utc,ml_prob)
@@ -328,7 +334,6 @@ async def monitor_symbol(symbol:str):
                         sent_timestamps.append(time.time())
                         prune_sent_timestamps()
                         check_and_activate_fallback()
-                        log(f"{symbol} | Sinal enviado: {sinal['tipo']} | Probabilidade ML: {ml_prob}")
         except Exception as e:
             log(f"{symbol} | ERRO WS: {e} | reconectando em 3s", "error")
             await asyncio.sleep(3+random.random()*2)
