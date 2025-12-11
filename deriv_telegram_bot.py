@@ -1,29 +1,37 @@
-Indicador Trading S1000 - Versão corrigida e pronta para deploy
-
-""" Arquivo corrigido: indicador_trading_s1000_fixed.py
-
-Corrige sintaxe e formatação
-
-Mantém reconexão robusta, logs, ML (se disponível)
-
-Envia subscribe: 1 ao solicitar ticks_history para receber updates ao vivo
-
-Salva candles em ./candles_data
-
-Requer variáveis de ambiente: TELEGRAM_TOKEN, CHAT_ID, DERIV_TOKEN, DERIV_APP_ID (opcional) """
+# Indicador Trading S1000 #
 
 
-import asyncio import json import logging import os import random import time import traceback from collections import deque from datetime import datetime, timedelta, timezone from pathlib import Path
 
-import pandas as pd import requests import websockets from dotenv import load_dotenv from flask import Flask
+
+import asyncio 
+import json 
+import logging 
+import os 
+import random 
+import time 
+import traceback 
+from collections 
+import deque 
+from datetime import datetime, timedelta, timezone 
+from pathlib import Path
+
+import pandas as pd 
+import requests 
+import websockets 
+from dotenv import load_dotenv 
+from flask import Flask
 
 indicadores TA
 
-from ta.momentum import RSIIndicator from ta.trend import EMAIndicator, MACD from ta.volatility import BollingerBands
+from ta.momentum import RSIIndicator 
+from ta.trend import EMAIndicator, MACD 
+from ta.volatility import BollingerBands
 
 ML opcional
 
-try: from sklearn.ensemble import RandomForestClassifier SKLEARN_AVAILABLE = True except Exception: SKLEARN_AVAILABLE = False
+try: from sklearn.ensemble import RandomForestClassifier 
+    SKLEARN_AVAILABLE = True 
+except Exception: SKLEARN_AVAILABLE = False
 
 ---------------- Inicialização ----------------
 
