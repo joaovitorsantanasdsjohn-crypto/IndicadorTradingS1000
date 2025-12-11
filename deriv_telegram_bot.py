@@ -1,6 +1,4 @@
-# Indicador Trading S1000
-
-
+# indicador_s1000_fixed_v2.py
 import asyncio
 import websockets
 import json
@@ -57,17 +55,22 @@ RSI_BUY_MAX = int(os.getenv("RSI_BUY_MAX", "52"))
 RSI_SELL_MIN = int(os.getenv("RSI_SELL_MIN", "48"))
 MACD_TOLERANCE = float(os.getenv("MACD_TOLERANCE", "0.002"))
 
-# IMPORTANT: EMA_SLOW grande exige muitas candles. Ajuste se o seu WS retornar poucas candles.
+# EMA params (keep EMA_SLOW reasonable for availability)
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_MID = int(os.getenv("EMA_MID", "20"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))  # mantido menor para viabilidade
+EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 
-MIN_CANDLES_BETWEEN_SIGNALS = int(os.getenv("MIN_CANDLES_BETWEEN_SIGNALS", "4"))
+# ---- Ajustes para aumentar volume de sinais (aplicados) ----
+MIN_SECONDS_BETWEEN_SIGNALS = int(os.getenv("MIN_SECONDS_BETWEEN_SIGNALS", "3"))
+MIN_CANDLES_BETWEEN_SIGNALS = int(os.getenv("MIN_CANDLES_BETWEEN_SIGNALS", "2"))
+REL_EMA_SEP_PCT = float(os.getenv("REL_EMA_SEP_PCT", "5e-06"))
+FORCE_MIN = int(os.getenv("FORCE_MIN", "35"))
+MICRO_FORCE_ALLOW_THRESHOLD = int(os.getenv("MICRO_FORCE_ALLOW_THRESHOLD", "25"))
 
 ML_ENABLED = SKLEARN_AVAILABLE and os.getenv("ENABLE_ML", "1") != "0"
 ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "40"))
 ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "4"))
-ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "50"))
+ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "200"))  # conforme ajuste
 ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "2000"))
 ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
 ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "50"))
@@ -75,8 +78,13 @@ ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "50"))
 MIN_SIGNALS_PER_HOUR = int(os.getenv("MIN_SIGNALS_PER_HOUR", "5"))
 FALLBACK_WINDOW_SEC = int(os.getenv("FALLBACK_WINDOW_SEC", "3600"))
 FALLBACK_DURATION_SECONDS = int(os.getenv("FALLBACK_DURATION_SECONDS", str(15*60)))
-INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT", "500"))
+INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT", "1200"))  # aumentado para coletar mais histórico
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "300"))
+
+# WebSocket timeouts (maiores para tolerar lentidão)
+WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "60"))
+WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "30"))
+RECV_TIMEOUT = int(os.getenv("RECV_TIMEOUT", "1200"))
 
 # ---------------- Estado ----------------
 last_signal_candle = {s: None for s in SYMBOLS}
@@ -141,7 +149,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df.get(c, 0.0), errors="coerce").fillna(0.0)
 
-    # TA lib may return NaN if not enough samples; fallback to ewm
     try:
         df[f"ema{EMA_FAST}"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     except Exception:
@@ -284,25 +291,37 @@ def format_start_message() -> str:
         "Entradas serão disparadas para a <b>abertura da próxima vela</b> (M5)."
     )
 
-# ---------------- Geração de sinais (robusta) ----------------
+# ---------------- Geração de sinais (robusta + menos restritiva) ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
     try:
-        # se houver pouco histórico, ainda tentamos com fallback EMAs
         if df is None or len(df) < 8:
             log(f"[{symbol}] Histórico muito curto ({0 if df is None else len(df)} candles).", "info")
             return None
 
         now = df.iloc[-1]
         candle_id = int(now["epoch"]) - (int(now["epoch"]) % GRANULARITY_SECONDS)
+
+        # evita sinal duplicado na mesma vela
         if last_signal_candle.get(symbol) == candle_id:
             return None
 
-        # tenta ler EMAs calculadas; se NaN, recalcula EMA por ewm com os dados disponíveis
+        # verifica tempo mínimo entre sinais
+        if time.time() - last_signal_time.get(symbol, 0) < MIN_SECONDS_BETWEEN_SIGNALS:
+            log(f"[{symbol}] Ignorando sinal: ainda dentro do MIN_SECONDS_BETWEEN_SIGNALS.", "info")
+            return None
+
+        # verifica candles mínimos desde último sinal (por epoch)
+        last_candle_epoch = last_signal_candle.get(symbol)
+        if last_candle_epoch is not None:
+            if (candle_id - last_candle_epoch) < (MIN_CANDLES_BETWEEN_SIGNALS * GRANULARITY_SECONDS):
+                log(f"[{symbol}] Ignorando sinal: MIN_CANDLES_BETWEEN_SIGNALS não atingido.", "info")
+                return None
+
+        # get EMAs (fallback to ewm if NaN)
         def get_ema_col(df_local, span):
             col = f"ema{span}"
             if col in df_local.columns and not pd.isna(df_local[col].iloc[-1]):
                 return float(df_local[col].iloc[-1])
-            # fallback
             try:
                 return float(df_local["close"].ewm(span=span, adjust=False).mean().iloc[-1])
             except Exception:
@@ -332,8 +351,36 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         macd_buy_ok = True if macd_diff is None or pd.isna(macd_diff) else macd_diff > -MACD_TOLERANCE
         macd_sell_ok = True if macd_diff is None or pd.isna(macd_diff) else macd_diff < MACD_TOLERANCE
 
+        # rel_sep current
+        rel_sep = abs(ema_mid - ema_slow) / (close if close != 0 else 1e-12)
+
+        # basic conditions
         buy_ok = triple_up and (bullish or perto_lower) and rsi_now <= RSI_BUY_MAX and macd_buy_ok
         sell_ok = triple_down and (bearish or perto_upper) and rsi_now >= RSI_SELL_MIN and macd_sell_ok
+
+        # allow looser EMAs if relative separation small but other forces present
+        # se rel_sep muito pequena, aplicamos heurística de 'micro force' para liberar sinais mais frequentes
+        if not (buy_ok or sell_ok):
+            # micro-force: se diferenciação rápida entre fast e mid for alta relativa, permitir
+            micro_sep = abs(ema_fast - ema_mid) / (close if close != 0 else 1e-12)
+            # transformar thresholds em valores interpretáveis:
+            # MICRO_FORCE_ALLOW_THRESHOLD é um inteiro; transformamos numa escala pequena
+            micro_thresh = MICRO_FORCE_ALLOW_THRESHOLD * 1e-05
+            force_thresh = FORCE_MIN * 1e-04
+
+            if rel_sep < REL_EMA_SEP_PCT:
+                # se micro_sep excede micro_thresh e a vela é direcional, liberar conforme fallback
+                if micro_sep > micro_thresh and (bullish or bearish):
+                    if bullish:
+                        buy_ok = True
+                    if bearish:
+                        sell_ok = True
+                # ou se rel_sep supera force_thresh (força maior) liberar
+                if rel_sep > force_thresh:
+                    if bullish:
+                        buy_ok = True
+                    if bearish:
+                        sell_ok = True
 
         if is_fallback_active():
             if not buy_ok and ema_mid > ema_slow and bullish:
@@ -342,7 +389,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
                 sell_ok = True
 
         if not (buy_ok or sell_ok):
-            log(f"[{symbol}] Sem condição para sinal (triple_up={triple_up} triple_down={triple_down} rsi={rsi_now:.2f}).", "info")
+            log(f"[{symbol}] Sem condição para sinal (triple_up={triple_up} triple_down={triple_down} rsi={rsi_now:.2f} rel_sep={rel_sep:.2e}).", "info")
             return None
 
         tipo = "COMPRA" if buy_ok else "VENDA"
@@ -384,7 +431,7 @@ async def monitor_symbol(symbol: str):
                 await asyncio.sleep(delay)
 
             log(f"{symbol} | Conectando ao WS (attempt {connect_attempt})...", "info")
-            async with websockets.connect(WS_URL, ping_interval=40, ping_timeout=20, max_size=None) as ws:
+            async with websockets.connect(WS_URL, ping_interval=WS_PING_INTERVAL, ping_timeout=WS_PING_TIMEOUT, max_size=None) as ws:
                 log(f"{symbol} | WS conectado.", "info")
 
                 # authorize
@@ -418,7 +465,7 @@ async def monitor_symbol(symbol: str):
                     log(f"{symbol} | Histórico solicitado ({INITIAL_HISTORY_COUNT} candles) (attempt {history_attempts}).", "info")
                     # aguardar resposta de history (tempo curto)
                     try:
-                        raw_hist = await asyncio.wait_for(ws.recv(), timeout=10)
+                        raw_hist = await asyncio.wait_for(ws.recv(), timeout=20)
                     except asyncio.TimeoutError:
                         log(f"{symbol} | Timeout aguardando resposta de histórico (attempt {history_attempts}).", "warning")
                         await asyncio.sleep(0.5 + random.random()*0.5)
@@ -431,7 +478,6 @@ async def monitor_symbol(symbol: str):
                         await asyncio.sleep(0.5 + random.random()*0.5)
                         continue
 
-                    # Alguns brokers retornam 'history' -> 'candles', outros podem retornar 'candles' diretamente.
                     candles_candidate = None
                     if "history" in msg_hist and isinstance(msg_hist.get("history"), dict) and "candles" in msg_hist["history"]:
                         candles_candidate = msg_hist["history"]["candles"]
@@ -464,7 +510,6 @@ async def monitor_symbol(symbol: str):
                                 except Exception as e:
                                     log(f"{symbol} | Erro retrain ML inicial: {e}", "warning")
                     else:
-                        # resposta sem candles (ex.: heartbeat) - aguardar um pouco e tentar novamente
                         log(f"{symbol} | Histórico recebido sem candles (attempt {history_attempts}).", "warning")
                         await asyncio.sleep(0.6 + random.random()*0.6)
 
@@ -491,7 +536,7 @@ async def monitor_symbol(symbol: str):
 
                 while True:
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=900)
+                        raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT)
                         last_msg_ts = time.time()
                     except asyncio.TimeoutError:
                         raise Exception("Timeout prolongado, reconectar")
