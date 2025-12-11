@@ -39,7 +39,12 @@ load_dotenv()
 
 ---------------- Configurações ----------------
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") CHAT_ID = os.getenv("CHAT_ID") DERIV_TOKEN = os.getenv("DERIV_TOKEN") CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5")) APP_ID = os.getenv("DERIV_APP_ID", "111022") WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}" GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") 
+CHAT_ID = os.getenv("CHAT_ID") 
+DERIV_TOKEN = os.getenv("DERIV_TOKEN") 
+CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5")) 
+APP_ID = os.getenv("DERIV_APP_ID", "111022") 
+WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}" GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
 
 SYMBOLS = [ "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD", "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP", "frxEURAUD", "frxAUDJPY", "frxGBPAUD", "frxGBPCAD", "frxAUDNZD", "frxEURCAD", ]
 
