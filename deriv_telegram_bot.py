@@ -1,4 +1,4 @@
-# indicador_s1000_fixed_v2.py
+# indicador_s1000_fixed_v2_ftt.py
 import asyncio
 import websockets
 import json
@@ -40,6 +40,7 @@ APP_ID = os.getenv("DERIV_APP_ID", "111022")
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
 
+# lista de símbolos (mantive a sua lista original)
 SYMBOLS = [
     "frxEURUSD","frxUSDJPY","frxGBPUSD","frxUSDCHF","frxAUDUSD",
     "frxUSDCAD","frxNZDUSD","frxEURJPY","frxGBPJPY","frxEURGBP",
@@ -50,18 +51,19 @@ DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
 
 # ---------------- Parâmetros (ajustáveis via env) ----------------
+TRADE_MODE = os.getenv("TRADE_MODE", "FTT")  # "FTT" ou "CFD" - apenas label/uso na mensagem
 BB_PROXIMITY_PCT = float(os.getenv("BB_PROXIMITY_PCT", "0.20"))
 RSI_BUY_MAX = int(os.getenv("RSI_BUY_MAX", "52"))
 RSI_SELL_MIN = int(os.getenv("RSI_SELL_MIN", "48"))
 MACD_TOLERANCE = float(os.getenv("MACD_TOLERANCE", "0.002"))
 
-# EMA params (keep EMA_SLOW reasonable for availability)
+# EMA params
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_MID = int(os.getenv("EMA_MID", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 
 # ---- Ajustes para aumentar volume de sinais (aplicados) ----
-MIN_SECONDS_BETWEEN_SIGNALS = int(os.getenv("MIN_SECONDS_BETWEEN_SIGNALS", "3"))
+MIN_SECONDS_BETWEEN_SIGNALS = int(os.getenv("MIN_SECONDS_BETWEEN_SIGNALS", "0"))  # 0 por padrão para FTT
 MIN_CANDLES_BETWEEN_SIGNALS = int(os.getenv("MIN_CANDLES_BETWEEN_SIGNALS", "2"))
 REL_EMA_SEP_PCT = float(os.getenv("REL_EMA_SEP_PCT", "5e-06"))
 FORCE_MIN = int(os.getenv("FORCE_MIN", "35"))
@@ -70,7 +72,7 @@ MICRO_FORCE_ALLOW_THRESHOLD = int(os.getenv("MICRO_FORCE_ALLOW_THRESHOLD", "25")
 ML_ENABLED = SKLEARN_AVAILABLE and os.getenv("ENABLE_ML", "1") != "0"
 ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "40"))
 ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "4"))
-ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "200"))  # conforme ajuste
+ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "200"))
 ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "2000"))
 ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
 ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "50"))
@@ -78,7 +80,7 @@ ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "50"))
 MIN_SIGNALS_PER_HOUR = int(os.getenv("MIN_SIGNALS_PER_HOUR", "5"))
 FALLBACK_WINDOW_SEC = int(os.getenv("FALLBACK_WINDOW_SEC", "3600"))
 FALLBACK_DURATION_SECONDS = int(os.getenv("FALLBACK_DURATION_SECONDS", str(15*60)))
-INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT", "1200"))  # aumentado para coletar mais histórico
+INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT", "1200"))
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "300"))
 
 # WebSocket timeouts (maiores para tolerar lentidão)
@@ -275,8 +277,9 @@ def format_signal_message(symbol: str, tipo: str, entry_dt_utc: datetime, ml_pro
     direction_emoji = "🟢" if tipo == "COMPRA" else "🔴"
     entry_brasilia = convert_utc_to_brasilia(entry_dt_utc)
     ml_text = "N/A" if ml_prob is None else f"{int(round(ml_prob * 100))}%"
+    # marca que é FTT para facilitar identificação
     text = (
-        f"💱 <b>{pair}</b>\n\n"
+        f"💱 <b>{pair} ({TRADE_MODE})</b>\n\n"
         f"📈 DIREÇÃO: <b>{direction_emoji} {tipo}</b>\n"
         f"⏱ ENTRADA: <b>{entry_brasilia}</b>\n\n"
         f"🤖 ML: <b>{ml_text}</b>"
@@ -286,7 +289,7 @@ def format_signal_message(symbol: str, tipo: str, entry_dt_utc: datetime, ml_pro
 def format_start_message() -> str:
     return (
         "🟢 <b>BOT INICIADO!</b>\n\n"
-        "O sistema está ativo e monitorando os pares configurados.\n"
+        f"O sistema está ativo e monitorando os pares configurados ({TRADE_MODE}).\n"
         "Os horários enviados serão ajustados automaticamente para <b>Horário de Brasília</b>.\n"
         "Entradas serão disparadas para a <b>abertura da próxima vela</b> (M5)."
     )
@@ -306,7 +309,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             return None
 
         # verifica tempo mínimo entre sinais
-        if time.time() - last_signal_time.get(symbol, 0) < MIN_SECONDS_BETWEEN_SIGNALS:
+        if MIN_SECONDS_BETWEEN_SIGNALS > 0 and time.time() - last_signal_time.get(symbol, 0) < MIN_SECONDS_BETWEEN_SIGNALS:
             log(f"[{symbol}] Ignorando sinal: ainda dentro do MIN_SECONDS_BETWEEN_SIGNALS.", "info")
             return None
 
@@ -359,23 +362,17 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         sell_ok = triple_down and (bearish or perto_upper) and rsi_now >= RSI_SELL_MIN and macd_sell_ok
 
         # allow looser EMAs if relative separation small but other forces present
-        # se rel_sep muito pequena, aplicamos heurística de 'micro force' para liberar sinais mais frequentes
         if not (buy_ok or sell_ok):
-            # micro-force: se diferenciação rápida entre fast e mid for alta relativa, permitir
             micro_sep = abs(ema_fast - ema_mid) / (close if close != 0 else 1e-12)
-            # transformar thresholds em valores interpretáveis:
-            # MICRO_FORCE_ALLOW_THRESHOLD é um inteiro; transformamos numa escala pequena
             micro_thresh = MICRO_FORCE_ALLOW_THRESHOLD * 1e-05
             force_thresh = FORCE_MIN * 1e-04
 
             if rel_sep < REL_EMA_SEP_PCT:
-                # se micro_sep excede micro_thresh e a vela é direcional, liberar conforme fallback
                 if micro_sep > micro_thresh and (bullish or bearish):
                     if bullish:
                         buy_ok = True
                     if bearish:
                         sell_ok = True
-                # ou se rel_sep supera force_thresh (força maior) liberar
                 if rel_sep > force_thresh:
                     if bullish:
                         buy_ok = True
@@ -446,9 +443,7 @@ async def monitor_symbol(symbol: str):
                 except asyncio.TimeoutError:
                     log(f"{symbol} | Timeout aguardando authorize response.", "warning")
 
-                # ---------------------------
                 # 1) solicita histórico (sem subscribe) - retry até 3 vezes se vier muito curto
-                # ---------------------------
                 history_attempts = 0
                 history_ok = False
                 while history_attempts < 3 and not history_ok:
@@ -463,7 +458,6 @@ async def monitor_symbol(symbol: str):
                     }
                     await ws.send(json.dumps(hist_req))
                     log(f"{symbol} | Histórico solicitado ({INITIAL_HISTORY_COUNT} candles) (attempt {history_attempts}).", "info")
-                    # aguardar resposta de history (tempo curto)
                     try:
                         raw_hist = await asyncio.wait_for(ws.recv(), timeout=20)
                     except asyncio.TimeoutError:
@@ -495,13 +489,11 @@ async def monitor_symbol(symbol: str):
                                 df = df.tail(MAX_CANDLES).reset_index(drop=True)
                             save_last_candles(df, symbol)
                             log(f"{symbol} | Histórico recebido ({len(df)} candles).", "info")
-                            # se veio muito curto (ex.: 1 vela), retry para aumentar chance de histórico completo
                             if len(df) < max(EMA_SLOW, 30):
                                 log(f"{symbol} | Histórico curto ({len(df)}). Tentando solicitar novamente para completar...", "warning")
                                 await asyncio.sleep(0.6 + random.random()*0.6)
                                 continue
                             history_ok = True
-                            # treinar ML inicial se possível
                             if ML_ENABLED:
                                 try:
                                     loop = asyncio.get_event_loop()
@@ -516,9 +508,7 @@ async def monitor_symbol(symbol: str):
                 if not history_ok:
                     log(f"{symbol} | Histórico inicial incompleto após retries; continuaremos e aguardaremos candles ao vivo.", "warning")
 
-                # ---------------------------
                 # 2) agora envia subscribe para atualizações ao vivo (separado)
-                # ---------------------------
                 try:
                     subscribe_msg = {
                         "ticks_history": symbol,
@@ -583,6 +573,7 @@ async def monitor_symbol(symbol: str):
                     elif "candles" in msg and isinstance(msg.get("candles"), list) and msg["candles"]:
                         candle = msg["candles"][-1]
                     elif "tick" in msg and isinstance(msg.get("tick"), dict):
+                        # ignore raw ticks for candle-based FTT strategy
                         continue
 
                     if not candle:
@@ -649,6 +640,7 @@ async def monitor_symbol(symbol: str):
                                 continue
 
                         next_candle_epoch = epoch + GRANULARITY_SECONDS
+                        # Para FTT: a entrada é na abertura da próxima vela (mesmo comportamento)
                         entry_dt_utc = datetime.fromtimestamp(next_candle_epoch, tz=timezone.utc)
                         msg_text = format_signal_message(symbol, sinal["tipo"], entry_dt_utc, ml_prob)
                         send_telegram(msg_text, symbol)
