@@ -1,4 +1,6 @@
 # Indicador Trading S1000
+
+
 import asyncio
 import websockets
 import json
