@@ -1,4 +1,4 @@
-# indicador_s1000_fixed.py
+# Indicador Trading S1000
 import asyncio
 import websockets
 import json
