@@ -58,14 +58,14 @@ MACD_TOLERANCE = float(os.getenv("MACD_TOLERANCE", "0.002"))
 # IMPORTANT: EMA_SLOW grande exige muitas candles. Ajuste se o seu WS retornar poucas candles.
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_MID = int(os.getenv("EMA_MID", "20"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))  # <--- reduzido para 50 para ser mais viável
+EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))  # mantido menor para viabilidade
 
 MIN_CANDLES_BETWEEN_SIGNALS = int(os.getenv("MIN_CANDLES_BETWEEN_SIGNALS", "4"))
 
 ML_ENABLED = SKLEARN_AVAILABLE and os.getenv("ENABLE_ML", "1") != "0"
 ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "40"))
 ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "4"))
-ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "50"))  # reduzido
+ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "50"))
 ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "2000"))
 ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
 ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "50"))
@@ -139,7 +139,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df.get(c, 0.0), errors="coerce").fillna(0.0)
 
-    # TA lib may return NaN if not enough samples; we keep them but also allow fallback later
+    # TA lib may return NaN if not enough samples; fallback to ewm
     try:
         df[f"ema{EMA_FAST}"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     except Exception:
@@ -397,18 +397,92 @@ async def monitor_symbol(symbol: str):
                 except asyncio.TimeoutError:
                     log(f"{symbol} | Timeout aguardando authorize response.", "warning")
 
-                # solicita histórico + subscribe
-                subscribe_msg = {
-                    "ticks_history": symbol,
-                    "adjust_start_time": 1,
-                    "count": INITIAL_HISTORY_COUNT,
-                    "end": "latest",
-                    "style": "candles",
-                    "granularity": GRANULARITY_SECONDS,
-                    "subscribe": 1
-                }
-                await ws.send(json.dumps(subscribe_msg))
-                log(f"{symbol} | Histórico solicitado ({INITIAL_HISTORY_COUNT} candles) + subscribe.", "info")
+                # ---------------------------
+                # 1) solicita histórico (sem subscribe) - retry até 3 vezes se vier muito curto
+                # ---------------------------
+                history_attempts = 0
+                history_ok = False
+                while history_attempts < 3 and not history_ok:
+                    history_attempts += 1
+                    hist_req = {
+                        "ticks_history": symbol,
+                        "adjust_start_time": 1,
+                        "count": INITIAL_HISTORY_COUNT,
+                        "end": "latest",
+                        "style": "candles",
+                        "granularity": GRANULARITY_SECONDS
+                    }
+                    await ws.send(json.dumps(hist_req))
+                    log(f"{symbol} | Histórico solicitado ({INITIAL_HISTORY_COUNT} candles) (attempt {history_attempts}).", "info")
+                    # aguardar resposta de history (tempo curto)
+                    try:
+                        raw_hist = await asyncio.wait_for(ws.recv(), timeout=10)
+                    except asyncio.TimeoutError:
+                        log(f"{symbol} | Timeout aguardando resposta de histórico (attempt {history_attempts}).", "warning")
+                        await asyncio.sleep(0.5 + random.random()*0.5)
+                        continue
+
+                    try:
+                        msg_hist = json.loads(raw_hist)
+                    except Exception:
+                        log(f"{symbol} | Resposta histórico não-JSON (attempt {history_attempts}).", "warning")
+                        await asyncio.sleep(0.5 + random.random()*0.5)
+                        continue
+
+                    # Alguns brokers retornam 'history' -> 'candles', outros podem retornar 'candles' diretamente.
+                    candles_candidate = None
+                    if "history" in msg_hist and isinstance(msg_hist.get("history"), dict) and "candles" in msg_hist["history"]:
+                        candles_candidate = msg_hist["history"]["candles"]
+                    elif "candles" in msg_hist and isinstance(msg_hist.get("candles"), list):
+                        candles_candidate = msg_hist["candles"]
+
+                    if isinstance(candles_candidate, list) and len(candles_candidate) > 0:
+                        hist = pd.DataFrame(candles_candidate)
+                        hist = hist.loc[:, hist.columns.intersection(columns)]
+                        if not hist.empty:
+                            hist = hist.sort_values("epoch").reset_index(drop=True)
+                            df = pd.DataFrame(hist, columns=columns)
+                            df = calcular_indicadores(df)
+                            if len(df) > MAX_CANDLES:
+                                df = df.tail(MAX_CANDLES).reset_index(drop=True)
+                            save_last_candles(df, symbol)
+                            log(f"{symbol} | Histórico recebido ({len(df)} candles).", "info")
+                            # se veio muito curto (ex.: 1 vela), retry para aumentar chance de histórico completo
+                            if len(df) < max(EMA_SLOW, 30):
+                                log(f"{symbol} | Histórico curto ({len(df)}). Tentando solicitar novamente para completar...", "warning")
+                                await asyncio.sleep(0.6 + random.random()*0.6)
+                                continue
+                            history_ok = True
+                            # treinar ML inicial se possível
+                            if ML_ENABLED:
+                                try:
+                                    loop = asyncio.get_event_loop()
+                                    await loop.run_in_executor(None, train_ml_for_symbol, df.copy(), symbol)
+                                    ml_trained_samples[symbol] = len(df)
+                                except Exception as e:
+                                    log(f"{symbol} | Erro retrain ML inicial: {e}", "warning")
+                    else:
+                        # resposta sem candles (ex.: heartbeat) - aguardar um pouco e tentar novamente
+                        log(f"{symbol} | Histórico recebido sem candles (attempt {history_attempts}).", "warning")
+                        await asyncio.sleep(0.6 + random.random()*0.6)
+
+                if not history_ok:
+                    log(f"{symbol} | Histórico inicial incompleto após retries; continuaremos e aguardaremos candles ao vivo.", "warning")
+
+                # ---------------------------
+                # 2) agora envia subscribe para atualizações ao vivo (separado)
+                # ---------------------------
+                try:
+                    subscribe_msg = {
+                        "ticks_history": symbol,
+                        "style": "candles",
+                        "granularity": GRANULARITY_SECONDS,
+                        "subscribe": 1
+                    }
+                    await ws.send(json.dumps(subscribe_msg))
+                    log(f"{symbol} | Subscribe enviado para updates ao vivo.", "info")
+                except Exception as e:
+                    log(f"{symbol} | Erro ao enviar subscribe: {e}", "warning")
 
                 connect_attempt = 0
                 last_msg_ts = time.time()
@@ -426,7 +500,7 @@ async def monitor_symbol(symbol: str):
                         log(f"{symbol} | Mensagem WS inválida (não JSON).", "warning")
                         continue
 
-                    # history initial
+                    # tratar histórico (caso ainda venha) - mesma lógica
                     if "history" in msg and isinstance(msg.get("history"), dict) and "candles" in msg["history"]:
                         try:
                             candles = msg["history"]["candles"]
@@ -442,7 +516,6 @@ async def monitor_symbol(symbol: str):
                                         df = df.tail(MAX_CANDLES).reset_index(drop=True)
                                     save_last_candles(df, symbol)
                                     log(f"{symbol} | Histórico recebido via WS ({len(df)} candles).", "info")
-                                    # train ML if possible
                                     if ML_ENABLED:
                                         try:
                                             loop = asyncio.get_event_loop()
@@ -463,7 +536,6 @@ async def monitor_symbol(symbol: str):
                     elif "candles" in msg and isinstance(msg.get("candles"), list) and msg["candles"]:
                         candle = msg["candles"][-1]
                     elif "tick" in msg and isinstance(msg.get("tick"), dict):
-                        # ignore raw ticks for candle-based strategy
                         continue
 
                     if not candle:
@@ -473,7 +545,6 @@ async def monitor_symbol(symbol: str):
                     try:
                         epoch = int(candle.get("epoch"))
                         if epoch % GRANULARITY_SECONDS != 0:
-                            # skip non-aligned
                             continue
                         open_p = float(candle.get("open", 0.0))
                         high_p = float(candle.get("high", 0.0))
