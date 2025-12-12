@@ -1,4 +1,6 @@
 # indicador_s1000_fixed_v2_ftt.py
+# Versão corrigida e formatada — reconexão/subscribe/histórico + melhorias de robustez.
+
 import asyncio
 import websockets
 import json
@@ -19,6 +21,8 @@ from collections import deque
 import html
 from flask import Flask
 import threading
+import signal
+import sys
 
 # ---------------- ML availability ----------------
 try:
@@ -40,7 +44,7 @@ APP_ID = os.getenv("DERIV_APP_ID", "111022")
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
 
-# lista de símbolos (mantive a sua lista original)
+# lista de símbolos
 SYMBOLS = [
     "frxEURUSD","frxUSDJPY","frxGBPUSD","frxUSDCHF","frxAUDUSD",
     "frxUSDCAD","frxNZDUSD","frxEURJPY","frxGBPJPY","frxEURGBP",
@@ -51,7 +55,7 @@ DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
 
 # ---------------- Parâmetros (ajustáveis via env) ----------------
-TRADE_MODE = os.getenv("TRADE_MODE", "FTT")  # "FTT" ou "CFD" - apenas label/uso na mensagem
+TRADE_MODE = os.getenv("TRADE_MODE", "FTT")  # label only
 BB_PROXIMITY_PCT = float(os.getenv("BB_PROXIMITY_PCT", "0.20"))
 RSI_BUY_MAX = int(os.getenv("RSI_BUY_MAX", "52"))
 RSI_SELL_MIN = int(os.getenv("RSI_SELL_MIN", "48"))
@@ -62,8 +66,8 @@ EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_MID = int(os.getenv("EMA_MID", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 
-# ---- Ajustes para aumentar volume de sinais (aplicados) ----
-MIN_SECONDS_BETWEEN_SIGNALS = int(os.getenv("MIN_SECONDS_BETWEEN_SIGNALS", "0"))  # 0 por padrão para FTT
+# Ajustes para aumentar volume de sinais (mantidos)
+MIN_SECONDS_BETWEEN_SIGNALS = int(os.getenv("MIN_SECONDS_BETWEEN_SIGNALS", "0"))
 MIN_CANDLES_BETWEEN_SIGNALS = int(os.getenv("MIN_CANDLES_BETWEEN_SIGNALS", "2"))
 REL_EMA_SEP_PCT = float(os.getenv("REL_EMA_SEP_PCT", "5e-06"))
 FORCE_MIN = int(os.getenv("FORCE_MIN", "35"))
@@ -80,7 +84,8 @@ ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "50"))
 MIN_SIGNALS_PER_HOUR = int(os.getenv("MIN_SIGNALS_PER_HOUR", "5"))
 FALLBACK_WINDOW_SEC = int(os.getenv("FALLBACK_WINDOW_SEC", "3600"))
 FALLBACK_DURATION_SECONDS = int(os.getenv("FALLBACK_DURATION_SECONDS", str(15*60)))
-INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT", "1200"))
+# Mudei o default para 500 (conforme sugerido) — você pode ajustar via env INITIAL_HISTORY_COUNT
+INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT", "500"))
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "300"))
 
 # WebSocket timeouts (maiores para tolerar lentidão)
@@ -97,6 +102,7 @@ ml_model_ready = {}
 sent_timestamps = deque()
 fallback_active_until = 0.0
 ml_trained_samples = {s: 0 for s in SYMBOLS}
+_shutdown = False
 
 # ---------------- Logging ----------------
 logger = logging.getLogger("indicador")
@@ -151,6 +157,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df.get(c, 0.0), errors="coerce").fillna(0.0)
 
+    # EMAs com fallback
     try:
         df[f"ema{EMA_FAST}"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     except Exception:
@@ -166,17 +173,20 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     except Exception:
         df[f"ema{EMA_SLOW}"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
 
+    # RSI
     try:
         df["rsi"] = RSIIndicator(df["close"], 14).rsi().fillna(50.0)
     except Exception:
         df["rsi"] = 50.0
 
+    # MACD diff
     try:
         macd = MACD(df["close"], 26, 12, 9)
         df["macd_diff"] = macd.macd_diff().fillna(0.0)
     except Exception:
         df["macd_diff"] = 0.0
 
+    # Bollinger Bands
     try:
         bb = BollingerBands(df["close"], window=20, window_dev=2)
         df["bb_upper"] = bb.bollinger_hband().fillna(df["close"])
@@ -269,6 +279,7 @@ def save_last_candles(df: pd.DataFrame, symbol: str):
 
 # ---------------- Mensagens ----------------
 def convert_utc_to_brasilia(dt_utc: datetime) -> str:
+    # dt_utc is timezone-aware in UTC
     brasilia = dt_utc - timedelta(hours=3)
     return brasilia.strftime("%H:%M:%S") + " BRT"
 
@@ -277,7 +288,7 @@ def format_signal_message(symbol: str, tipo: str, entry_dt_utc: datetime, ml_pro
     direction_emoji = "🟢" if tipo == "COMPRA" else "🔴"
     entry_brasilia = convert_utc_to_brasilia(entry_dt_utc)
     ml_text = "N/A" if ml_prob is None else f"{int(round(ml_prob * 100))}%"
-    # marca que é FTT para facilitar identificação
+    # mensagem em HTML (Telegram)
     text = (
         f"💱 <b>{pair} ({TRADE_MODE})</b>\n\n"
         f"📈 DIREÇÃO: <b>{direction_emoji} {tipo}</b>\n"
@@ -294,7 +305,7 @@ def format_start_message() -> str:
         "Entradas serão disparadas para a <b>abertura da próxima vela</b> (M5)."
     )
 
-# ---------------- Geração de sinais (robusta + menos restritiva) ----------------
+# ---------------- Geração de sinais (mantida sua lógica) ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
     try:
         if df is None or len(df) < 8:
@@ -320,7 +331,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
                 log(f"[{symbol}] Ignorando sinal: MIN_CANDLES_BETWEEN_SIGNALS não atingido.", "info")
                 return None
 
-        # get EMAs (fallback to ewm if NaN)
+        # get EMAs (fallback)
         def get_ema_col(df_local, span):
             col = f"ema{span}"
             if col in df_local.columns and not pd.isna(df_local[col].iloc[-1]):
@@ -419,7 +430,7 @@ async def monitor_symbol(symbol: str):
     connect_attempt = 0
     backoff_base = 2.0
 
-    while True:
+    while not _shutdown:
         try:
             connect_attempt += 1
             if connect_attempt > 1:
@@ -432,7 +443,12 @@ async def monitor_symbol(symbol: str):
                 log(f"{symbol} | WS conectado.", "info")
 
                 # authorize
-                await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+                try:
+                    await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+                except Exception as e:
+                    log(f"{symbol} | Erro enviando authorize: {e}", "warning")
+
+                # short wait for authorize response (non-blocking)
                 try:
                     auth_raw = await asyncio.wait_for(ws.recv(), timeout=20)
                     try:
@@ -442,11 +458,13 @@ async def monitor_symbol(symbol: str):
                         log(f"{symbol} | Autorize raw recebido (não JSON).", "info")
                 except asyncio.TimeoutError:
                     log(f"{symbol} | Timeout aguardando authorize response.", "warning")
+                except Exception as e:
+                    log(f"{symbol} | Erro receber authorize response: {e}", "warning")
 
                 # 1) solicita histórico (sem subscribe) - retry até 3 vezes se vier muito curto
                 history_attempts = 0
                 history_ok = False
-                while history_attempts < 3 and not history_ok:
+                while history_attempts < 3 and not history_ok and not _shutdown:
                     history_attempts += 1
                     hist_req = {
                         "ticks_history": symbol,
@@ -456,20 +474,30 @@ async def monitor_symbol(symbol: str):
                         "style": "candles",
                         "granularity": GRANULARITY_SECONDS
                     }
-                    await ws.send(json.dumps(hist_req))
+                    try:
+                        await ws.send(json.dumps(hist_req))
+                    except Exception as e:
+                        log(f"{symbol} | Erro enviando request histórico: {e}", "warning")
+                        await asyncio.sleep(0.5)
+                        continue
+
                     log(f"{symbol} | Histórico solicitado ({INITIAL_HISTORY_COUNT} candles) (attempt {history_attempts}).", "info")
                     try:
-                        raw_hist = await asyncio.wait_for(ws.recv(), timeout=20)
+                        raw_hist = await asyncio.wait_for(ws.recv(), timeout=25)
                     except asyncio.TimeoutError:
                         log(f"{symbol} | Timeout aguardando resposta de histórico (attempt {history_attempts}).", "warning")
-                        await asyncio.sleep(0.5 + random.random()*0.5)
+                        await asyncio.sleep(0.6 + random.random()*0.6)
+                        continue
+                    except Exception as e:
+                        log(f"{symbol} | Erro recebendo histórico: {e}", "warning")
+                        await asyncio.sleep(0.6 + random.random()*0.6)
                         continue
 
                     try:
                         msg_hist = json.loads(raw_hist)
                     except Exception:
                         log(f"{symbol} | Resposta histórico não-JSON (attempt {history_attempts}).", "warning")
-                        await asyncio.sleep(0.5 + random.random()*0.5)
+                        await asyncio.sleep(0.6 + random.random()*0.6)
                         continue
 
                     candles_candidate = None
@@ -508,7 +536,7 @@ async def monitor_symbol(symbol: str):
                 if not history_ok:
                     log(f"{symbol} | Histórico inicial incompleto após retries; continuaremos e aguardaremos candles ao vivo.", "warning")
 
-                # 2) agora envia subscribe para atualizações ao vivo (separado)
+                # 2) agora envia subscribe para atualizações ao vivo (separado) - importante manter subscribe ativo
                 try:
                     subscribe_msg = {
                         "ticks_history": symbol,
@@ -521,15 +549,21 @@ async def monitor_symbol(symbol: str):
                 except Exception as e:
                     log(f"{symbol} | Erro ao enviar subscribe: {e}", "warning")
 
+                # reset connect_attempt depois de conexão bem-sucedida
                 connect_attempt = 0
                 last_msg_ts = time.time()
 
-                while True:
+                # loop principal de leitura WS
+                while not _shutdown:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT)
                         last_msg_ts = time.time()
                     except asyncio.TimeoutError:
                         raise Exception("Timeout prolongado, reconectar")
+                    except websockets.ConnectionClosed:
+                        raise Exception("ConnectionClosed, reconectar")
+                    except Exception as e:
+                        raise Exception(f"Erro leitura WS: {e}")
 
                     try:
                         msg = json.loads(raw)
@@ -537,7 +571,7 @@ async def monitor_symbol(symbol: str):
                         log(f"{symbol} | Mensagem WS inválida (não JSON).", "warning")
                         continue
 
-                    # tratar histórico (caso ainda venha) - mesma lógica
+                    # tratar histórico (caso ainda venha)
                     if "history" in msg and isinstance(msg.get("history"), dict) and "candles" in msg["history"]:
                         try:
                             candles = msg["history"]["candles"]
@@ -573,7 +607,7 @@ async def monitor_symbol(symbol: str):
                     elif "candles" in msg and isinstance(msg.get("candles"), list) and msg["candles"]:
                         candle = msg["candles"][-1]
                     elif "tick" in msg and isinstance(msg.get("tick"), dict):
-                        # ignore raw ticks for candle-based FTT strategy
+                        # ignore raw ticks for candle-based strategy
                         continue
 
                     if not candle:
@@ -640,7 +674,6 @@ async def monitor_symbol(symbol: str):
                                 continue
 
                         next_candle_epoch = epoch + GRANULARITY_SECONDS
-                        # Para FTT: a entrada é na abertura da próxima vela (mesmo comportamento)
                         entry_dt_utc = datetime.fromtimestamp(next_candle_epoch, tz=timezone.utc)
                         msg_text = format_signal_message(symbol, sinal["tipo"], entry_dt_utc, ml_prob)
                         send_telegram(msg_text, symbol)
@@ -653,8 +686,12 @@ async def monitor_symbol(symbol: str):
                         check_and_activate_fallback()
 
         except Exception as e:
+            # log e reconecta com backoff
             log(f"{symbol} | ERRO WS (reconectando): {e}", "error")
-            await asyncio.sleep(3 + random.random() * 2)
+            try:
+                await asyncio.sleep(3 + random.random() * 2)
+            except asyncio.CancelledError:
+                break
 
 # ---------------- Loop principal ----------------
 async def main():
@@ -668,8 +705,20 @@ async def main():
         log("⚠️ TELEGRAM_TOKEN/CHAT_ID não presente — não será possível enviar sinais até configurar.", "warning")
 
     log("Iniciando tasks para todos os símbolos...", "info")
-    tasks = [monitor_symbol(s) for s in SYMBOLS]
-    await asyncio.gather(*tasks)
+
+    # criar tarefas individualmente para garantir reconexões isoladas
+    tasks = []
+    for s in SYMBOLS:
+        t = asyncio.create_task(monitor_symbol(s))
+        tasks.append(t)
+
+    # aguarda todas (na prática ficam rodando até shutdown)
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        log("Tasks canceladas.", "info")
+    except Exception as e:
+        log(f"Erro no gather principal: {e}", "error")
 
 # ---------------- Flask health-check ----------------
 app = Flask(__name__)
@@ -681,15 +730,29 @@ def home():
 def run_flask():
     port = int(os.getenv("PORT", 10000))
     log(f"🔎 Flask HTTP health-check iniciado na porta {port}", "info")
-    app.run(host="0.0.0.0", port=port)
+    # use_reloader=False evita threads duplicadas quando em dev
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+# ---------------- Signal handlers (graceful shutdown) ----------------
+def _signal_handler(sig, frame):
+    global _shutdown
+    log(f"Recebido sinal {sig}, encerrando...", "info")
+    _shutdown = True
+    # deixar o asyncio loop parar naturalmente
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 # ---------------- STARTUP ----------------
 if __name__ == "__main__":
+    # start flask in background
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         log("Encerrando por KeyboardInterrupt.", "info")
     except Exception as e:
         log(f"Erro fatal no loop principal: {e}", "error")
+        sys.exit(1)
