@@ -1,5 +1,4 @@
-# deriv_telegram_bot.py
-# IndicadorTradingS1000 — versão com formatação corrigida para Python
+#Indicador Trading S1000
 
 import asyncio
 import websockets
