@@ -39,7 +39,6 @@ CHAT_ID = os.getenv("CHAT_ID")
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
-
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
 SIGNAL_ADVANCE_SECONDS = 3
@@ -55,16 +54,16 @@ DATA_DIR.mkdir(exist_ok=True)
 
 # ---------------- Parâmetros ----------------
 TRADE_MODE = os.getenv("TRADE_MODE", "FTT")
-BB_PROXIMITY_PCT = float(os.getenv("BB_PROXIMITY_PCT", "0.20"))
+BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
+BB_STD = float(os.getenv("BB_STD", "2"))
+
 RSI_BUY_MAX = int(os.getenv("RSI_BUY_MAX", "52"))
 RSI_SELL_MIN = int(os.getenv("RSI_SELL_MIN", "48"))
-MACD_TOLERANCE = float(os.getenv("MACD_TOLERANCE", "0.002"))
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_MID = int(os.getenv("EMA_MID", "20"))
 EMA_SLOW = int(os.getenv("EMA_SLOW", "50"))
 
 MIN_SECONDS_BETWEEN_SIGNALS = int(os.getenv("MIN_SECONDS_BETWEEN_SIGNALS", "0"))
-REL_EMA_SEP_PCT = float(os.getenv("REL_EMA_SEP_PCT", "5e-06"))
 
 ML_ENABLED = SKLEARN_AVAILABLE and os.getenv("ENABLE_ML", "1") != "0"
 ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "40"))
@@ -72,7 +71,6 @@ ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "4"))
 ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "200"))
 ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "2000"))
 ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
-ML_RETRAIN_INTERVAL = int(os.getenv("ML_RETRAIN_INTERVAL", "50"))
 
 INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT", "1200"))
 MAX_CANDLES = int(os.getenv("MAX_CANDLES", "300"))
@@ -107,7 +105,7 @@ def log(msg: str, level: str = "info"):
     else:
         logger.debug(msg)
 
-# ---------------- telegram utils ----------------
+# ---------------- Telegram ----------------
 def send_telegram(message: str, symbol: str = None, bypass_throttle: bool = False) -> bool:
     now_ts = time.time()
     if symbol and not bypass_throttle:
@@ -168,7 +166,7 @@ def ml_predict_prob(symbol: str, last_row: pd.Series) -> Optional[float]:
         if not ml_model_ready.get(symbol):
             return None
         model, cols = ml_models[symbol]
-        vals = [float(last_row.get(c,0.0)) for c in cols]
+        vals = [float(last_row.get(c, 0.0)) for c in cols]
         prob = model.predict_proba([vals])[0][1]
         return prob
     except Exception:
@@ -180,27 +178,35 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         return df
     df = df.copy().reset_index(drop=True)
     try:
+        # EMA
         df[f"ema{EMA_FAST}"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
         df[f"ema{EMA_MID}"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
         df[f"ema{EMA_SLOW}"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
+        # RSI
         df["rsi"] = RSIIndicator(df["close"], 14).rsi()
+        # MACD
         macd = MACD(df["close"])
         df["macd_diff"] = macd.macd_diff()
+        # Bollinger Bands
+        bb = BollingerBands(df["close"], window=BB_PERIOD, window_dev=BB_STD)
+        df["bb_upper"] = bb.bollinger_hband()
+        df["bb_lower"] = bb.bollinger_lband()
+        df["bb_mavg"] = bb.bollinger_mavg()
+        df["bb_width"] = df["bb_upper"] - df["bb_lower"]
     except Exception:
         pass
     return df
 
-#eração de sinal
+# ---------------- Geração de sinal ----------------
 def gerar_sinal(df: pd.DataFrame, symbol: str):
     try:
-        if df is None or len(df) < max(EMA_SLOW, 30):
+        if df is None or len(df) < max(EMA_SLOW, BB_PERIOD+1, 30):
             return None
 
         now = df.iloc[-1]
         epoch = int(now["epoch"])
         prev_epoch = last_epoch_seen[symbol]
         last_epoch_seen[symbol] = epoch
-
         if prev_epoch is None or epoch == prev_epoch:
             return None
 
@@ -215,8 +221,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
         triple_up = ema_fast > ema_mid > ema_slow
         triple_down = ema_fast < ema_mid < ema_slow
 
-        rsi_now = float(now["rsi"]) if not pd.isna(now.get("rsi")) else 50.0
-        macd_diff = now.get("macd_diff")
+        rsi_now = float(now["rsi"]) if not pd.isna(now["rsi"]) else 50.0
 
         buy_ok = triple_up and rsi_now <= RSI_BUY_MAX
         sell_ok = triple_down and rsi_now >= RSI_SELL_MIN
@@ -238,13 +243,14 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             wait_time = send_ts - nowt
             if wait_time > 0:
                 time.sleep(wait_time)
-
             entry_dt_utc = datetime.fromtimestamp(next_epoch, timezone.utc)
+
             msg = (
                 f"💱 <b>{symbol.replace('frx','')}</b> ({TRADE_MODE})\n"
                 f"📈 DIREÇÃO: <b>{tipo}</b>\n"
                 f"⏱ ENTRADA: <b>{convert_utc_to_brasilia(entry_dt_utc)}</b>\n"
-                f"🤖 ML: <b>{int(round((ml_prob or 0)*100))}%</b>"
+                f"🤖 ML: {int(round((ml_prob or 0)*100))}%\n"
+                f"📊 RSI: {rsi_now:.1f} | EMA F/M/S: {ema_fast:.5f}/{ema_mid:.5f}/{ema_slow:.5f}"
             )
             send_telegram(msg, symbol)
             last_signal_candle[symbol] = candle_id
@@ -256,6 +262,7 @@ def gerar_sinal(df: pd.DataFrame, symbol: str):
             args=(send_ts, symbol, tipo, next_epoch, ml_prob),
             daemon=True
         ).start()
+
         return {"tipo": tipo, "candle_id": candle_id}
     except Exception as e:
         log(f"{symbol} | erro gerar_sinal: {e}", "error")
@@ -271,6 +278,7 @@ async def monitor_symbol(symbol: str):
             connect_attempt += 1
             if connect_attempt > 1:
                 await asyncio.sleep(min(120,(2**connect_attempt))+random.random())
+
             async with websockets.connect(WS_URL, ping_interval=WS_PING_INTERVAL, ping_timeout=WS_PING_TIMEOUT) as ws:
                 log(f"{symbol} | WS conectado.", "info")
                 send_telegram(f"🔌 WS conectado: {symbol}", symbol, bypass_throttle=True)
@@ -279,8 +287,20 @@ async def monitor_symbol(symbol: str):
                     await ws.send(json.dumps({"authorize":DERIV_TOKEN}))
                     await ws.recv()
 
-                await ws.send(json.dumps({"ticks_history":symbol,"adjust_start_time":1,"count":INITIAL_HISTORY_COUNT,"end":"latest","style":"candles","granularity":GRANULARITY_SECONDS}))
-                await ws.send(json.dumps({"ticks_history":symbol,"subscribe":1,"style":"candles","granularity":GRANULARITY_SECONDS}))
+                await ws.send(json.dumps({
+                    "ticks_history":symbol,
+                    "adjust_start_time":1,
+                    "count":INITIAL_HISTORY_COUNT,
+                    "end":"latest",
+                    "style":"candles",
+                    "granularity":GRANULARITY_SECONDS
+                }))
+                await ws.send(json.dumps({
+                    "ticks_history":symbol,
+                    "subscribe":1,
+                    "style":"candles",
+                    "granularity":GRANULARITY_SECONDS
+                }))
 
                 while True:
                     raw = await ws.recv()
@@ -308,6 +328,8 @@ async def monitor_symbol(symbol: str):
                         if len(df) > MAX_CANDLES:
                             df = df.tail(MAX_CANDLES).reset_index(drop=True)
                         df = calcular_indicadores(df)
+
+                        # Train ML and generate signal
                         train_ml_for_symbol(df, symbol)
                         gerar_sinal(df, symbol)
 
