@@ -221,14 +221,14 @@ def avaliar_sinal(symbol: str):
     if last_signal_epoch[symbol] == epoch:
         return
     last_signal_epoch[symbol] = epoch
-    direction = "CALL" if buy else "PUT"
+    direction = "COMPRA" if buy else "VENDA"
     dt_brt = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
     msg = (
-        f"{symbol}\n"
-        f"{direction}\n"
+        f"📊 {symbol}\n"
+        f"🎯 {direction}\n"
         f"⏱ Entrada: {dt_brt.strftime('%H:%M:%S')} BRT\n"
-        f"ML: {ml_prob if ml_prob is not None else 'treinando'}\n"
-        f"RSI: {row['rsi']:.2f}"
+        f"🤖 ML: {ml_prob if ml_prob is not None else 'treinando'}\n"
+        f"📈 RSI: {row['rsi']:.2f}"
     )
     send_telegram(msg)
     log(f"{symbol} — sinal enviado {direction}", "info")
