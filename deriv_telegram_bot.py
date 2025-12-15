@@ -1,5 +1,5 @@
 # deriv_telegram_bot.py
-# IndicadorTradingS1000 — versão corrigida com logs, reconexão e controles
+# IndicadorTradingS1000 — versão corrigida com logs detalhados e controle de flood
 
 import asyncio
 import websockets
@@ -40,9 +40,9 @@ CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # minutos
 GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
 SIGNAL_ADVANCE_SECONDS = 3
 
-# Ping/Pong configurado
-WS_PING_INTERVAL = 30
-WS_PING_TIMEOUT  = 10
+# Ping/Pong configurado para 30s/10s
+WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
+WS_PING_TIMEOUT  = int(os.getenv("WS_PING_TIMEOUT", "10"))
 
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
@@ -54,10 +54,6 @@ SYMBOLS = [
 
 DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
-
-# ---------------- Variáveis adicionadas ----------------
-INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT", "1200"))
-MAX_CANDLES = int(os.getenv("MAX_CANDLES", "300"))
 
 # ---------------- Parâmetros Técnicos ----------------
 EMA_FAST = 9
@@ -77,6 +73,10 @@ ML_MAX_SAMPLES         = 2000
 ML_CONF_THRESHOLD      = 0.55
 ML_N_ESTIMATORS        = 40
 ML_MAX_DEPTH           = 4
+
+# ---------------- Histórico ----------------
+INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT", "1200"))
+MAX_CANDLES = int(os.getenv("MAX_CANDLES", "300"))
 
 # ---------------- Estado ----------------
 candles = {s: pd.DataFrame() for s in SYMBOLS}
@@ -121,7 +121,7 @@ def send_telegram(message: str):
         else:
             log(f"Telegram erro: {r.status_code} {r.text}", "error")
     except Exception as e:
-        log(f"Erro ao enviar mensagem via Telegram: {e}", "error")
+        log(f"Erro ao enviar Telegram: {e}", "error")
 
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
@@ -144,7 +144,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         df["bb_lower"] = bb.bollinger_lband()
         df["bb_mid"]   = bb.bollinger_mavg()
 
-        log(f"Indicadores calculados — última RSI {df['rsi'].iloc[-1]:.2f}", "info")
+        log(f"Indicadores calculados — RSI {df['rsi'].iloc[-1]:.2f}", "info")
     except Exception as e:
         log(f"Erro ao calcular indicadores: {e}", "error")
 
@@ -202,16 +202,8 @@ def avaliar_sinal(symbol: str):
 
     row = df.iloc[-1]
 
-    buy  = (
-        row["ema_fast"] > row["ema_mid"] and
-        row["rsi"] < RSI_BUY_MAX and
-        row["close"] <= row["bb_mid"]
-    )
-    sell = (
-        row["ema_fast"] < row["ema_mid"] and
-        row["rsi"] > RSI_SELL_MIN and
-        row["close"] >= row["bb_mid"]
-    )
+    buy  = (row["ema_fast"] > row["ema_mid"] and row["rsi"] < RSI_BUY_MAX and row["close"] <= row["bb_mid"])
+    sell = (row["ema_fast"] < row["ema_mid"] and row["rsi"] > RSI_SELL_MIN and row["close"] >= row["bb_mid"])
 
     if not buy and not sell:
         log(f"{symbol} — sem setup técnico", "info")
@@ -228,10 +220,8 @@ def avaliar_sinal(symbol: str):
 
     last_signal_epoch[symbol] = epoch
 
-    dt_utc = datetime.utcfromtimestamp(epoch)
-    dt_brt = dt_utc - timedelta(hours=3)
-
     direction = "CALL" if buy else "PUT"
+    dt_brt = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
     msg = (
         f"📊 <b>{symbol}</b>\n"
         f"🎯 {direction}\n"
@@ -254,7 +244,6 @@ async def ws_loop(symbol: str):
                 ping_interval=WS_PING_INTERVAL,
                 ping_timeout=WS_PING_TIMEOUT
             ) as ws:
-
                 if symbol not in ws_notified:
                     send_telegram(f"🔌 WS conectado: {symbol}")
                     ws_notified.add(symbol)
@@ -272,7 +261,6 @@ async def ws_loop(symbol: str):
 
                 async for raw in ws:
                     data = json.loads(raw)
-
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         candles[symbol] = calcular_indicadores(df)
@@ -299,7 +287,7 @@ def run_flask():
 
 # ---------------- MAIN ----------------
 async def main():
-    send_telegram("🚀 BOT INICIADO — conexões corretas")
+    send_telegram("🚀 BOT INICIADO — conexões estabilizadas")
     await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
 
 if __name__ == "__main__":
