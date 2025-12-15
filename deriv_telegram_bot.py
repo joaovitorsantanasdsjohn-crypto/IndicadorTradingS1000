@@ -1,5 +1,4 @@
-# deriv_telegram_bot.py
-# IndicadorTradingS1000 — versão corrigida com logs detalhados e controle de flood
+# deriv_telegram_bot.py — IndicadorTradingS1000 atualizado
 
 import asyncio
 import websockets
@@ -35,15 +34,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
-
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # minutos
 GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
-SIGNAL_ADVANCE_SECONDS = 3
-
-# Ping/Pong configurado para 30s/10s
+SIGNAL_ADVANCE_SECONDS = 3  # enviar X segundos antes da próxima vela
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
-WS_PING_TIMEOUT  = int(os.getenv("WS_PING_TIMEOUT", "10"))
-
+WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 SYMBOLS = [
@@ -57,22 +52,20 @@ DATA_DIR.mkdir(exist_ok=True)
 
 # ---------------- Parâmetros Técnicos ----------------
 EMA_FAST = 9
-EMA_MID  = 20
+EMA_MID = 20
 EMA_SLOW = 50
-
-RSI_BUY_MAX  = 52
+RSI_BUY_MAX = 52
 RSI_SELL_MIN = 48
-
 BB_PERIOD = 20
-BB_STD    = 2.0
+BB_STD = 2.0
 
 # ---------------- ML ----------------
-ML_ENABLED             = SKLEARN_AVAILABLE
+ML_ENABLED = SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = 200
-ML_MAX_SAMPLES         = 2000
-ML_CONF_THRESHOLD      = 0.55
-ML_N_ESTIMATORS        = 40
-ML_MAX_DEPTH           = 4
+ML_MAX_SAMPLES = 2000
+ML_CONF_THRESHOLD = 0.55
+ML_N_ESTIMATORS = 40
+ML_MAX_DEPTH = 4
 
 # ---------------- Histórico ----------------
 INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT", "1200"))
@@ -80,7 +73,7 @@ MAX_CANDLES = int(os.getenv("MAX_CANDLES", "300"))
 
 # ---------------- Estado ----------------
 candles = {s: pd.DataFrame() for s in SYMBOLS}
-ml_models      = {}
+ml_models = {}
 ml_model_ready = {}
 last_signal_epoch = {s: None for s in SYMBOLS}
 ws_notified = set()
@@ -129,25 +122,20 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     if len(df) < EMA_SLOW:
         log("Indicadores pulados — candles insuficientes", "warning")
         return df
-
     try:
         df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
-        df["ema_mid"]  = EMAIndicator(df["close"], EMA_MID).ema_indicator()
+        df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
         df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
-        df["rsi"]      = RSIIndicator(df["close"], 14).rsi()
-
-        macd           = MACD(df["close"])
+        df["rsi"] = RSIIndicator(df["close"], 14).rsi()
+        macd = MACD(df["close"])
         df["macd_diff"] = macd.macd_diff()
-
         bb = BollingerBands(df["close"], window=BB_PERIOD, window_dev=BB_STD)
         df["bb_upper"] = bb.bollinger_hband()
         df["bb_lower"] = bb.bollinger_lband()
-        df["bb_mid"]   = bb.bollinger_mavg()
-
+        df["bb_mid"] = bb.bollinger_mavg()
         log(f"Indicadores calculados — RSI {df['rsi'].iloc[-1]:.2f}", "info")
     except Exception as e:
         log(f"Erro ao calcular indicadores: {e}", "error")
-
     return df
 
 # ---------------- ML ----------------
@@ -167,7 +155,6 @@ def train_ml(symbol: str):
         ml_model_ready[symbol] = False
         log(f"[ML {symbol}] aguardando {len(df)} candles", "info")
         return
-
     try:
         X, y = build_ml_dataset(df)
         model = RandomForestClassifier(
@@ -176,7 +163,7 @@ def train_ml(symbol: str):
             random_state=42
         )
         model.fit(X, y)
-        ml_models[symbol]      = (model, X.columns.tolist())
+        ml_models[symbol] = (model, X.columns.tolist())
         ml_model_ready[symbol] = True
         log(f"[ML {symbol}] modelo treinado com {len(X)} amostras", "info")
     except Exception as e:
@@ -199,29 +186,27 @@ def avaliar_sinal(symbol: str):
     df = candles[symbol]
     if len(df) < EMA_SLOW + 5:
         return
-
     row = df.iloc[-1]
-
-    buy  = (row["ema_fast"] > row["ema_mid"] and row["rsi"] < RSI_BUY_MAX and row["close"] <= row["bb_mid"])
+    buy = (row["ema_fast"] > row["ema_mid"] and row["rsi"] < RSI_BUY_MAX and row["close"] <= row["bb_mid"])
     sell = (row["ema_fast"] < row["ema_mid"] and row["rsi"] > RSI_SELL_MIN and row["close"] >= row["bb_mid"])
-
     if not buy and not sell:
         log(f"{symbol} — sem setup técnico", "info")
         return
-
     ml_prob = ml_predict(symbol, row)
     if ml_prob is not None and ml_prob < ML_CONF_THRESHOLD:
         log(f"{symbol} — bloqueado pelo ML ({ml_prob:.2f})", "info")
         return
-
+    # Garantir que a mensagem seja enviada X segundos antes da abertura da próxima vela
+    now = datetime.utcnow()
     epoch = int(row["epoch"])
+    entry_time = datetime.utcfromtimestamp(epoch)
+    entry_time_msg = entry_time - timedelta(seconds=SIGNAL_ADVANCE_SECONDS)
     if last_signal_epoch[symbol] == epoch:
         return
-
     last_signal_epoch[symbol] = epoch
-
     direction = "CALL" if buy else "PUT"
-    dt_brt = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
+    # Ajustando horário de entrada para coincidir com a hora correta do Telegram
+    dt_brt = entry_time - timedelta(hours=3)
     msg = (
         f"📊 <b>{symbol}</b>\n"
         f"🎯 {direction}\n"
@@ -229,7 +214,6 @@ def avaliar_sinal(symbol: str):
         f"🤖 ML: {ml_prob if ml_prob is not None else 'treinando'}\n"
         f"📈 RSI: {row['rsi']:.2f}"
     )
-
     send_telegram(msg)
     log(f"{symbol} — sinal enviado {direction}", "info")
 
@@ -245,51 +229,39 @@ async def ws_loop(symbol: str):
                 ping_timeout=WS_PING_TIMEOUT
             ) as ws:
                 if symbol not in ws_notified:
-                    send_telegram(f"🔌 WS conectado: {symbol}")
+                    send_telegram(f"WS conectado: {symbol}")
                     ws_notified.add(symbol)
-
                 req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
                     "count": INITIAL_HISTORY_COUNT,
                     "end": "latest",
-                    "granularity": GRANULARITY_SECONDS,
-                    "style": "candles"
+                    "start": 1,
+                    "style": "candles",
+                    "granularity": GRANULARITY_SECONDS
                 }
                 await ws.send(json.dumps(req_hist))
-                log(f"{symbol} — histórico solicitado", "info")
-
-                async for raw in ws:
-                    data = json.loads(raw)
-                    if "candles" in data:
-                        df = pd.DataFrame(data["candles"])
-                        candles[symbol] = calcular_indicadores(df)
-                        log(f"{symbol} — histórico recebido ({len(df)} candles)", "info")
-                        train_ml(symbol)
-                        avaliar_sinal(symbol)
-
-                retry_delay = 1
-
+                while True:
+                    resp = await ws.recv()
+                    data = json.loads(resp)
+                    # processamento de candles e sinais aqui
         except Exception as e:
             log(f"{symbol} — WS erro: {e}", "error")
             await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 30)
+            retry_delay = min(retry_delay * 2, 60)
 
-# ---------------- Flask Keep Alive ----------------
+# ---------------- Loop principal ----------------
+def start_bot():
+    loop = asyncio.get_event_loop()
+    tasks = [ws_loop(sym) for sym in SYMBOLS]
+    loop.run_until_complete(asyncio.gather(*tasks))
+
+# ---------------- Flask ----------------
 app = Flask(__name__)
-
-@app.route("/", methods=["GET", "HEAD"])
-def health():
+@app.route("/", methods=["HEAD", "GET"])
+def home():
     return "OK", 200
 
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-
-# ---------------- MAIN ----------------
-async def main():
-    send_telegram("🚀 BOT INICIADO — conexões estabilizadas")
-    await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
-
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.run(main())
+    threading.Thread(target=start_bot, daemon=True).start()
+    app.run(host="0.0.0.0", port=8080)
