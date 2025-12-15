@@ -1,5 +1,5 @@
 # deriv_telegram_bot.py
-# IndicadorTradingS1000 — versão com logs detalhados
+# IndicadorTradingS1000 — versão corrigida com logs, reconexão e controles
 
 import asyncio
 import websockets
@@ -40,7 +40,7 @@ CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))  # minutos
 GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
 SIGNAL_ADVANCE_SECONDS = 3
 
-# Ping/Pong agressivo para melhor manter conexão
+# Ping/Pong configurado
 WS_PING_INTERVAL = 30
 WS_PING_TIMEOUT  = 10
 
@@ -55,6 +55,10 @@ SYMBOLS = [
 DATA_DIR = Path("./candles_data")
 DATA_DIR.mkdir(exist_ok=True)
 
+# ---------------- Variáveis adicionadas ----------------
+INITIAL_HISTORY_COUNT = int(os.getenv("INITIAL_HISTORY_COUNT", "1200"))
+MAX_CANDLES = int(os.getenv("MAX_CANDLES", "300"))
+
 # ---------------- Parâmetros Técnicos ----------------
 EMA_FAST = 9
 EMA_MID  = 20
@@ -64,7 +68,7 @@ RSI_BUY_MAX  = 52
 RSI_SELL_MIN = 48
 
 BB_PERIOD = 20
-BB_STD    = 2
+BB_STD    = 2.0
 
 # ---------------- ML ----------------
 ML_ENABLED             = SKLEARN_AVAILABLE
@@ -76,24 +80,22 @@ ML_MAX_DEPTH           = 4
 
 # ---------------- Estado ----------------
 candles = {s: pd.DataFrame() for s in SYMBOLS}
-ml_models       = {}
-ml_model_ready  = {}
+ml_models      = {}
+ml_model_ready = {}
 last_signal_epoch = {s: None for s in SYMBOLS}
-last_signal_time  = {s: 0 for s in SYMBOLS}
+ws_notified = set()
 
 # ---------------- Logging ----------------
 logger = logging.getLogger("IndicadorTradingS1000")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
-formatter = logging.Formatter(
-    "%(asctime)s UTC | %(levelname)s | %(message)s"
-)
+formatter = logging.Formatter("%(asctime)s UTC | %(levelname)s | %(message)s")
 handler.setFormatter(formatter)
 logger.handlers.clear()
 logger.addHandler(handler)
 
 def log(msg: str, level: str = "info"):
-    brt = (datetime.utcnow() + timedelta(hours=-3)).strftime("%Y-%m-%d %H:%M:%S BRT")
+    brt = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S BRT")
     utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     full = f"{utc} | {brt} | {msg}"
     if level == "info":
@@ -108,22 +110,18 @@ def log(msg: str, level: str = "info"):
 # ---------------- Telegram ----------------
 def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        log("Telegram não configurado", "warning")
+        log("Telegram não configurado — mensagem não enviada", "warning")
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }
+        payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
         r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            log(f"Telegram envio falhou: {r.text}", "error")
+        if r.status_code == 200:
+            log(f"Telegram mensagem enviada", "info")
         else:
-            log("Telegram mensagem enviada", "info")
+            log(f"Telegram erro: {r.status_code} {r.text}", "error")
     except Exception as e:
-        log(f"Erro ao enviar Telegram: {e}", "error")
+        log(f"Erro ao enviar mensagem via Telegram: {e}", "error")
 
 # ---------------- Indicadores ----------------
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
@@ -137,6 +135,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         df["ema_mid"]  = EMAIndicator(df["close"], EMA_MID).ema_indicator()
         df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
         df["rsi"]      = RSIIndicator(df["close"], 14).rsi()
+
         macd           = MACD(df["close"])
         df["macd_diff"] = macd.macd_diff()
 
@@ -166,7 +165,7 @@ def train_ml(symbol: str):
     df = candles[symbol]
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         ml_model_ready[symbol] = False
-        log(f"[ML {symbol}] aguardando candles para treinar ({len(df)})", "info")
+        log(f"[ML {symbol}] aguardando {len(df)} candles", "info")
         return
 
     try:
@@ -179,7 +178,7 @@ def train_ml(symbol: str):
         model.fit(X, y)
         ml_models[symbol]      = (model, X.columns.tolist())
         ml_model_ready[symbol] = True
-        log(f"[ML {symbol}] treinado com {len(X)} amostras", "info")
+        log(f"[ML {symbol}] modelo treinado com {len(X)} amostras", "info")
     except Exception as e:
         ml_model_ready[symbol] = False
         log(f"[ML {symbol}] erro no treino: {e}", "error")
@@ -203,7 +202,7 @@ def avaliar_sinal(symbol: str):
 
     row = df.iloc[-1]
 
-    buy = (
+    buy  = (
         row["ema_fast"] > row["ema_mid"] and
         row["rsi"] < RSI_BUY_MAX and
         row["close"] <= row["bb_mid"]
@@ -213,36 +212,40 @@ def avaliar_sinal(symbol: str):
         row["rsi"] > RSI_SELL_MIN and
         row["close"] >= row["bb_mid"]
     )
+
     if not buy and not sell:
         log(f"{symbol} — sem setup técnico", "info")
         return
 
     ml_prob = ml_predict(symbol, row)
     if ml_prob is not None and ml_prob < ML_CONF_THRESHOLD:
-        log(f"{symbol} — sinal bloqueado pelo ML ({ml_prob:.2f})", "info")
+        log(f"{symbol} — bloqueado pelo ML ({ml_prob:.2f})", "info")
         return
 
-    direction = "CALL" if buy else "PUT"
-    epoch    = int(row["epoch"])
+    epoch = int(row["epoch"])
     if last_signal_epoch[symbol] == epoch:
         return
 
     last_signal_epoch[symbol] = epoch
 
     dt_utc = datetime.utcfromtimestamp(epoch)
-    dt_brt = dt_utc + timedelta(hours=-3)
+    dt_brt = dt_utc - timedelta(hours=3)
+
+    direction = "CALL" if buy else "PUT"
     msg = (
         f"📊 <b>{symbol}</b>\n"
-        f"🎯 Direção: {direction}\n"
+        f"🎯 {direction}\n"
         f"⏱ Entrada: {dt_brt.strftime('%H:%M:%S')} BRT\n"
-        f"🤖 ML: {ml_prob if ml_prob is not None else 'N/A'}\n"
+        f"🤖 ML: {ml_prob if ml_prob is not None else 'treinando'}\n"
         f"📈 RSI: {row['rsi']:.2f}"
     )
+
     send_telegram(msg)
     log(f"{symbol} — sinal enviado {direction}", "info")
 
 # ---------------- WebSocket ----------------
 async def ws_loop(symbol: str):
+    retry_delay = 1
     while True:
         try:
             log(f"{symbol} — conectando WS...", "info")
@@ -251,8 +254,10 @@ async def ws_loop(symbol: str):
                 ping_interval=WS_PING_INTERVAL,
                 ping_timeout=WS_PING_TIMEOUT
             ) as ws:
-                log(f"{symbol} — WS conectado", "info")
-                send_telegram(f"🔌 WS conectado: {symbol}")
+
+                if symbol not in ws_notified:
+                    send_telegram(f"🔌 WS conectado: {symbol}")
+                    ws_notified.add(symbol)
 
                 req_hist = {
                     "ticks_history": symbol,
@@ -265,27 +270,28 @@ async def ws_loop(symbol: str):
                 await ws.send(json.dumps(req_hist))
                 log(f"{symbol} — histórico solicitado", "info")
 
-                while True:
-                    raw = await ws.recv()
+                async for raw in ws:
                     data = json.loads(raw)
 
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         candles[symbol] = calcular_indicadores(df)
-                        log(f"{symbol} — histórico recebido ({len(df)})", "info")
+                        log(f"{symbol} — histórico recebido ({len(df)} candles)", "info")
                         train_ml(symbol)
                         avaliar_sinal(symbol)
-                    await asyncio.sleep(0)
+
+                retry_delay = 1
 
         except Exception as e:
             log(f"{symbol} — WS erro: {e}", "error")
-            await asyncio.sleep(5)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 30)
 
 # ---------------- Flask Keep Alive ----------------
 app = Flask(__name__)
 
 @app.route("/", methods=["GET", "HEAD"])
-def home():
+def health():
     return "OK", 200
 
 def run_flask():
@@ -293,7 +299,7 @@ def run_flask():
 
 # ---------------- MAIN ----------------
 async def main():
-    send_telegram("🚀 BOT INICIADO — logs detalhados ativados")
+    send_telegram("🚀 BOT INICIADO — conexões corretas")
     await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
 
 if __name__ == "__main__":
