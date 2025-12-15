@@ -1,6 +1,3 @@
-# deriv_telegram_bot.py
-# IndicadorTradingS1000 — versão corrigida com logs detalhados e controle de flood
-
 import asyncio
 import websockets
 import json
