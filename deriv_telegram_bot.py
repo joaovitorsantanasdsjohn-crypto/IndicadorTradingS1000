@@ -284,7 +284,7 @@ def run_flask():
 # ---------------- MAIN ----------------
 
 async def main():
-    send_telegram("BOT INICIADO — conexões estabilizadas")
+    send_telegram("🚀 BOT INICIADO — conexões estabilizadas")
     await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
 
 if __name__ == "__main__":
