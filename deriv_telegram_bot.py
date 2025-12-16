@@ -218,28 +218,25 @@ def avaliar_sinal(symbol: str):
         log(f"{symbol} — bloqueado pelo ML ({ml_prob:.2f})", "info")
         return
     epoch = int(row["epoch"])
-if last_signal_epoch[symbol] == epoch:
-    return
-last_signal_epoch[symbol] = epoch
+    if last_signal_epoch[symbol] == epoch:
+        return
+    last_signal_epoch[symbol] = epoch
 
-direction = "COMPRA" if buy else "VENDA"
+    direction = "COMPRA" if buy else "VENDA"
 
-# Horário base da vela (UTC -> BRT)
-dt_brt = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
+    dt_brt = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
+    dt_brt += timedelta(seconds=SIGNAL_ADVANCE_SECONDS)
 
-# Envio exatamente X segundos antes da abertura da próxima vela
-dt_brt += timedelta(seconds=SIGNAL_ADVANCE_SECONDS)
+    msg = (
+        f"📊 <b>{symbol}</b>\n"
+        f"🎯 <b>{direction}</b>\n"
+        f"⏱ <b>Entrada:</b> {dt_brt.strftime('%H:%M:%S')} BRT\n"
+        f"🤖 <b>ML:</b> {ml_prob:.2f if ml_prob is not None else 'treinando'}\n"
+        f"📈 <b>RSI:</b> {row['rsi']:.2f}"
+    )
 
-msg = (
-    f"📊 <b>{symbol}</b>\n"
-    f"🎯 <b>{direction}</b>\n"
-    f"⏱ <b>Entrada:</b> {dt_brt.strftime('%H:%M:%S')} BRT\n"
-    f"🤖 <b>ML:</b> {ml_prob:.2f if ml_prob is not None else 'treinando'}\n"
-    f"📈 <b>RSI:</b> {row['rsi']:.2f}"
-)
-
-send_telegram(msg)
-log(f"{symbol} — sinal enviado {direction}", "info")
+    send_telegram(msg)
+    log(f"{symbol} — sinal enviado {direction}", "info")
 
 # ---------------- WebSocket ----------------
 
