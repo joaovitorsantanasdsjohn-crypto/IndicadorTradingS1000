@@ -224,7 +224,7 @@ def avaliar_sinal(symbol: str):
     direction = "COMPRA" if buy else "VENDA"
     dt_brt = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
     msg = (
-        f"📊 {symbol}\n"
+        f"📊 <b>{symbol}</b>\n"
         f"🎯 {direction}\n"
         f"⏱ Entrada: {dt_brt.strftime('%H:%M:%S')} BRT\n"
         f"🤖 ML: {ml_prob if ml_prob is not None else 'treinando'}\n"
