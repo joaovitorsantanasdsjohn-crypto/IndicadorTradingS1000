@@ -222,7 +222,8 @@ def avaliar_sinal(symbol: str):
         return
     last_signal_epoch[symbol] = epoch
     direction = "COMPRA" if buy else "VENDA"
-    dt_brt = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
+    # 🔒 Horário da entrada = horário real do envio da mensagem
+dt_brt = datetime.now(timezone.utc) - timedelta(hours=3)
     msg = (
         f"📊 <b>{symbol}</b>\n"
         f"🎯 {direction}\n"
