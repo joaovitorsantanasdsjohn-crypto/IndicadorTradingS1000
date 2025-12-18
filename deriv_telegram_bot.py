@@ -41,7 +41,7 @@ APP_ID = os.getenv("DERIV_APP_ID", "111022")
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))
 GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
 
-SIGNAL_ADVANCE_MINUTES = 5  # <<< AJUSTE
+SIGNAL_ADVANCE_MINUTES = 5
 
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
@@ -127,6 +127,8 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
     df["bb_mid"] = bb.bollinger_mavg()
+    df["bb_upper"] = bb.bollinger_hband()   # <<< ADICIONADO
+    df["bb_lower"] = bb.bollinger_lband()   # <<< ADICIONADO
 
     return df
 
