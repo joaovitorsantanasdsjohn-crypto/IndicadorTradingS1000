@@ -57,13 +57,13 @@ SYMBOLS = [
 
 EMA_FAST = 9
 EMA_MID = 21
-EMA_SLOW = 100
+EMA_SLOW = 55
 
-RSI_BUY_MAX = 40
-RSI_SELL_MIN = 60
+RSI_BUY_MAX = 45
+RSI_SELL_MIN = 55
 
 BB_PERIOD = 20
-BB_STD = 2.5
+BB_STD = 2.0
 
 # ---------------- ML ----------------
 
