@@ -7,6 +7,7 @@ import pandas as pd
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import BollingerBands
+from ta.volume import MFIIndicator   # <<< ADICIONADO
 import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -64,6 +65,8 @@ RSI_SELL_MIN = 60
 
 BB_PERIOD = 20
 BB_STD = 2.5
+
+MFI_PERIOD = 14   # <<< ADICIONADO (configurável)
 
 # ---------------- ML ----------------
 
@@ -127,8 +130,21 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
     df["bb_mid"] = bb.bollinger_mavg()
-    df["bb_upper"] = bb.bollinger_hband()   # <<< ADICIONADO
-    df["bb_lower"] = bb.bollinger_lband()   # <<< ADICIONADO
+    df["bb_upper"] = bb.bollinger_hband()
+    df["bb_lower"] = bb.bollinger_lband()
+
+    # ---------------- MFI (somente CONTEXTO) ----------------
+    if "volume" not in df.columns:
+        df["volume"] = 1  # <<< Volume neutro para Forex (não bloqueia nada)
+
+    df["mfi"] = MFIIndicator(
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        volume=df["volume"],
+        window=MFI_PERIOD
+    ).money_flow_index()
+    # --------------------------------------------------------
 
     return df
 
@@ -172,7 +188,6 @@ def avaliar_sinal(symbol: str):
 
     row = df.iloc[-1]
 
-    # Direção apenas como CONTEXTO
     direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
     ml_prob = ml_predict(symbol, row)
