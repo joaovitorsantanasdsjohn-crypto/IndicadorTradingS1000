@@ -64,7 +64,7 @@ RSI_BUY_MAX = 40
 RSI_SELL_MIN = 60
 
 BB_PERIOD = 20
-BB_STD = 2.5
+BB_STD = 2.0
 
 MFI_PERIOD = 14   # <<< ADICIONADO (configurável)
 
