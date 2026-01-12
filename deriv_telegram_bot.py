@@ -48,6 +48,10 @@ WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
+# <<< ADICIONADO: watchdog para reconectar se WS ficar "mudo"
+WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "120"))
+# (120s = 2 minutos sem candles => reconecta)
+
 SYMBOLS = [
     "frxEURUSD","frxUSDJPY","frxGBPUSD","frxUSDCHF","frxAUDUSD",
     "frxUSDCAD","frxNZDUSD","frxEURJPY","frxGBPJPY","frxEURGBP",
@@ -219,11 +223,15 @@ def avaliar_sinal(symbol: str):
 async def ws_loop(symbol: str):
     while True:
         try:
+            log(f"{symbol} WS conectando...", "info")  # <<< ADICIONADO
+
             async with websockets.connect(
                 WS_URL,
                 ping_interval=WS_PING_INTERVAL,
                 ping_timeout=WS_PING_TIMEOUT
             ) as ws:
+
+                log(f"{symbol} WS conectado ✅", "info")  # <<< ADICIONADO
 
                 req_hist = {
                     "ticks_history": symbol,
@@ -234,8 +242,26 @@ async def ws_loop(symbol: str):
                     "style": "candles"
                 }
                 await ws.send(json.dumps(req_hist))
+                log(f"{symbol} Histórico solicitado 📥", "info")  # <<< ADICIONADO
 
-                async for raw in ws:
+                # <<< ADICIONADO: loop com timeout para não travar em silêncio
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(
+                            ws.recv(),
+                            timeout=WS_CANDLE_TIMEOUT_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        log(
+                            f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁",
+                            "warning"
+                        )
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        break  # sai do while True interno e volta pro while True externo (reconecta)
+
                     data = json.loads(raw)
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
