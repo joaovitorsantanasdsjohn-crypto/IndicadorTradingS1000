@@ -223,7 +223,7 @@ def avaliar_sinal(symbol: str):
 async def ws_loop(symbol: str):
     while True:
         try:
-            log(f"{symbol} WS conectando...", "info")  # <<< ADICIONADO
+            log(f"{symbol} WS conectando...", "info")
 
             async with websockets.connect(
                 WS_URL,
@@ -231,7 +231,7 @@ async def ws_loop(symbol: str):
                 ping_timeout=WS_PING_TIMEOUT
             ) as ws:
 
-                log(f"{symbol} WS conectado ✅", "info")  # <<< ADICIONADO
+                log(f"{symbol} WS conectado ✅", "info")
 
                 req_hist = {
                     "ticks_history": symbol,
@@ -239,12 +239,13 @@ async def ws_loop(symbol: str):
                     "count": 1200,
                     "end": "latest",
                     "granularity": GRANULARITY_SECONDS,
-                    "style": "candles"
+                    "style": "candles",
+                    "subscribe": 1  # <<< ADICIONADO (stream contínuo de candles)
                 }
                 await ws.send(json.dumps(req_hist))
-                log(f"{symbol} Histórico solicitado 📥", "info")  # <<< ADICIONADO
+                log(f"{symbol} Histórico solicitado 📥", "info")
 
-                # <<< ADICIONADO: loop com timeout para não travar em silêncio
+                # loop com timeout para não travar em silêncio
                 while True:
                     try:
                         raw = await asyncio.wait_for(
@@ -260,7 +261,7 @@ async def ws_loop(symbol: str):
                             await ws.close()
                         except Exception:
                             pass
-                        break  # sai do while True interno e volta pro while True externo (reconecta)
+                        break  # reconecta
 
                     data = json.loads(raw)
                     if "candles" in data:
