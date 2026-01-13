@@ -89,6 +89,9 @@ ml_model_ready = {}
 last_signal_epoch = {s: None for s in SYMBOLS}
 ws_notified = set()
 
+# <<< ADICIONADO: controla treino por candle fechado (evita re-treino repetido)
+last_trained_epoch = {s: None for s in SYMBOLS}
+
 # ---------------- Logging ----------------
 
 logger = logging.getLogger("IndicadorTradingS1000")
@@ -267,8 +270,18 @@ async def ws_loop(symbol: str):
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         candles[symbol] = calcular_indicadores(df)
-                        train_ml(symbol)
-                        avaliar_sinal(symbol)
+
+                        # <<< ADICIONADO: treinar SOMENTE quando fechar candle novo
+                        try:
+                            current_epoch = int(candles[symbol].iloc[-1]["epoch"])
+                        except Exception:
+                            continue
+
+                        if last_trained_epoch[symbol] != current_epoch:
+                            last_trained_epoch[symbol] = current_epoch
+                            train_ml(symbol)
+                            avaliar_sinal(symbol)
+                        # Se não mudou o epoch, ignora (evita re-treino)
 
         except Exception as e:
             log(f"{symbol} WS erro: {e}", "error")
