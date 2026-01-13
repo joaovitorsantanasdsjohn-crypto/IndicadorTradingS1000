@@ -49,7 +49,7 @@ WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 # <<< ADICIONADO: watchdog para reconectar se WS ficar "mudo"
-WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "120"))
+WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "300"))
 # (120s = 2 minutos sem candles => reconecta)
 
 SYMBOLS = [
