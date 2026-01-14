@@ -50,7 +50,7 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 # <<< ADICIONADO: watchdog para reconectar se WS ficar "mudo"
 WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "300"))
-# (120s = 2 minutos sem candles => reconecta)
+# (300s = 5 minutos sem candles => reconecta)
 
 SYMBOLS = [
     "frxEURUSD","frxUSDJPY","frxGBPUSD","frxUSDCHF","frxAUDUSD",
@@ -267,9 +267,35 @@ async def ws_loop(symbol: str):
                         break  # reconecta
 
                     data = json.loads(raw)
+
                     if "candles" in data:
-                        df = pd.DataFrame(data["candles"])
-                        candles[symbol] = calcular_indicadores(df)
+                        df_new = pd.DataFrame(data["candles"])
+                        if df_new.empty:
+                            continue
+
+                        # ---------- CORREÇÃO CRÍTICA ----------
+                        # Em modo subscribe, o Deriv pode mandar 1 candle só.
+                        # Se você substituir candles[symbol] por df_new, você perde o histórico
+                        # e o ML fica sem dados. Então aqui a gente ACUMULA candles.
+                        try:
+                            df_new["epoch"] = df_new["epoch"].astype(int)
+                        except Exception:
+                            pass
+
+                        if candles[symbol].empty:
+                            df_full = df_new
+                        else:
+                            df_full = pd.concat([candles[symbol], df_new], ignore_index=True)
+
+                        # remove duplicados por epoch (caso Deriv reenvie candle)
+                        if "epoch" in df_full.columns:
+                            df_full = df_full.drop_duplicates(subset=["epoch"], keep="last")
+
+                        # mantém só os últimos 1200 candles (histórico saudável)
+                        df_full = df_full.tail(1200).reset_index(drop=True)
+
+                        candles[symbol] = calcular_indicadores(df_full)
+                        # -------------------------------------
 
                         # <<< ADICIONADO: treinar SOMENTE quando fechar candle novo
                         try:
