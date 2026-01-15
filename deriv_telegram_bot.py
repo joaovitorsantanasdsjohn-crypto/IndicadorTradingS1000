@@ -48,9 +48,8 @@ WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# <<< ADICIONADO: watchdog para reconectar se WS ficar "mudo"
+# <<< watchdog para reconectar se WS ficar "mudo"
 WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "300"))
-# (120s = 2 minutos sem candles => reconecta)
 
 SYMBOLS = [
     "frxEURUSD","frxUSDJPY","frxGBPUSD","frxUSDCHF","frxAUDUSD",
@@ -87,9 +86,8 @@ candles = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models = {}
 ml_model_ready = {}
 last_signal_epoch = {s: None for s in SYMBOLS}
-ws_notified = set()
 
-# <<< ADICIONADO: controla treino por candle fechado (evita re-treino repetido)
+# controla treino/avaliação só por candle novo
 last_trained_epoch = {s: None for s in SYMBOLS}
 
 # ---------------- Logging ----------------
@@ -169,6 +167,7 @@ def train_ml(symbol: str):
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         ml_model_ready[symbol] = False
         return
+
     X, y = build_ml_dataset(df)
     model = RandomForestClassifier(
         n_estimators=ML_N_ESTIMATORS,
@@ -176,6 +175,7 @@ def train_ml(symbol: str):
         random_state=42
     )
     model.fit(X, y)
+
     ml_models[symbol] = (model, X.columns.tolist())
     ml_model_ready[symbol] = True
 
@@ -195,6 +195,7 @@ def avaliar_sinal(symbol: str):
 
     row = df.iloc[-1]
 
+    # direção é apenas contexto
     direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
     ml_prob = ml_predict(symbol, row)
@@ -241,14 +242,13 @@ async def ws_loop(symbol: str):
                     "adjust_start_time": 1,
                     "count": 1200,
                     "end": "latest",
-                    "granularity": GRANULARITY_SECONDS,  # ✅ CORRIGIDO
+                    "granularity": GRANULARITY_SECONDS,  # ✅ LIMPO E CORRETO
                     "style": "candles",
-                    "subscribe": 1  # <<< ADICIONADO (stream contínuo de candles)
+                    "subscribe": 1
                 }
                 await ws.send(json.dumps(req_hist))
                 log(f"{symbol} Histórico solicitado 📥", "info")
 
-                # loop com timeout para não travar em silêncio
                 while True:
                     try:
                         raw = await asyncio.wait_for(
@@ -264,14 +264,13 @@ async def ws_loop(symbol: str):
                             await ws.close()
                         except Exception:
                             pass
-                        break  # reconecta
+                        break
 
                     data = json.loads(raw)
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         candles[symbol] = calcular_indicadores(df)
 
-                        # <<< ADICIONADO: treinar SOMENTE quando fechar candle novo
                         try:
                             current_epoch = int(candles[symbol].iloc[-1]["epoch"])
                         except Exception:
@@ -281,7 +280,6 @@ async def ws_loop(symbol: str):
                             last_trained_epoch[symbol] = current_epoch
                             train_ml(symbol)
                             avaliar_sinal(symbol)
-                        # Se não mudou o epoch, ignora (evita re-treino)
 
         except Exception as e:
             log(f"{symbol} WS erro: {e}", "error")
