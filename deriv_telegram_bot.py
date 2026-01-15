@@ -237,18 +237,54 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
+                # =========================================================
+                # 1) HISTÓRICO: ticks_history (SOMENTE HISTÓRICO, sem subscribe)
+                # =========================================================
                 req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
                     "count": 1200,
                     "end": "latest",
-                    "granularity": GRANULARITY_SECONDS,  # ✅ LIMPO E CORRETO
-                    "style": "candles",
-                    "subscribe": 1
+                    "granularity": GRANULARITY_SECONDS,
+                    "style": "candles"
                 }
                 await ws.send(json.dumps(req_hist))
                 log(f"{symbol} Histórico solicitado 📥", "info")
 
+                # recebe 1 pacote de histórico e aplica no dataset
+                hist_received = False
+                while not hist_received:
+                    raw = await ws.recv()
+                    data = json.loads(raw)
+                    if "candles" in data:
+                        df = pd.DataFrame(data["candles"])
+                        candles[symbol] = calcular_indicadores(df)
+
+                        # treina 1 vez após histórico
+                        try:
+                            current_epoch = int(candles[symbol].iloc[-1]["epoch"])
+                        except Exception:
+                            current_epoch = None
+
+                        if current_epoch is not None:
+                            last_trained_epoch[symbol] = current_epoch
+                            train_ml(symbol)
+                            avaliar_sinal(symbol)
+
+                        hist_received = True
+
+                # =========================================================
+                # 2) STREAM REAL: candles subscribe (isso impede o "mudo")
+                # =========================================================
+                req_stream = {
+                    "candles": symbol,
+                    "subscribe": 1,
+                    "granularity": GRANULARITY_SECONDS
+                }
+                await ws.send(json.dumps(req_stream))
+                log(f"{symbol} Stream iniciado 🔥", "info")
+
+                # loop com timeout para não travar em silêncio
                 while True:
                     try:
                         raw = await asyncio.wait_for(
@@ -267,19 +303,35 @@ async def ws_loop(symbol: str):
                         break
 
                     data = json.loads(raw)
-                    if "candles" in data:
+
+                    # stream pode vir como {"candles":[...]} ou {"candle":{...}}
+                    if "candle" in data and isinstance(data["candle"], dict):
+                        df = pd.DataFrame([data["candle"]])
+                        # junta com o dataset existente sem apagar histórico
+                        if len(candles[symbol]) > 0:
+                            candles[symbol] = pd.concat([candles[symbol], df], ignore_index=True)
+                        else:
+                            candles[symbol] = df
+                        candles[symbol] = calcular_indicadores(candles[symbol])
+
+                    elif "candles" in data:
                         df = pd.DataFrame(data["candles"])
+                        # se vier pacote, substitui pelo pacote (normalmente não vem aqui no stream)
                         candles[symbol] = calcular_indicadores(df)
 
-                        try:
-                            current_epoch = int(candles[symbol].iloc[-1]["epoch"])
-                        except Exception:
-                            continue
+                    else:
+                        continue
 
-                        if last_trained_epoch[symbol] != current_epoch:
-                            last_trained_epoch[symbol] = current_epoch
-                            train_ml(symbol)
-                            avaliar_sinal(symbol)
+                    # garante candle novo
+                    try:
+                        current_epoch = int(candles[symbol].iloc[-1]["epoch"])
+                    except Exception:
+                        continue
+
+                    if last_trained_epoch[symbol] != current_epoch:
+                        last_trained_epoch[symbol] = current_epoch
+                        train_ml(symbol)
+                        avaliar_sinal(symbol)
 
         except Exception as e:
             log(f"{symbol} WS erro: {e}", "error")
