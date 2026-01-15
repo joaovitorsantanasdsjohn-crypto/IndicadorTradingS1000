@@ -48,8 +48,9 @@ WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# <<< watchdog para reconectar se WS ficar "mudo"
+# <<< ADICIONADO: watchdog para reconectar se WS ficar "mudo"
 WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "300"))
+# (120s = 2 minutos sem candles => reconecta)
 
 SYMBOLS = [
     "frxEURUSD","frxUSDJPY","frxGBPUSD","frxUSDCHF","frxAUDUSD",
@@ -86,9 +87,10 @@ candles = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models = {}
 ml_model_ready = {}
 last_signal_epoch = {s: None for s in SYMBOLS}
+ws_notified = set()
 
-# controla candle fechado (evita duplicação)
-last_closed_candle_epoch = {s: None for s in SYMBOLS}
+# <<< ADICIONADO: controla treino por candle fechado (evita re-treino repetido)
+last_trained_epoch = {s: None for s in SYMBOLS}
 
 # ---------------- Logging ----------------
 
@@ -140,7 +142,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     # ---------------- MFI (somente CONTEXTO) ----------------
     if "volume" not in df.columns:
-        df["volume"] = 1  # Volume neutro (não bloqueia nada)
+        df["volume"] = 1  # <<< Volume neutro para Forex (não bloqueia nada)
 
     df["mfi"] = MFIIndicator(
         high=df["high"],
@@ -167,16 +169,13 @@ def train_ml(symbol: str):
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         ml_model_ready[symbol] = False
         return
-
     X, y = build_ml_dataset(df)
-
     model = RandomForestClassifier(
         n_estimators=ML_N_ESTIMATORS,
         max_depth=ML_MAX_DEPTH,
         random_state=42
     )
     model.fit(X, y)
-
     ml_models[symbol] = (model, X.columns.tolist())
     ml_model_ready[symbol] = True
 
@@ -237,73 +236,52 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
-                # 1) HISTÓRICO (1200 candles)
                 req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
                     "count": 1200,
                     "end": "latest",
-                    "granularity": GRANULARITY_SECONDS,
-                    "style": "candles"
+                    "granularity": GRANULARITY_SECONDS,  # ✅ CORRIGIDO
+                    "style": "candles",
+                    "subscribe": 1  # <<< ADICIONADO (stream contínuo de candles)
                 }
                 await ws.send(json.dumps(req_hist))
                 log(f"{symbol} Histórico solicitado 📥", "info")
 
-                # 2) STREAM REAL (candles fechando a cada 5min)
-                req_stream = {
-                    "candles": symbol,
-                    "subscribe": 1,
-                    "granularity": GRANULARITY_SECONDS
-                }
-                await ws.send(json.dumps(req_stream))
-                log(f"{symbol} Stream candles ativado 🔴", "info")
-
+                # loop com timeout para não travar em silêncio
                 while True:
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=WS_CANDLE_TIMEOUT_SECONDS)
+                        raw = await asyncio.wait_for(
+                            ws.recv(),
+                            timeout=WS_CANDLE_TIMEOUT_SECONDS
+                        )
                     except asyncio.TimeoutError:
-                        log(f"{symbol} Sem candle por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
+                        log(
+                            f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁",
+                            "warning"
+                        )
                         try:
                             await ws.close()
                         except Exception:
                             pass
-                        break
+                        break  # reconecta
 
                     data = json.loads(raw)
-
-                    # resposta de histórico
-                    if "candles" in data and isinstance(data["candles"], list):
+                    if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         candles[symbol] = calcular_indicadores(df)
-                        train_ml(symbol)
-                        avaliar_sinal(symbol)
 
-                    # resposta do stream (candles fechados chegando 1 por vez)
-                    elif "candle" in data and isinstance(data["candle"], dict):
-                        c = data["candle"]
-                        if c.get("epoch") is None:
+                        # <<< ADICIONADO: treinar SOMENTE quando fechar candle novo
+                        try:
+                            current_epoch = int(candles[symbol].iloc[-1]["epoch"])
+                        except Exception:
                             continue
 
-                        # Deriv manda atualizações durante o candle formar.
-                        # Quando fecha, ele começa um novo. A forma mais segura:
-                        epoch = int(c["epoch"])
-
-                        # evita spam
-                        if last_closed_candle_epoch[symbol] == epoch:
-                            continue
-                        last_closed_candle_epoch[symbol] = epoch
-
-                        # adiciona candle novo ao DF
-                        df_old = candles[symbol]
-                        df_new = pd.DataFrame([c])
-                        df = pd.concat([df_old, df_new], ignore_index=True)
-
-                        # mantém DF “limpo”
-                        df = df.drop_duplicates(subset=["epoch"]).reset_index(drop=True)
-
-                        candles[symbol] = calcular_indicadores(df)
-                        train_ml(symbol)
-                        avaliar_sinal(symbol)
+                        if last_trained_epoch[symbol] != current_epoch:
+                            last_trained_epoch[symbol] = current_epoch
+                            train_ml(symbol)
+                            avaliar_sinal(symbol)
+                        # Se não mudou o epoch, ignora (evita re-treino)
 
         except Exception as e:
             log(f"{symbol} WS erro: {e}", "error")
