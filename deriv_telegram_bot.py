@@ -48,9 +48,8 @@ WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# <<< ADICIONADO: watchdog para reconectar se WS ficar "mudo"
+# Watchdog WS: reconecta se parar de vir candle
 WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "300"))
-# (300s = 5 minutos sem candles => reconecta)
 
 SYMBOLS = [
     "frxEURUSD","frxUSDJPY","frxGBPUSD","frxUSDCHF","frxAUDUSD",
@@ -70,7 +69,7 @@ RSI_SELL_MIN = 55
 BB_PERIOD = 20
 BB_STD = 2.3
 
-MFI_PERIOD = 14   # <<< ADICIONADO (configurável)
+MFI_PERIOD = 14
 
 # ---------------- ML ----------------
 
@@ -87,10 +86,9 @@ candles = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models = {}
 ml_model_ready = {}
 last_signal_epoch = {s: None for s in SYMBOLS}
-ws_notified = set()
 
-# <<< ADICIONADO: controla treino por candle fechado (evita re-treino repetido)
-last_trained_epoch = {s: None for s in SYMBOLS}
+# evita reprocessar várias vezes o mesmo candle
+last_processed_epoch = {s: None for s in SYMBOLS}
 
 # ---------------- Logging ----------------
 
@@ -140,9 +138,8 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_upper"] = bb.bollinger_hband()
     df["bb_lower"] = bb.bollinger_lband()
 
-    # ---------------- MFI (somente CONTEXTO) ----------------
     if "volume" not in df.columns:
-        df["volume"] = 1  # <<< Volume neutro para Forex (não bloqueia nada)
+        df["volume"] = 1  # volume neutro forex
 
     df["mfi"] = MFIIndicator(
         high=df["high"],
@@ -151,7 +148,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         volume=df["volume"],
         window=MFI_PERIOD
     ).money_flow_index()
-    # --------------------------------------------------------
 
     return df
 
@@ -221,35 +217,26 @@ def avaliar_sinal(symbol: str):
     send_telegram(msg)
     log(f"{symbol} — sinal enviado {direction}")
 
-# ---------------- Utils: update df sem apagar histórico ----------------
+# ---------------- Utils candles ----------------
 
-def merge_candles(symbol: str, new_df: pd.DataFrame):
-    """
-    Junta candles novos SEM resetar o histórico.
-    Remove duplicados por epoch e mantém no máximo ML_MAX_SAMPLES candles.
-    """
-    if new_df is None or len(new_df) == 0:
+def update_history(symbol: str, df_new: pd.DataFrame):
+    if df_new is None or df_new.empty:
         return
 
-    # Garantir colunas essenciais
+    df_new = df_new.copy()
     for col in ["epoch", "open", "high", "low", "close"]:
-        if col not in new_df.columns:
+        if col not in df_new.columns:
             return
 
-    # Converter epoch
-    new_df = new_df.copy()
-    new_df["epoch"] = new_df["epoch"].astype(int)
+    df_new["epoch"] = df_new["epoch"].astype(int)
 
-    if candles[symbol] is None or candles[symbol].empty:
-        base = new_df
+    if candles[symbol].empty:
+        base = df_new
     else:
-        base = pd.concat([candles[symbol], new_df], ignore_index=True)
+        base = pd.concat([candles[symbol], df_new], ignore_index=True)
+        base = base.drop_duplicates(subset=["epoch"], keep="last")
+        base = base.sort_values("epoch").reset_index(drop=True)
 
-    # remove duplicados e ordena
-    base = base.drop_duplicates(subset=["epoch"], keep="last")
-    base = base.sort_values("epoch").reset_index(drop=True)
-
-    # manter só os últimos ML_MAX_SAMPLES
     if len(base) > ML_MAX_SAMPLES:
         base = base.tail(ML_MAX_SAMPLES).reset_index(drop=True)
 
@@ -270,29 +257,56 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
+                # 1) HISTÓRICO (sem subscribe)
                 req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
                     "count": 1200,
                     "end": "latest",
-                    "granularity": GRANULARITY_SECONDS,
-                    "style": "candles",
-                    "subscribe": 1
+                    "granularity": GRANANULARITY_SECONDS if False else GRANULARITY_SECONDS,
+                    "style": "candles"
                 }
                 await ws.send(json.dumps(req_hist))
-                log(f"{symbol} Histórico solicitado 📥", "info")
+
+                # aguardar histórico
+                hist_ok = False
+                start_wait = time.time()
+
+                while time.time() - start_wait < 15:
+                    raw = await ws.recv()
+                    data = json.loads(raw)
+                    if "candles" in data:
+                        df = pd.DataFrame(data["candles"])
+                        update_history(symbol, df)
+                        hist_ok = True
+                        break
+
+                if not hist_ok:
+                    log(f"{symbol} Não recebeu histórico — reconectando", "warning")
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    continue
+
+                # treina com histórico inicial
+                train_ml(symbol)
+                avaliar_sinal(symbol)
+
+                # 2) SUBSCRIBE CANDLES (stream real)
+                sub_req = {
+                    "candles": symbol,
+                    "granularity": GRANULARITY_SECONDS,
+                    "subscribe": 1
+                }
+                await ws.send(json.dumps(sub_req))
+                log(f"{symbol} Subscribe candles ✅", "info")
 
                 while True:
                     try:
-                        raw = await asyncio.wait_for(
-                            ws.recv(),
-                            timeout=WS_CANDLE_TIMEOUT_SECONDS
-                        )
+                        raw = await asyncio.wait_for(ws.recv(), timeout=WS_CANDLE_TIMEOUT_SECONDS)
                     except asyncio.TimeoutError:
-                        log(
-                            f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁",
-                            "warning"
-                        )
+                        log(f"{symbol} WS ficou mudo {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
                         try:
                             await ws.close()
                         except Exception:
@@ -301,27 +315,26 @@ async def ws_loop(symbol: str):
 
                     data = json.loads(raw)
 
-                    # 1) histórico / atualização vindo como "candles"
+                    # stream vem como: {"candles": [...] } ou {"ohlc": {...}}
                     if "candles" in data:
                         df_new = pd.DataFrame(data["candles"])
-                        merge_candles(symbol, df_new)
+                        update_history(symbol, df_new)
 
-                    # 2) atualização vindo como "ohlc" (formato comum de stream)
                     elif "ohlc" in data:
                         df_new = pd.DataFrame([data["ohlc"]])
-                        merge_candles(symbol, df_new)
+                        update_history(symbol, df_new)
 
                     else:
                         continue
 
-                    # Treinar / sinal SOMENTE quando fechar candle novo
+                    # processa somente quando candle muda de epoch
                     try:
                         current_epoch = int(candles[symbol].iloc[-1]["epoch"])
                     except Exception:
                         continue
 
-                    if last_trained_epoch[symbol] != current_epoch:
-                        last_trained_epoch[symbol] = current_epoch
+                    if last_processed_epoch[symbol] != current_epoch:
+                        last_processed_epoch[symbol] = current_epoch
                         train_ml(symbol)
                         avaliar_sinal(symbol)
 
