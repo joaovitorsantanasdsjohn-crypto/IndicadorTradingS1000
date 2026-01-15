@@ -221,6 +221,40 @@ def avaliar_sinal(symbol: str):
     send_telegram(msg)
     log(f"{symbol} — sinal enviado {direction}")
 
+# ---------------- Utils: update df sem apagar histórico ----------------
+
+def merge_candles(symbol: str, new_df: pd.DataFrame):
+    """
+    Junta candles novos SEM resetar o histórico.
+    Remove duplicados por epoch e mantém no máximo ML_MAX_SAMPLES candles.
+    """
+    if new_df is None or len(new_df) == 0:
+        return
+
+    # Garantir colunas essenciais
+    for col in ["epoch", "open", "high", "low", "close"]:
+        if col not in new_df.columns:
+            return
+
+    # Converter epoch
+    new_df = new_df.copy()
+    new_df["epoch"] = new_df["epoch"].astype(int)
+
+    if candles[symbol] is None or candles[symbol].empty:
+        base = new_df
+    else:
+        base = pd.concat([candles[symbol], new_df], ignore_index=True)
+
+    # remove duplicados e ordena
+    base = base.drop_duplicates(subset=["epoch"], keep="last")
+    base = base.sort_values("epoch").reset_index(drop=True)
+
+    # manter só os últimos ML_MAX_SAMPLES
+    if len(base) > ML_MAX_SAMPLES:
+        base = base.tail(ML_MAX_SAMPLES).reset_index(drop=True)
+
+    candles[symbol] = calcular_indicadores(base)
+
 # ---------------- WebSocket ----------------
 
 async def ws_loop(symbol: str):
@@ -243,12 +277,11 @@ async def ws_loop(symbol: str):
                     "end": "latest",
                     "granularity": GRANULARITY_SECONDS,
                     "style": "candles",
-                    "subscribe": 1  # <<< ADICIONADO (stream contínuo de candles)
+                    "subscribe": 1
                 }
                 await ws.send(json.dumps(req_hist))
                 log(f"{symbol} Histórico solicitado 📥", "info")
 
-                # loop com timeout para não travar em silêncio
                 while True:
                     try:
                         raw = await asyncio.wait_for(
@@ -264,50 +297,33 @@ async def ws_loop(symbol: str):
                             await ws.close()
                         except Exception:
                             pass
-                        break  # reconecta
+                        break
 
                     data = json.loads(raw)
 
+                    # 1) histórico / atualização vindo como "candles"
                     if "candles" in data:
                         df_new = pd.DataFrame(data["candles"])
-                        if df_new.empty:
-                            continue
+                        merge_candles(symbol, df_new)
 
-                        # ---------- CORREÇÃO CRÍTICA ----------
-                        # Em modo subscribe, o Deriv pode mandar 1 candle só.
-                        # Se você substituir candles[symbol] por df_new, você perde o histórico
-                        # e o ML fica sem dados. Então aqui a gente ACUMULA candles.
-                        try:
-                            df_new["epoch"] = df_new["epoch"].astype(int)
-                        except Exception:
-                            pass
+                    # 2) atualização vindo como "ohlc" (formato comum de stream)
+                    elif "ohlc" in data:
+                        df_new = pd.DataFrame([data["ohlc"]])
+                        merge_candles(symbol, df_new)
 
-                        if candles[symbol].empty:
-                            df_full = df_new
-                        else:
-                            df_full = pd.concat([candles[symbol], df_new], ignore_index=True)
+                    else:
+                        continue
 
-                        # remove duplicados por epoch (caso Deriv reenvie candle)
-                        if "epoch" in df_full.columns:
-                            df_full = df_full.drop_duplicates(subset=["epoch"], keep="last")
+                    # Treinar / sinal SOMENTE quando fechar candle novo
+                    try:
+                        current_epoch = int(candles[symbol].iloc[-1]["epoch"])
+                    except Exception:
+                        continue
 
-                        # mantém só os últimos 1200 candles (histórico saudável)
-                        df_full = df_full.tail(1200).reset_index(drop=True)
-
-                        candles[symbol] = calcular_indicadores(df_full)
-                        # -------------------------------------
-
-                        # <<< ADICIONADO: treinar SOMENTE quando fechar candle novo
-                        try:
-                            current_epoch = int(candles[symbol].iloc[-1]["epoch"])
-                        except Exception:
-                            continue
-
-                        if last_trained_epoch[symbol] != current_epoch:
-                            last_trained_epoch[symbol] = current_epoch
-                            train_ml(symbol)
-                            avaliar_sinal(symbol)
-                        # Se não mudou o epoch, ignora (evita re-treino)
+                    if last_trained_epoch[symbol] != current_epoch:
+                        last_trained_epoch[symbol] = current_epoch
+                        train_ml(symbol)
+                        avaliar_sinal(symbol)
 
         except Exception as e:
             log(f"{symbol} WS erro: {e}", "error")
