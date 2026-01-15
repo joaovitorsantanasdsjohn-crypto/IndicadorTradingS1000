@@ -48,7 +48,7 @@ WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# Watchdog WS: reconecta se parar de vir candle
+# <<< watchdog para reconectar se WS ficar "mudo"
 WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "300"))
 
 SYMBOLS = [
@@ -69,7 +69,7 @@ RSI_SELL_MIN = 55
 BB_PERIOD = 20
 BB_STD = 2.3
 
-MFI_PERIOD = 14
+MFI_PERIOD = 14   # <<< ADICIONADO (configurável)
 
 # ---------------- ML ----------------
 
@@ -87,8 +87,8 @@ ml_models = {}
 ml_model_ready = {}
 last_signal_epoch = {s: None for s in SYMBOLS}
 
-# evita reprocessar várias vezes o mesmo candle
-last_processed_epoch = {s: None for s in SYMBOLS}
+# controla candle fechado (evita duplicação)
+last_closed_candle_epoch = {s: None for s in SYMBOLS}
 
 # ---------------- Logging ----------------
 
@@ -138,8 +138,9 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_upper"] = bb.bollinger_hband()
     df["bb_lower"] = bb.bollinger_lband()
 
+    # ---------------- MFI (somente CONTEXTO) ----------------
     if "volume" not in df.columns:
-        df["volume"] = 1  # volume neutro forex
+        df["volume"] = 1  # Volume neutro (não bloqueia nada)
 
     df["mfi"] = MFIIndicator(
         high=df["high"],
@@ -148,6 +149,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         volume=df["volume"],
         window=MFI_PERIOD
     ).money_flow_index()
+    # --------------------------------------------------------
 
     return df
 
@@ -165,13 +167,16 @@ def train_ml(symbol: str):
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         ml_model_ready[symbol] = False
         return
+
     X, y = build_ml_dataset(df)
+
     model = RandomForestClassifier(
         n_estimators=ML_N_ESTIMATORS,
         max_depth=ML_MAX_DEPTH,
         random_state=42
     )
     model.fit(X, y)
+
     ml_models[symbol] = (model, X.columns.tolist())
     ml_model_ready[symbol] = True
 
@@ -217,31 +222,6 @@ def avaliar_sinal(symbol: str):
     send_telegram(msg)
     log(f"{symbol} — sinal enviado {direction}")
 
-# ---------------- Utils candles ----------------
-
-def update_history(symbol: str, df_new: pd.DataFrame):
-    if df_new is None or df_new.empty:
-        return
-
-    df_new = df_new.copy()
-    for col in ["epoch", "open", "high", "low", "close"]:
-        if col not in df_new.columns:
-            return
-
-    df_new["epoch"] = df_new["epoch"].astype(int)
-
-    if candles[symbol].empty:
-        base = df_new
-    else:
-        base = pd.concat([candles[symbol], df_new], ignore_index=True)
-        base = base.drop_duplicates(subset=["epoch"], keep="last")
-        base = base.sort_values("epoch").reset_index(drop=True)
-
-    if len(base) > ML_MAX_SAMPLES:
-        base = base.tail(ML_MAX_SAMPLES).reset_index(drop=True)
-
-    candles[symbol] = calcular_indicadores(base)
-
 # ---------------- WebSocket ----------------
 
 async def ws_loop(symbol: str):
@@ -257,56 +237,32 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
-                # 1) HISTÓRICO (sem subscribe)
+                # 1) HISTÓRICO (1200 candles)
                 req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
                     "count": 1200,
                     "end": "latest",
-                    "granularity": GRANANULARITY_SECONDS if False else GRANULARITY_SECONDS,
+                    "granularity": GRANULARITY_SECONDS,
                     "style": "candles"
                 }
                 await ws.send(json.dumps(req_hist))
+                log(f"{symbol} Histórico solicitado 📥", "info")
 
-                # aguardar histórico
-                hist_ok = False
-                start_wait = time.time()
-
-                while time.time() - start_wait < 15:
-                    raw = await ws.recv()
-                    data = json.loads(raw)
-                    if "candles" in data:
-                        df = pd.DataFrame(data["candles"])
-                        update_history(symbol, df)
-                        hist_ok = True
-                        break
-
-                if not hist_ok:
-                    log(f"{symbol} Não recebeu histórico — reconectando", "warning")
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
-                    continue
-
-                # treina com histórico inicial
-                train_ml(symbol)
-                avaliar_sinal(symbol)
-
-                # 2) SUBSCRIBE CANDLES (stream real)
-                sub_req = {
+                # 2) STREAM REAL (candles fechando a cada 5min)
+                req_stream = {
                     "candles": symbol,
-                    "granularity": GRANULARITY_SECONDS,
-                    "subscribe": 1
+                    "subscribe": 1,
+                    "granularity": GRANULARITY_SECONDS
                 }
-                await ws.send(json.dumps(sub_req))
-                log(f"{symbol} Subscribe candles ✅", "info")
+                await ws.send(json.dumps(req_stream))
+                log(f"{symbol} Stream candles ativado 🔴", "info")
 
                 while True:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=WS_CANDLE_TIMEOUT_SECONDS)
                     except asyncio.TimeoutError:
-                        log(f"{symbol} WS ficou mudo {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
+                        log(f"{symbol} Sem candle por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
                         try:
                             await ws.close()
                         except Exception:
@@ -315,26 +271,37 @@ async def ws_loop(symbol: str):
 
                     data = json.loads(raw)
 
-                    # stream vem como: {"candles": [...] } ou {"ohlc": {...}}
-                    if "candles" in data:
-                        df_new = pd.DataFrame(data["candles"])
-                        update_history(symbol, df_new)
+                    # resposta de histórico
+                    if "candles" in data and isinstance(data["candles"], list):
+                        df = pd.DataFrame(data["candles"])
+                        candles[symbol] = calcular_indicadores(df)
+                        train_ml(symbol)
+                        avaliar_sinal(symbol)
 
-                    elif "ohlc" in data:
-                        df_new = pd.DataFrame([data["ohlc"]])
-                        update_history(symbol, df_new)
+                    # resposta do stream (candles fechados chegando 1 por vez)
+                    elif "candle" in data and isinstance(data["candle"], dict):
+                        c = data["candle"]
+                        if c.get("epoch") is None:
+                            continue
 
-                    else:
-                        continue
+                        # Deriv manda atualizações durante o candle formar.
+                        # Quando fecha, ele começa um novo. A forma mais segura:
+                        epoch = int(c["epoch"])
 
-                    # processa somente quando candle muda de epoch
-                    try:
-                        current_epoch = int(candles[symbol].iloc[-1]["epoch"])
-                    except Exception:
-                        continue
+                        # evita spam
+                        if last_closed_candle_epoch[symbol] == epoch:
+                            continue
+                        last_closed_candle_epoch[symbol] = epoch
 
-                    if last_processed_epoch[symbol] != current_epoch:
-                        last_processed_epoch[symbol] = current_epoch
+                        # adiciona candle novo ao DF
+                        df_old = candles[symbol]
+                        df_new = pd.DataFrame([c])
+                        df = pd.concat([df_old, df_new], ignore_index=True)
+
+                        # mantém DF “limpo”
+                        df = df.drop_duplicates(subset=["epoch"]).reset_index(drop=True)
+
+                        candles[symbol] = calcular_indicadores(df)
                         train_ml(symbol)
                         avaliar_sinal(symbol)
 
