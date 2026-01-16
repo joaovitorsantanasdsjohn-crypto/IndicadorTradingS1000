@@ -40,7 +40,7 @@ APP_ID = os.getenv("DERIV_APP_ID", "111022")
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))
 GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
 
-SIGNAL_ADVANCE_MINUTES = 5
+SIGNAL_ADVANCE_MINUTES = int(os.getenv("SIGNAL_ADVANCE_MINUTES", "5"))
 
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
@@ -66,27 +66,39 @@ BB_STD = float(os.getenv("BB_STD", "2.3"))
 
 MFI_PERIOD = int(os.getenv("MFI_PERIOD", "14"))
 
-# RSI (configurável)
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 
 # ---------------- ML ----------------
 
 ML_ENABLED = SKLEARN_AVAILABLE
+
+# mínimo de candles pra treinar 1x (você pode mudar se quiser)
 ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "300"))
-ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "2000"))
+
+# ✅ REDUZIDO PRA CABER NO RENDER FREE (menos RAM)
+ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "1200"))
+
 ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
-ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "60"))
+
+# ✅ REDUZIDO PRA CABER NO RENDER FREE (menos RAM)
+ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "30"))
 ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "5"))
+
+# ✅ MUITO IMPORTANTE: evita treinar ML em TODO candle (isso explode RAM/CPU)
+# default: treina a cada 6 candles (30min no M5)
+ML_TRAIN_EVERY_N_CANDLES = int(os.getenv("ML_TRAIN_EVERY_N_CANDLES", "6"))
 
 # ---------------- Estado ----------------
 
 candles = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models = {}
 ml_model_ready = {}
-last_signal_epoch = {s: None for s in SYMBOLS}
 
 # evita reprocessar candle repetido
 last_processed_epoch = {s: None for s in SYMBOLS}
+
+# ✅ controla quando foi o ultimo treino do ML (por candle index)
+last_ml_train_idx = {s: None for s in SYMBOLS}
 
 # ---------------- Logging ----------------
 
@@ -99,7 +111,6 @@ logger.handlers.clear()
 logger.addHandler(handler)
 
 def log(msg: str, level: str = "info"):
-    # mantém seu padrão UTC + BRT
     brt = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S BRT")
     utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     full = f"{utc} | {brt} | {msg}"
@@ -124,9 +135,7 @@ def send_telegram(message: str):
 
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().reset_index(drop=True)
-
-    # precisa ter candles suficientes pra indicadores ficarem consistentes
-    if len(df) < EMA_SLOW + 30:
+    if len(df) < EMA_SLOW + 10:
         return df
 
     df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
@@ -161,7 +170,28 @@ def build_ml_dataset(df: pd.DataFrame):
     df["future"] = (df["close"].shift(-1) > df["close"]).astype(int)
     X = df.drop(columns=["future", "epoch"]).iloc[:-1]
     y = df["future"].iloc[:-1]
-    return X.tail(ML_MAX_SAMPLES), y.tail(ML_MAX_SAMPLES)
+
+    # ✅ limita dataset pra reduzir RAM
+    X = X.tail(ML_MAX_SAMPLES)
+    y = y.tail(ML_MAX_SAMPLES)
+
+    return X, y
+
+def should_train_ml(symbol: str, df: pd.DataFrame) -> bool:
+    """
+    ✅ treina o ML apenas a cada N candles
+    para não estourar RAM / CPU no Render Free.
+    """
+    idx = len(df) - 1
+    last_idx = last_ml_train_idx.get(symbol)
+
+    if last_idx is None:
+        return True
+
+    if (idx - last_idx) >= ML_TRAIN_EVERY_N_CANDLES:
+        return True
+
+    return False
 
 def train_ml(symbol: str):
     if not ML_ENABLED:
@@ -173,20 +203,34 @@ def train_ml(symbol: str):
         ml_model_ready[symbol] = False
         return
 
-    X, y = build_ml_dataset(df)
-    if len(X) < ML_MIN_TRAINED_SAMPLES:
-        ml_model_ready[symbol] = False
+    # ✅ treino controlado (não treina toda hora)
+    if not should_train_ml(symbol, df):
         return
 
-    model = RandomForestClassifier(
-        n_estimators=ML_N_ESTIMATORS,
-        max_depth=ML_MAX_DEPTH,
-        random_state=42
-    )
-    model.fit(X, y)
+    try:
+        X, y = build_ml_dataset(df)
 
-    ml_models[symbol] = (model, X.columns.tolist())
-    ml_model_ready[symbol] = True
+        if len(X) < 50:
+            ml_model_ready[symbol] = False
+            return
+
+        model = RandomForestClassifier(
+            n_estimators=ML_N_ESTIMATORS,
+            max_depth=ML_MAX_DEPTH,
+            random_state=42,
+            n_jobs=1  # ✅ evita threads demais (reduz RAM)
+        )
+        model.fit(X, y)
+
+        ml_models[symbol] = (model, X.columns.tolist())
+        ml_model_ready[symbol] = True
+        last_ml_train_idx[symbol] = len(df) - 1
+
+        log(f"{symbol} ML treinado ✅ (samples={len(X)})", "info")
+
+    except Exception as e:
+        ml_model_ready[symbol] = False
+        log(f"{symbol} erro treino ML: {e}", "error")
 
 def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
     if not ML_ENABLED:
@@ -195,21 +239,18 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
         return None
 
     model, cols = ml_models[symbol]
-
-    # garante ordem idêntica às colunas treinadas
     try:
         vals = [float(row[c]) for c in cols]
+        return float(model.predict_proba([vals])[0][1])
     except Exception:
         return None
-
-    return model.predict_proba([vals])[0][1]
 
 # ---------------- SETUP / CONTEXTO DE MERCADO ----------------
 
 def has_market_context(row: pd.Series, direction: str) -> bool:
     """
-    Contexto REAL baseado em:
-    EMA (tendência), RSI (força), Bollinger (pullback/volatilidade), MFI (volume/contexto).
+    ✅ indicadores criam cenário: EMA + RSI + Bollinger + MFI
+    ✅ ML é filtro final (rei do bot)
     """
 
     close = float(row["close"])
@@ -220,31 +261,26 @@ def has_market_context(row: pd.Series, direction: str) -> bool:
     mfi = float(row["mfi"])
     bb_mid = float(row["bb_mid"])
 
-    # =====================
-    # COMPRA (tendência de alta + pullback)
-    # =====================
+    # COMPRA (pullback em tendência)
     if direction == "COMPRA":
-        # tendência
         if not (ema_fast > ema_mid > ema_slow):
             return False
 
-        # RSI: faixa saudável (evita lateral neutro puro e evita exaustão)
+        # RSI não pode estar super esticado nem morto
         if not (35 <= rsi <= 55):
             return False
 
-        # pullback: preço no meio/abaixo da média BB
+        # preço abaixo ou perto do meio (pullback)
         if close > bb_mid:
             return False
 
-        # MFI: não compra em saturação
+        # MFI evita compra em saturação
         if mfi >= 75:
             return False
 
         return True
 
-    # =====================
-    # VENDA (tendência de baixa + pullback)
-    # =====================
+    # VENDA (pullback em tendência)
     if direction == "VENDA":
         if not (ema_fast < ema_mid < ema_slow):
             return False
@@ -266,30 +302,24 @@ def has_market_context(row: pd.Series, direction: str) -> bool:
 
 def avaliar_sinal(symbol: str):
     df = candles[symbol]
-    if len(df) < EMA_SLOW + 50:
+    if len(df) < EMA_SLOW + 80:
         return
 
     row = df.iloc[-1]
 
-    # direção base (não é o único critério!)
+    # direção base
     direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
-    # 1) contexto do mercado: EMA + RSI + BB + MFI
+    # 1) contexto por indicadores
     if not has_market_context(row, direction):
         return
 
-    # 2) ML filtra probabilidade
+    # 2) ML aprova probabilidade
     ml_prob = ml_predict(symbol, row)
     if ml_prob is None or ml_prob < ML_CONF_THRESHOLD:
         return
 
     epoch = int(row["epoch"])
-
-    # 3) trava simples: não manda 2 sinais na MESMA vela pro MESMO ativo
-    if last_signal_epoch[symbol] == epoch:
-        return
-
-    last_signal_epoch[symbol] = epoch
 
     entry_time = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
     entry_time += timedelta(minutes=SIGNAL_ADVANCE_MINUTES)
@@ -304,7 +334,7 @@ def avaliar_sinal(symbol: str):
     )
 
     send_telegram(msg)
-    log(f"{symbol} — sinal enviado {direction} (ML {ml_prob*100:.0f}%)")
+    log(f"{symbol} — sinal enviado {direction} (ML {ml_prob*100:.0f}%)", "info")
 
 # ---------------- WebSocket ----------------
 
@@ -321,20 +351,18 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
-                # ✅ CORREÇÃO DEFINITIVA:
-                # NÃO usar candles_subscribe/candles (isso é request inválida)
-                # o stream correto é via ticks_history + style=candles + subscribe=True
-                req = {
+                # ✅ Subscribe correto: Deriv exige inteiro (1), não boolean
+                req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
                     "count": 1200,
                     "end": "latest",
                     "granularity": GRANULARITY_SECONDS,
                     "style": "candles",
-                    "subscribe": True  # ✅ TEM QUE SER boolean
+                    "subscribe": 1  # ✅ CORRETO
                 }
 
-                await ws.send(json.dumps(req))
+                await ws.send(json.dumps(req_hist))
                 log(f"{symbol} Histórico + stream solicitado 📥", "info")
 
                 while True:
@@ -353,7 +381,6 @@ async def ws_loop(symbol: str):
 
                     data = json.loads(raw)
 
-                    # erro no retorno
                     if "error" in data:
                         log(f"{symbol} WS retornou erro: {data.get('error')}", "error")
                         try:
@@ -362,22 +389,59 @@ async def ws_loop(symbol: str):
                             pass
                         break
 
-                    # ticks_history retorna candles em "candles"
+                    # Deriv envia candles no primeiro pacote e depois updates
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         df = calcular_indicadores(df)
                         candles[symbol] = df
 
-                        # processar só quando epoch muda
-                        try:
-                            current_epoch = int(df.iloc[-1]["epoch"])
-                        except Exception:
-                            continue
+                    elif "ohlc" in data:
+                        # updates (stream)
+                        o = data["ohlc"]
+                        df = candles[symbol]
 
-                        if last_processed_epoch[symbol] != current_epoch:
-                            last_processed_epoch[symbol] = current_epoch
-                            train_ml(symbol)
-                            avaliar_sinal(symbol)
+                        new_row = {
+                            "epoch": int(o["open_time"]),
+                            "open": float(o["open"]),
+                            "high": float(o["high"]),
+                            "low": float(o["low"]),
+                            "close": float(o["close"]),
+                        }
+
+                        # se vier volume (normalmente não vem no Forex)
+                        if "volume" in o:
+                            new_row["volume"] = float(o["volume"])
+
+                        if len(df) == 0:
+                            df = pd.DataFrame([new_row])
+                        else:
+                            last_epoch = int(df.iloc[-1]["epoch"])
+                            if new_row["epoch"] == last_epoch:
+                                df.iloc[-1] = pd.Series(new_row)
+                            else:
+                                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+                        # mantém tamanho controlado
+                        if len(df) > 1500:
+                            df = df.tail(1500).reset_index(drop=True)
+
+                        df = calcular_indicadores(df)
+                        candles[symbol] = df
+
+                    # processar só quando epoch muda
+                    try:
+                        current_epoch = int(candles[symbol].iloc[-1]["epoch"])
+                    except Exception:
+                        continue
+
+                    if last_processed_epoch[symbol] != current_epoch:
+                        last_processed_epoch[symbol] = current_epoch
+
+                        # ✅ treina ML de forma controlada pra não estourar RAM
+                        train_ml(symbol)
+
+                        # avalia sinal
+                        avaliar_sinal(symbol)
 
         except Exception as e:
             log(f"{symbol} WS erro: {e}", "error")
