@@ -18,7 +18,6 @@ import threading
 from typing import Optional
 
 # ---------------- ML availability ----------------
-
 try:
     from sklearn.ensemble import RandomForestClassifier
     SKLEARN_AVAILABLE = True
@@ -26,14 +25,12 @@ except Exception:
     SKLEARN_AVAILABLE = False
 
 # ---------------- Inicialização ----------------
-
 load_dotenv()
 
 # ---------------- Configurações ----------------
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # (não é obrigatório p/ candles, mas pode estabilizar)
+DERIV_TOKEN = os.getenv("DERIV_TOKEN")  # opcional
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
 
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))
@@ -55,19 +52,18 @@ SYMBOLS = [
 ]
 
 # ---------------- Parâmetros Técnicos ----------------
-
 EMA_FAST = 9
-EMA_MID  = 21
+EMA_MID = 21
 EMA_SLOW = 34
 
 BB_PERIOD = 20
-BB_STD    = 2.3
+BB_STD = 2.3
 
 MFI_PERIOD = 14
+
 RSI_PERIOD = 14
 
 # ---------------- ML ----------------
-
 ML_ENABLED = SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = 300
 ML_MAX_SAMPLES = 2000
@@ -75,26 +71,18 @@ ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
 ML_N_ESTIMATORS = 60
 ML_MAX_DEPTH = 5
 
-# ---------------- Otimização Memória ----------------
-# >>> ESSAS CONFIGS EVITAM ESTOURO NO RENDER FREE (512MB)
-
-MAX_CANDLES_RAM = int(os.getenv("MAX_CANDLES_RAM", "1300"))   # limite por símbolo
-INDICATOR_WINDOW = int(os.getenv("INDICATOR_WINDOW", "220"))  # recalcula só o final
-TRAIN_EVERY_N_CANDLES = int(os.getenv("TRAIN_EVERY_N_CANDLES", "3"))  # treina ML a cada N velas
-
 # ---------------- Estado ----------------
-
 candles = {s: pd.DataFrame() for s in SYMBOLS}
+
 ml_models = {}
-ml_model_ready = {}
+ml_model_ready = {s: False for s in SYMBOLS}
+
 last_signal_epoch = {s: None for s in SYMBOLS}
+
+# evita reprocessar candle repetido
 last_processed_epoch = {s: None for s in SYMBOLS}
 
-# contador de velas por símbolo (pra decidir quando treinar ML)
-candle_counter = {s: 0 for s in SYMBOLS}
-
 # ---------------- Logging ----------------
-
 logger = logging.getLogger("IndicadorTradingS1000")
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -115,7 +103,6 @@ def log(msg: str, level: str = "info"):
         logger.error(full)
 
 # ---------------- Telegram ----------------
-
 def send_telegram(message: str):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -125,33 +112,25 @@ def send_telegram(message: str):
         log(f"Erro Telegram: {e}", "error")
 
 # ---------------- Indicadores ----------------
-
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().reset_index(drop=True)
     if len(df) < EMA_SLOW + 10:
         return df
 
-    # garante tipos numéricos
-    for col in ["open", "high", "low", "close"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
-    df["ema_mid"]  = EMAIndicator(df["close"], EMA_MID).ema_indicator()
+    df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
 
     df["rsi"] = RSIIndicator(df["close"], RSI_PERIOD).rsi()
 
     bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
-    df["bb_mid"]   = bb.bollinger_mavg()
+    df["bb_mid"] = bb.bollinger_mavg()
     df["bb_upper"] = bb.bollinger_hband()
     df["bb_lower"] = bb.bollinger_lband()
 
     # MFI (volume neutro em Forex)
     if "volume" not in df.columns:
         df["volume"] = 1
-
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1)
 
     df["mfi"] = MFIIndicator(
         high=df["high"],
@@ -163,43 +142,13 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def update_indicators_light(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Recalcula indicadores só na cauda do DF, pra economizar RAM/CPU.
-    """
-    if df.empty:
-        return df
-    tail = df.tail(INDICATOR_WINDOW).copy().reset_index(drop=True)
-    tail = calcular_indicadores(tail)
-
-    # escreve de volta somente nas linhas da cauda
-    start = max(len(df) - len(tail), 0)
-    for col in ["ema_fast","ema_mid","ema_slow","rsi","bb_mid","bb_upper","bb_lower","mfi","volume"]:
-        if col in tail.columns:
-            df.loc[df.index[start:], col] = tail[col].values
-
-    return df
-
-def trim_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Limita o dataframe por símbolo pra não estourar RAM.
-    """
-    if len(df) > MAX_CANDLES_RAM:
-        df = df.iloc[-MAX_CANDLES_RAM:].reset_index(drop=True)
-    return df
-
 # ---------------- ML ----------------
-
 def build_ml_dataset(df: pd.DataFrame):
     df = df.dropna().copy()
-
-    # features que ML deve usar
     df["future"] = (df["close"].shift(-1) > df["close"]).astype(int)
 
-    # remove epoch e future
-    X = df.drop(columns=["future", "epoch"], errors="ignore").iloc[:-1]
+    X = df.drop(columns=["future", "epoch"]).iloc[:-1]
     y = df["future"].iloc[:-1]
-
     return X.tail(ML_MAX_SAMPLES), y.tail(ML_MAX_SAMPLES)
 
 def train_ml(symbol: str):
@@ -220,8 +169,7 @@ def train_ml(symbol: str):
     model = RandomForestClassifier(
         n_estimators=ML_N_ESTIMATORS,
         max_depth=ML_MAX_DEPTH,
-        random_state=42,
-        n_jobs=1  # IMPORTANT: não explode CPU/RAM no Render
+        random_state=42
     )
     model.fit(X, y)
 
@@ -235,79 +183,53 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
         return None
 
     model, cols = ml_models[symbol]
-    try:
-        vals = [float(row[c]) for c in cols]
-    except Exception:
-        return None
-
-    try:
-        return model.predict_proba([vals])[0][1]
-    except Exception:
-        return None
+    vals = [float(row[c]) for c in cols]
+    return model.predict_proba([vals])[0][1]
 
 # ---------------- SETUP / CONTEXTO DE MERCADO ----------------
-
 def has_market_context(row: pd.Series, direction: str) -> bool:
-    """
-    Só manda sinal quando existir SETUP com contexto,
-    usando EMA + RSI + Bollinger + MFI.
-    """
-
-    try:
-        close = float(row["close"])
-        ema_fast = float(row["ema_fast"])
-        ema_mid = float(row["ema_mid"])
-        ema_slow = float(row["ema_slow"])
-        rsi = float(row["rsi"])
-        mfi = float(row["mfi"])
-        bb_mid = float(row["bb_mid"])
-    except Exception:
-        return False
+    close = float(row["close"])
+    ema_fast = float(row["ema_fast"])
+    ema_mid = float(row["ema_mid"])
+    ema_slow = float(row["ema_slow"])
+    rsi = float(row["rsi"])
+    mfi = float(row["mfi"])
+    bb_mid = float(row["bb_mid"])
 
     # COMPRA
     if direction == "COMPRA":
         if not (ema_fast > ema_mid > ema_slow):
             return False
-
         if not (35 <= rsi <= 55):
             return False
-
         if close > bb_mid:
             return False
-
         if mfi >= 75:
             return False
-
         return True
 
     # VENDA
     if direction == "VENDA":
         if not (ema_fast < ema_mid < ema_slow):
             return False
-
         if not (45 <= rsi <= 65):
             return False
-
         if close < bb_mid:
             return False
-
         if mfi <= 25:
             return False
-
         return True
 
     return False
 
 # ---------------- SINAL ----------------
-
 def avaliar_sinal(symbol: str):
     df = candles[symbol]
     if len(df) < EMA_SLOW + 50:
         return
 
     row = df.iloc[-1]
-
-    direction = "COMPRA" if float(row.get("ema_fast", 0)) >= float(row.get("ema_mid", 0)) else "VENDA"
+    direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
     # 1) contexto
     if not has_market_context(row, direction):
@@ -341,7 +263,6 @@ def avaliar_sinal(symbol: str):
     log(f"{symbol} — sinal enviado {direction} (ML {ml_prob*100:.0f}%)")
 
 # ---------------- WebSocket ----------------
-
 async def ws_loop(symbol: str):
     while True:
         try:
@@ -355,18 +276,21 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
-                # (Opcional) autoriza para estabilizar algumas contas/requests
+                # (Opcional) authorize, se tiver token
+                # OBS: para candle stream geralmente NÃO precisa
                 if DERIV_TOKEN:
                     try:
                         await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                         auth_raw = await ws.recv()
                         auth_data = json.loads(auth_raw)
                         if "error" in auth_data:
-                            log(f"{symbol} authorize falhou: {auth_data.get('error')}", "warning")
+                            log(f"{symbol} authorize erro: {auth_data.get('error')}", "warning")
+                        else:
+                            log(f"{symbol} authorize OK 🔑", "info")
                     except Exception as e:
-                        log(f"{symbol} authorize erro: {e}", "warning")
+                        log(f"{symbol} authorize exception: {e}", "warning")
 
-                # 1) histórico
+                # 1) histórico (1200)
                 req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
@@ -382,7 +306,7 @@ async def ws_loop(symbol: str):
                 hist_data = json.loads(hist_raw)
 
                 if "error" in hist_data:
-                    log(f"{symbol} WS retornou erro: {hist_data.get('error')}", "error")
+                    log(f"{symbol} WS retornou erro no histórico: {hist_data.get('error')}", "error")
                     await ws.close()
                     continue
 
@@ -392,23 +316,22 @@ async def ws_loop(symbol: str):
                     await ws.close()
                     continue
 
-                # organiza colunas principais
-                for col in ["open", "high", "low", "close", "epoch"]:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors="coerce")
-
                 df = calcular_indicadores(df)
-                df = trim_df(df)
                 candles[symbol] = df
 
-                # treina ML uma vez no start (se der)
+                # treina ML assim que carregar histórico
                 train_ml(symbol)
 
-                # 2) stream candles (chave correta é "candles" com subscribe)
+                # 2) ✅ stream de candles CORRETO (Deriv WS v3)
+                # IMPORTANTE: stream é ticks_history + subscribe=1
                 req_stream = {
-                    "candles": symbol,
-                    "subscribe": 1,
-                    "granularity": GRANULARITY_SECONDS
+                    "ticks_history": symbol,
+                    "adjust_start_time": 1,
+                    "count": 1,
+                    "end": "latest",
+                    "granularity": GRANULARITY_SECONDS,
+                    "style": "candles",
+                    "subscribe": 1
                 }
                 await ws.send(json.dumps(req_stream))
                 log(f"{symbol} Stream (candles) ligado 🔴", "info")
@@ -434,54 +357,38 @@ async def ws_loop(symbol: str):
                             pass
                         break
 
-                    # candle update
-                    if "candles" in data and data["candles"]:
+                    # candle update vem em "candles"
+                    if "candles" in data and isinstance(data["candles"], list) and len(data["candles"]) > 0:
                         new_row = data["candles"][0]
                         df = candles[symbol]
 
-                        # normaliza numérico
-                        for col in ["open", "high", "low", "close", "epoch"]:
-                            if col in new_row:
-                                try:
-                                    new_row[col] = float(new_row[col]) if col != "epoch" else int(new_row[col])
-                                except Exception:
-                                    pass
-
                         if df.empty:
                             df = pd.DataFrame([new_row])
-                        else:
-                            last_epoch = int(df.iloc[-1]["epoch"])
-                            new_epoch = int(new_row["epoch"])
-
-                            if new_epoch == last_epoch:
-                                # atualiza somente chaves base
-                                for k, v in new_row.items():
-                                    df.at[df.index[-1], k] = v
-                            else:
-                                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-
-                        # limita DF pra não estourar RAM
-                        df = trim_df(df)
-
-                        # atualiza indicadores somente na cauda
-                        df = update_indicators_light(df)
-                        candles[symbol] = df
-
-                        # processar só quando epoch muda
-                        try:
-                            current_epoch = int(df.iloc[-1]["epoch"])
-                        except Exception:
+                            df = calcular_indicadores(df)
+                            candles[symbol] = df
                             continue
 
+                        last_epoch = int(df.iloc[-1]["epoch"])
+                        new_epoch = int(new_row["epoch"])
+
+                        # atualiza candle atual ou adiciona novo candle
+                        if new_epoch == last_epoch:
+                            for k, v in new_row.items():
+                                df.at[df.index[-1], k] = v
+                        else:
+                            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+
+                        df = calcular_indicadores(df)
+                        candles[symbol] = df
+
+                        current_epoch = int(df.iloc[-1]["epoch"])
                         if last_processed_epoch[symbol] != current_epoch:
                             last_processed_epoch[symbol] = current_epoch
 
-                            candle_counter[symbol] += 1
+                            # treina ML a cada candle fechado/novo
+                            train_ml(symbol)
 
-                            # treina ML só a cada N velas (economiza RAM/CPU e evita reset)
-                            if candle_counter[symbol] % TRAIN_EVERY_N_CANDLES == 0:
-                                train_ml(symbol)
-
+                            # avalia sinal
                             avaliar_sinal(symbol)
 
         except Exception as e:
@@ -489,7 +396,6 @@ async def ws_loop(symbol: str):
             await asyncio.sleep(5)
 
 # ---------------- Flask ----------------
-
 app = Flask(__name__)
 
 @app.route("/", methods=["GET", "HEAD"])
@@ -500,7 +406,6 @@ def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
 
 # ---------------- MAIN ----------------
-
 async def main():
     send_telegram("🚀 BOT INICIADO — M5 ATIVO")
     await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
