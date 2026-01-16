@@ -40,7 +40,7 @@ APP_ID = os.getenv("DERIV_APP_ID", "111022")
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))
 GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
 
-# ✅ AGORA AUTOMÁTICO (você muda no Render ou no .env)
+# ✅ quantos minutos ANTES você quer receber a mensagem (5, 10, 15...)
 SIGNAL_ADVANCE_MINUTES = int(os.getenv("SIGNAL_ADVANCE_MINUTES", "5"))
 
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
@@ -205,24 +205,32 @@ def has_market_context(row: pd.Series, direction: str) -> bool:
     if direction == "COMPRA":
         if not (ema_fast > ema_mid > ema_slow):
             return False
+
         if not (35 <= rsi <= 55):
             return False
+
         if close > bb_mid:
             return False
+
         if mfi >= 75:
             return False
+
         return True
 
     # VENDA
     if direction == "VENDA":
         if not (ema_fast < ema_mid < ema_slow):
             return False
+
         if not (45 <= rsi <= 65):
             return False
+
         if close < bb_mid:
             return False
+
         if mfi <= 25:
             return False
+
         return True
 
     return False
@@ -254,10 +262,21 @@ def avaliar_sinal(symbol: str):
         return
     last_signal_epoch[symbol] = epoch
 
-    # ✅ NOVO CÁLCULO AUTOMÁTICO:
-    # Ex: M5 e você quer 10 min antes -> entrada precisa ser 2 velas à frente
+    # ==========================================================
+    # ✅ CORREÇÃO DEFINITIVA DO HORÁRIO:
+    # - alinha no início do candle M5
+    # - calcula a entrada em múltiplos de 5min
+    # - manda mensagem "SIGNAL_ADVANCE_MINUTES" antes (por candles)
+    # ==========================================================
+
+    # quantos candles à frente equivale aos minutos desejados
     candles_a_frente = max(1, int(round(SIGNAL_ADVANCE_MINUTES / CANDLE_INTERVAL)))
-    entry_epoch = epoch + (candles_a_frente * GRANULARITY_SECONDS)
+
+    # ✅ alinha o epoch no começo exato do candle
+    base_epoch = (epoch // GRANULARITY_SECONDS) * GRANULARITY_SECONDS
+
+    # ✅ entrada exatamente na abertura do candle futuro
+    entry_epoch = base_epoch + (candles_a_frente * GRANULARITY_SECONDS)
 
     entry_time = datetime.utcfromtimestamp(entry_epoch) - timedelta(hours=3)
 
@@ -267,7 +286,6 @@ def avaliar_sinal(symbol: str):
         f"📊 <b>ATIVO:</b> {ativo}\n"
         f"📈 <b>DIREÇÃO:</b> {direction}\n"
         f"⏰ <b>ENTRADA:</b> {entry_time.strftime('%H:%M')}\n"
-        f"⏳ <b>AVISO:</b> {SIGNAL_ADVANCE_MINUTES} min antes\n"
         f"🤖 <b>ML:</b> {ml_prob*100:.0f}%"
     )
 
@@ -356,6 +374,7 @@ async def ws_loop(symbol: str):
                         last_epoch = int(df.iloc[-1]["epoch"])
                         new_epoch = int(new_row["epoch"])
 
+                        # ✅ CORREÇÃO: atualiza somente campos base sem quebrar df
                         if new_epoch == last_epoch:
                             for k, v in new_row.items():
                                 df.at[df.index[-1], k] = v
@@ -365,6 +384,7 @@ async def ws_loop(symbol: str):
                         df = calcular_indicadores(df)
                         candles[symbol] = df
 
+                        # processar só quando epoch muda
                         try:
                             current_epoch = int(df.iloc[-1]["epoch"])
                         except Exception:
