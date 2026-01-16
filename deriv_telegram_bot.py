@@ -80,6 +80,21 @@ ML_CONF_THRESHOLD = 0.55
 ML_N_ESTIMATORS = 60
 ML_MAX_DEPTH = 5
 
+# ---------------- CONTROLE DE SINAIS (ANTI-SPAM) ----------------
+# <<< ADICIONADO: controla frequência e evita reversão rápida
+
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "900"))
+# 900s = 15 minutos (por ativo)
+
+SIGNAL_MIN_CANDLES_BETWEEN = int(os.getenv("SIGNAL_MIN_CANDLES_BETWEEN", "2"))
+# precisa pelo menos 2 candles fechados antes de liberar novo sinal no mesmo ativo
+
+SIGNAL_ANTI_REVERSAL_CANDLES = int(os.getenv("SIGNAL_ANTI_REVERSAL_CANDLES", "3"))
+# se mandou COMPRA, não pode mandar VENDA logo depois (e vice-versa) por X candles
+
+WARMUP_CANDLES_AFTER_BOOT = int(os.getenv("WARMUP_CANDLES_AFTER_BOOT", "30"))
+# evita sinal "cru" logo após restart (30 candles = 150 min em M5)
+
 # ---------------- Estado ----------------
 
 candles = {s: pd.DataFrame() for s in SYMBOLS}
@@ -89,6 +104,14 @@ last_signal_epoch = {s: None for s in SYMBOLS}
 
 # controla treino/avaliação só por candle novo
 last_trained_epoch = {s: None for s in SYMBOLS}
+
+# <<< ADICIONADO: anti-spam por ativo
+last_signal_time = {s: 0.0 for s in SYMBOLS}
+last_signal_direction = {s: None for s in SYMBOLS}
+last_signal_index = {s: None for s in SYMBOLS}
+
+# <<< ADICIONADO: warmup global após boot (não bloqueia ML, só evita sinais ruins no boot)
+boot_time = time.time()
 
 # ---------------- Logging ----------------
 
@@ -186,6 +209,49 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
     vals = [float(row[c]) for c in cols]
     return model.predict_proba([vals])[0][1]
 
+# ---------------- FILTROS ANTI-SPAM ----------------
+
+def can_send_signal(symbol: str, direction: str, epoch: int) -> bool:
+    """
+    <<< ADICIONADO: impede spam, sinal duplicado, e reversão rápida.
+    NÃO altera o ML (ML continua sendo o único filtro da assertividade).
+    """
+    now = time.time()
+
+    # 1) cooldown por tempo
+    if (now - last_signal_time[symbol]) < SIGNAL_COOLDOWN_SECONDS:
+        return False
+
+    # 2) 1 sinal por candle (por ativo)
+    if last_signal_epoch[symbol] == epoch:
+        return False
+
+    # 3) precisa passar X candles antes de mandar outro sinal no mesmo ativo
+    df = candles[symbol]
+    if len(df) > 5:
+        idx = len(df) - 1
+        last_idx = last_signal_index[symbol]
+        if last_idx is not None and (idx - last_idx) < SIGNAL_MIN_CANDLES_BETWEEN:
+            return False
+
+    # 4) anti reversão rápida
+    prev_dir = last_signal_direction[symbol]
+    if prev_dir is not None and prev_dir != direction:
+        df = candles[symbol]
+        if len(df) > 5:
+            idx = len(df) - 1
+            last_idx = last_signal_index[symbol]
+            if last_idx is not None and (idx - last_idx) < SIGNAL_ANTI_REVERSAL_CANDLES:
+                return False
+
+    # 5) warmup após boot (evita sinais "crus" do restart)
+    df = candles[symbol]
+    if len(df) < ML_MIN_TRAINED_SAMPLES + WARMUP_CANDLES_AFTER_BOOT:
+        # aqui é pra impedir aquele spam inicial e evitar que você opere sinais ruins do boot
+        return False
+
+    return True
+
 # ---------------- SINAL ----------------
 
 def avaliar_sinal(symbol: str):
@@ -203,9 +269,16 @@ def avaliar_sinal(symbol: str):
         return
 
     epoch = int(row["epoch"])
-    if last_signal_epoch[symbol] == epoch:
+
+    # <<< ADICIONADO: anti-spam inteligente (sem mexer na lógica do ML)
+    if not can_send_signal(symbol, direction, epoch):
         return
+
+    # marcações de envio
     last_signal_epoch[symbol] = epoch
+    last_signal_time[symbol] = time.time()
+    last_signal_direction[symbol] = direction
+    last_signal_index[symbol] = len(df) - 1
 
     entry_time = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
     entry_time += timedelta(minutes=SIGNAL_ADVANCE_MINUTES)
@@ -237,54 +310,18 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
-                # =========================================================
-                # 1) HISTÓRICO: ticks_history (SOMENTE HISTÓRICO, sem subscribe)
-                # =========================================================
                 req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
                     "count": 1200,
                     "end": "latest",
                     "granularity": GRANULARITY_SECONDS,
-                    "style": "candles"
+                    "style": "candles",
+                    "subscribe": 1
                 }
                 await ws.send(json.dumps(req_hist))
                 log(f"{symbol} Histórico solicitado 📥", "info")
 
-                # recebe 1 pacote de histórico e aplica no dataset
-                hist_received = False
-                while not hist_received:
-                    raw = await ws.recv()
-                    data = json.loads(raw)
-                    if "candles" in data:
-                        df = pd.DataFrame(data["candles"])
-                        candles[symbol] = calcular_indicadores(df)
-
-                        # treina 1 vez após histórico
-                        try:
-                            current_epoch = int(candles[symbol].iloc[-1]["epoch"])
-                        except Exception:
-                            current_epoch = None
-
-                        if current_epoch is not None:
-                            last_trained_epoch[symbol] = current_epoch
-                            train_ml(symbol)
-                            avaliar_sinal(symbol)
-
-                        hist_received = True
-
-                # =========================================================
-                # 2) STREAM REAL: candles subscribe (isso impede o "mudo")
-                # =========================================================
-                req_stream = {
-                    "candles": symbol,
-                    "subscribe": 1,
-                    "granularity": GRANULARITY_SECONDS
-                }
-                await ws.send(json.dumps(req_stream))
-                log(f"{symbol} Stream iniciado 🔥", "info")
-
-                # loop com timeout para não travar em silêncio
                 while True:
                     try:
                         raw = await asyncio.wait_for(
@@ -304,34 +341,25 @@ async def ws_loop(symbol: str):
 
                     data = json.loads(raw)
 
-                    # stream pode vir como {"candles":[...]} ou {"candle":{...}}
-                    if "candle" in data and isinstance(data["candle"], dict):
-                        df = pd.DataFrame([data["candle"]])
-                        # junta com o dataset existente sem apagar histórico
-                        if len(candles[symbol]) > 0:
-                            candles[symbol] = pd.concat([candles[symbol], df], ignore_index=True)
-                        else:
-                            candles[symbol] = df
-                        candles[symbol] = calcular_indicadores(candles[symbol])
+                    # resposta de erro do WS
+                    if "error" in data:
+                        log(f"{symbol} WS erro retorno: {data.get('error')}", "error")
+                        break
 
-                    elif "candles" in data:
+                    if "candles" in data:
                         df = pd.DataFrame(data["candles"])
-                        # se vier pacote, substitui pelo pacote (normalmente não vem aqui no stream)
                         candles[symbol] = calcular_indicadores(df)
 
-                    else:
-                        continue
+                        try:
+                            current_epoch = int(candles[symbol].iloc[-1]["epoch"])
+                        except Exception:
+                            continue
 
-                    # garante candle novo
-                    try:
-                        current_epoch = int(candles[symbol].iloc[-1]["epoch"])
-                    except Exception:
-                        continue
-
-                    if last_trained_epoch[symbol] != current_epoch:
-                        last_trained_epoch[symbol] = current_epoch
-                        train_ml(symbol)
-                        avaliar_sinal(symbol)
+                        # treinar e avaliar SOMENTE quando mudar candle (epoch novo)
+                        if last_trained_epoch[symbol] != current_epoch:
+                            last_trained_epoch[symbol] = current_epoch
+                            train_ml(symbol)
+                            avaliar_sinal(symbol)
 
         except Exception as e:
             log(f"{symbol} WS erro: {e}", "error")
