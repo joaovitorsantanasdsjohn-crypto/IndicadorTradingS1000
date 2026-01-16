@@ -55,31 +55,19 @@ SYMBOLS = [
     "frxEURAUD","frxAUDJPY","frxGBPAUD","frxGBPCAD","frxAUDNZD","frxEURCAD"
 ]
 
-# ---------------- Painel de Parâmetros Técnicos (AJUSTÁVEL) ----------------
-# ✅ Você pode calibrar aqui quando quiser.
+# ---------------- Parâmetros Técnicos ----------------
 
 EMA_FAST = 9
 EMA_MID = 21
 EMA_SLOW = 34
 
-# RSI
-RSI_PERIOD = 14
-RSI_BUY_MAX = 45    # compra: RSI deve estar <= esse valor (pullback)
-RSI_SELL_MIN = 55   # venda: RSI deve estar >= esse valor (pullback)
-
-# Bollinger
 BB_PERIOD = 20
 BB_STD = 2.3
 
-# MFI
 MFI_PERIOD = 14
-MFI_BUY_MAX = 80    # não compra com MFI estourado
-MFI_SELL_MIN = 20   # não vende com MFI já esgotado no fundo
 
-# tolerância de pullback usando BB mid
-# 0.0 = exige abaixo/acima da BB mid certinho
-# 0.001 = dá margem (0.1%) pra não ficar travado
-BB_PULLBACK_TOL_PCT = float(os.getenv("BB_PULLBACK_TOL_PCT", "0.001"))
+# RSI (usado como filtro real de setup)
+RSI_PERIOD = 14
 
 # ---------------- ML ----------------
 
@@ -90,6 +78,14 @@ ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
 ML_N_ESTIMATORS = 60
 ML_MAX_DEPTH = 5
 
+# ---------------- CONTROLE DE SINAIS (anti-spam leve) ----------------
+
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1200"))
+# 1200s = 20 minutos por ativo
+
+ANTI_REVERSAL_CANDLES = int(os.getenv("ANTI_REVERSAL_CANDLES", "2"))
+# impede COMPRA -> VENDA imediata (ou vice versa) em poucos candles
+
 # ---------------- Estado ----------------
 
 candles = {s: pd.DataFrame() for s in SYMBOLS}
@@ -97,8 +93,13 @@ ml_models = {}
 ml_model_ready = {}
 last_signal_epoch = {s: None for s in SYMBOLS}
 
-# evita reprocessar candle repetido (epoch)
+# evita reprocessar candle repetido
 last_processed_epoch = {s: None for s in SYMBOLS}
+
+# anti-spam por ativo
+last_signal_time = {s: 0.0 for s in SYMBOLS}
+last_signal_dir = {s: None for s in SYMBOLS}
+last_signal_idx = {s: None for s in SYMBOLS}
 
 # ---------------- Logging ----------------
 
@@ -138,15 +139,12 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     if len(df) < EMA_SLOW + 10:
         return df
 
-    # EMAs
     df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
 
-    # RSI
     df["rsi"] = RSIIndicator(df["close"], RSI_PERIOD).rsi()
 
-    # Bollinger
     bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
     df["bb_mid"] = bb.bollinger_mavg()
     df["bb_upper"] = bb.bollinger_hband()
@@ -171,7 +169,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 def build_ml_dataset(df: pd.DataFrame):
     df = df.dropna().copy()
     df["future"] = (df["close"].shift(-1) > df["close"]).astype(int)
-    X = df.drop(columns=["future", "epoch"]).iloc[:-1]
+    X = df.drop(columns=["future","epoch"]).iloc[:-1]
     y = df["future"].iloc[:-1]
     return X.tail(ML_MAX_SAMPLES), y.tail(ML_MAX_SAMPLES)
 
@@ -199,14 +197,15 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
     vals = [float(row[c]) for c in cols]
     return model.predict_proba([vals])[0][1]
 
-# ---------------- CENÁRIO (Indicadores juntos criam o setup) ----------------
+# ---------------- SETUP / CONTEXTO DE MERCADO ----------------
 
 def has_market_context(row: pd.Series, direction: str) -> bool:
     """
-    ✅ EMA + RSI + Bollinger + MFI juntos criam o cenário.
-    ✅ ML continua sendo o filtro final (decide enviar ou não).
+    Só manda sinal quando existir um SETUP com contexto,
+    usando EMA + RSI + Bollinger + MFI.
     """
 
+    # valores
     close = float(row["close"])
     ema_fast = float(row["ema_fast"])
     ema_mid = float(row["ema_mid"])
@@ -215,54 +214,71 @@ def has_market_context(row: pd.Series, direction: str) -> bool:
     mfi = float(row["mfi"])
     bb_mid = float(row["bb_mid"])
 
-    # tolerância p/ pullback na bb_mid
-    tol = abs(bb_mid) * BB_PULLBACK_TOL_PCT
-
     # =====================
-    # COMPRA
+    # COMPRA (pullback)
     # =====================
     if direction == "COMPRA":
-        # 1) tendência de alta real
+        # tendência real
         if not (ema_fast > ema_mid > ema_slow):
             return False
 
-        # 2) RSI indicando pullback / chance
-        if rsi > RSI_BUY_MAX:
+        # RSI saudável
+        if not (35 <= rsi <= 55):
             return False
 
-        # 3) pullback na BB mid (preço abaixo ou bem próximo)
-        if close > (bb_mid + tol):
+        # pullback: preço perto/abaixo da BB mid
+        if close > bb_mid:
             return False
 
-        # 4) MFI não saturado
-        if mfi >= MFI_BUY_MAX:
+        # MFI: não comprar saturado
+        if mfi >= 75:
             return False
 
         return True
 
     # =====================
-    # VENDA
+    # VENDA (pullback)
     # =====================
     if direction == "VENDA":
-        # 1) tendência de baixa real
         if not (ema_fast < ema_mid < ema_slow):
             return False
 
-        # 2) RSI indicando pullback / chance
-        if rsi < RSI_SELL_MIN:
+        if not (45 <= rsi <= 65):
             return False
 
-        # 3) pullback na BB mid (preço acima ou bem próximo)
-        if close < (bb_mid - tol):
+        # pullback: preço perto/acima da BB mid
+        if close < bb_mid:
             return False
 
-        # 4) MFI não esgotado
-        if mfi <= MFI_SELL_MIN:
+        # MFI: não vender esgotado
+        if mfi <= 25:
             return False
 
         return True
 
     return False
+
+# ---------------- ANTI-SPAM LEVE ----------------
+
+def can_send_signal(symbol: str, direction: str, epoch: int, idx: int) -> bool:
+    now = time.time()
+
+    # 1) 1 sinal por candle por ativo
+    if last_signal_epoch[symbol] == epoch:
+        return False
+
+    # 2) cooldown por tempo (20m por ativo)
+    if (now - last_signal_time[symbol]) < SIGNAL_COOLDOWN_SECONDS:
+        return False
+
+    # 3) anti reversão rápida
+    prev_dir = last_signal_dir[symbol]
+    last_idx = last_signal_idx[symbol]
+    if prev_dir is not None and prev_dir != direction and last_idx is not None:
+        if (idx - last_idx) < ANTI_REVERSAL_CANDLES:
+            return False
+
+    return True
 
 # ---------------- SINAL ----------------
 
@@ -272,25 +288,31 @@ def avaliar_sinal(symbol: str):
         return
 
     row = df.iloc[-1]
-    epoch = int(row["epoch"])
 
-    # 1 sinal por candle por ativo (isso não é anti-spam, é evitar duplicidade)
-    if last_signal_epoch[symbol] == epoch:
-        return
-
-    # direção base (CONTEXTO)
+    # direção base
     direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
-    # ✅ cenário criado pelos indicadores juntos
+    # 1) contexto de mercado
     if not has_market_context(row, direction):
         return
 
-    # ✅ ML decide a vela (filtro final)
+    # 2) ML filtra probabilidade
     ml_prob = ml_predict(symbol, row)
     if ml_prob is None or ml_prob < ML_CONF_THRESHOLD:
         return
 
+    epoch = int(row["epoch"])
+    idx = len(df) - 1
+
+    # 3) anti-spam leve
+    if not can_send_signal(symbol, direction, epoch, idx):
+        return
+
+    # marcações
     last_signal_epoch[symbol] = epoch
+    last_signal_time[symbol] = time.time()
+    last_signal_dir[symbol] = direction
+    last_signal_idx[symbol] = idx
 
     entry_time = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
     entry_time += timedelta(minutes=SIGNAL_ADVANCE_MINUTES)
@@ -322,7 +344,7 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
-                req = {
+                req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
                     "count": 1200,
@@ -331,12 +353,15 @@ async def ws_loop(symbol: str):
                     "style": "candles",
                     "subscribe": 1
                 }
-                await ws.send(json.dumps(req))
+                await ws.send(json.dumps(req_hist))
                 log(f"{symbol} Histórico + stream solicitado 📥", "info")
 
                 while True:
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=WS_CANDLE_TIMEOUT_SECONDS)
+                        raw = await asyncio.wait_for(
+                            ws.recv(),
+                            timeout=WS_CANDLE_TIMEOUT_SECONDS
+                        )
                     except asyncio.TimeoutError:
                         log(f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
                         try:
@@ -347,6 +372,7 @@ async def ws_loop(symbol: str):
 
                     data = json.loads(raw)
 
+                    # erro no retorno
                     if "error" in data:
                         log(f"{symbol} WS retornou erro: {data.get('error')}", "error")
                         try:
@@ -360,7 +386,7 @@ async def ws_loop(symbol: str):
                         df = calcular_indicadores(df)
                         candles[symbol] = df
 
-                        # processar apenas quando muda o epoch
+                        # processar só quando epoch muda
                         try:
                             current_epoch = int(df.iloc[-1]["epoch"])
                         except Exception:
@@ -379,7 +405,7 @@ async def ws_loop(symbol: str):
 
 app = Flask(__name__)
 
-@app.route("/", methods=["GET", "HEAD"])
+@app.route("/", methods=["GET","HEAD"])
 def health():
     return "OK", 200
 
@@ -390,7 +416,14 @@ def run_flask():
 
 async def main():
     send_telegram("🚀 BOT INICIADO — M5 ATIVO")
-    await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
+
+    # <<< ADICIONADO: evita overload na Deriv (corrige WrongResponse)
+    tasks = []
+    for i, s in enumerate(SYMBOLS):
+        tasks.append(asyncio.create_task(ws_loop(s)))
+        await asyncio.sleep(1.2)  # delay entre conexões
+
+    await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
