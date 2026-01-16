@@ -46,8 +46,8 @@ WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# watchdog: se ficar sem candle, reconecta
-WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "900"))
+# watchdog para reconectar se WS ficar "mudo"
+WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "300"))
 
 SYMBOLS = [
     "frxEURUSD","frxUSDJPY","frxGBPUSD","frxUSDCHF","frxAUDUSD",
@@ -61,22 +61,30 @@ EMA_FAST = 9
 EMA_MID = 21
 EMA_SLOW = 34
 
-RSI_BUY_MAX = 45
-RSI_SELL_MIN = 55
-
 BB_PERIOD = 20
 BB_STD = 2.3
 
 MFI_PERIOD = 14
+
+# RSI (usado como filtro real de setup)
+RSI_PERIOD = 14
 
 # ---------------- ML ----------------
 
 ML_ENABLED = SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = 300
 ML_MAX_SAMPLES = 2000
-ML_CONF_THRESHOLD = 0.55
+ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
 ML_N_ESTIMATORS = 60
 ML_MAX_DEPTH = 5
+
+# ---------------- CONTROLE DE SINAIS (anti-spam leve) ----------------
+
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1200"))
+# 1200s = 20 minutos por ativo
+
+ANTI_REVERSAL_CANDLES = int(os.getenv("ANTI_REVERSAL_CANDLES", "2"))
+# impede COMPRA -> VENDA imediata (ou vice versa) em poucos candles
 
 # ---------------- Estado ----------------
 
@@ -85,8 +93,13 @@ ml_models = {}
 ml_model_ready = {}
 last_signal_epoch = {s: None for s in SYMBOLS}
 
-# controla treino/avaliação só por candle novo
-last_trained_epoch = {s: None for s in SYMBOLS}
+# evita reprocessar candle repetido
+last_processed_epoch = {s: None for s in SYMBOLS}
+
+# anti-spam por ativo
+last_signal_time = {s: 0.0 for s in SYMBOLS}
+last_signal_dir = {s: None for s in SYMBOLS}
+last_signal_idx = {s: None for s in SYMBOLS}
 
 # ---------------- Logging ----------------
 
@@ -123,20 +136,21 @@ def send_telegram(message: str):
 
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().reset_index(drop=True)
-    if len(df) < EMA_SLOW:
+    if len(df) < EMA_SLOW + 10:
         return df
 
     df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
-    df["rsi"] = RSIIndicator(df["close"], 14).rsi()
+
+    df["rsi"] = RSIIndicator(df["close"], RSI_PERIOD).rsi()
 
     bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
     df["bb_mid"] = bb.bollinger_mavg()
     df["bb_upper"] = bb.bollinger_hband()
     df["bb_lower"] = bb.bollinger_lband()
 
-    # volume neutro
+    # MFI (volume neutro em Forex)
     if "volume" not in df.columns:
         df["volume"] = 1
 
@@ -183,25 +197,125 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
     vals = [float(row[c]) for c in cols]
     return model.predict_proba([vals])[0][1]
 
+# ---------------- SETUP / CONTEXTO DE MERCADO ----------------
+
+def has_market_context(row: pd.Series, direction: str) -> bool:
+    """
+    Aqui é a correção principal:
+    Só manda sinal quando existir um SETUP com contexto,
+    usando EMA + RSI + Bollinger + MFI.
+    """
+
+    # valores
+    close = float(row["close"])
+    ema_fast = float(row["ema_fast"])
+    ema_mid = float(row["ema_mid"])
+    ema_slow = float(row["ema_slow"])
+    rsi = float(row["rsi"])
+    mfi = float(row["mfi"])
+    bb_mid = float(row["bb_mid"])
+    bb_upper = float(row["bb_upper"])
+    bb_lower = float(row["bb_lower"])
+
+    # =====================
+    # COMPRA (pullback)
+    # =====================
+    if direction == "COMPRA":
+        # tendência real
+        if not (ema_fast > ema_mid > ema_slow):
+            return False
+
+        # RSI saudável: sem exaustão e sem neutro demais
+        if not (35 <= rsi <= 55):
+            return False
+
+        # pullback: preço perto/abaixo da BB mid
+        if close > bb_mid:
+            return False
+
+        # MFI: não comprar quando já está saturado
+        if mfi >= 75:
+            return False
+
+        return True
+
+    # =====================
+    # VENDA (pullback)
+    # =====================
+    if direction == "VENDA":
+        if not (ema_fast < ema_mid < ema_slow):
+            return False
+
+        if not (45 <= rsi <= 65):
+            return False
+
+        # pullback: preço perto/acima da BB mid
+        if close < bb_mid:
+            return False
+
+        # MFI: não vender quando já está esgotado pra baixo
+        if mfi <= 25:
+            return False
+
+        return True
+
+    return False
+
+# ---------------- ANTI-SPAM LEVE ----------------
+
+def can_send_signal(symbol: str, direction: str, epoch: int, idx: int) -> bool:
+    now = time.time()
+
+    # 1) 1 sinal por candle por ativo
+    if last_signal_epoch[symbol] == epoch:
+        return False
+
+    # 2) cooldown por tempo (20m por ativo)
+    if (now - last_signal_time[symbol]) < SIGNAL_COOLDOWN_SECONDS:
+        return False
+
+    # 3) anti reversão rápida
+    prev_dir = last_signal_dir[symbol]
+    last_idx = last_signal_idx[symbol]
+    if prev_dir is not None and prev_dir != direction and last_idx is not None:
+        if (idx - last_idx) < ANTI_REVERSAL_CANDLES:
+            return False
+
+    return True
+
 # ---------------- SINAL ----------------
 
 def avaliar_sinal(symbol: str):
     df = candles[symbol]
-    if len(df) < EMA_SLOW + 5:
+    if len(df) < EMA_SLOW + 50:
         return
 
     row = df.iloc[-1]
 
+    # direção base (mas agora NÃO é mais o único critério)
     direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
+    # 1) contexto de mercado (correção principal)
+    if not has_market_context(row, direction):
+        return
+
+    # 2) ML filtra probabilidade
     ml_prob = ml_predict(symbol, row)
     if ml_prob is None or ml_prob < ML_CONF_THRESHOLD:
         return
 
     epoch = int(row["epoch"])
-    if last_signal_epoch[symbol] == epoch:
+    idx = len(df) - 1
+
+    # 3) anti-spam leve
+    if not can_send_signal(symbol, direction, epoch, idx):
         return
+
+    # marcações
     last_signal_epoch[symbol] = epoch
+    last_signal_time[symbol] = time.time()
+    last_signal_dir[symbol] = direction
+    last_signal_idx[symbol] = idx
 
     entry_time = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
     entry_time += timedelta(minutes=SIGNAL_ADVANCE_MINUTES)
@@ -216,129 +330,85 @@ def avaliar_sinal(symbol: str):
     )
 
     send_telegram(msg)
-    log(f"{symbol} — sinal enviado {direction}")
+    log(f"{symbol} — sinal enviado {direction} (ML {ml_prob*100:.0f}%)")
 
 # ---------------- WebSocket ----------------
 
 async def ws_loop(symbol: str):
-    backoff = 5  # começa com 5s
-    backoff_max = 90
-
     while True:
-        ws = None
         try:
             log(f"{symbol} WS conectando...", "info")
 
-            ws = await websockets.connect(
+            async with websockets.connect(
                 WS_URL,
                 ping_interval=WS_PING_INTERVAL,
                 ping_timeout=WS_PING_TIMEOUT
-            )
+            ) as ws:
 
-            log(f"{symbol} WS conectado ✅", "info")
-            backoff = 5  # reset backoff quando conecta
+                log(f"{symbol} WS conectado ✅", "info")
 
-            # 1) histórico (SEM subscribe)
-            req_hist = {
-                "ticks_history": symbol,
-                "adjust_start_time": 1,
-                "count": 1200,
-                "end": "latest",
-                "granularity": GRANULARITY_SECONDS,
-                "style": "candles"
-            }
-            await ws.send(json.dumps(req_hist))
+                req_hist = {
+                    "ticks_history": symbol,
+                    "adjust_start_time": 1,
+                    "count": 1200,
+                    "end": "latest",
+                    "granularity": GRANULARITY_SECONDS,
+                    "style": "candles",
+                    "subscribe": 1
+                }
+                await ws.send(json.dumps(req_hist))
+                log(f"{symbol} Histórico + stream solicitado 📥", "info")
 
-            # aguarda resposta do histórico
-            while True:
-                raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                data = json.loads(raw)
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(
+                            ws.recv(),
+                            timeout=WS_CANDLE_TIMEOUT_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        log(f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        break
 
-                if "error" in data:
-                    log(f"{symbol} WS retornou erro no histórico: {data.get('error')}", "error")
-                    raise Exception("Erro ao solicitar histórico")
+                    data = json.loads(raw)
 
-                if "candles" in data:
-                    df = pd.DataFrame(data["candles"])
-                    candles[symbol] = calcular_indicadores(df)
+                    # erro no retorno
+                    if "error" in data:
+                        log(f"{symbol} WS retornou erro: {data.get('error')}", "error")
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        break
 
-                    # treina e avalia UMA vez após histórico
-                    train_ml(symbol)
-                    avaliar_sinal(symbol)
-                    break
+                    if "candles" in data:
+                        df = pd.DataFrame(data["candles"])
+                        df = calcular_indicadores(df)
+                        candles[symbol] = df
 
-            log(f"{symbol} Histórico carregado ✅", "info")
+                        # processar só quando epoch muda
+                        try:
+                            current_epoch = int(df.iloc[-1]["epoch"])
+                        except Exception:
+                            continue
 
-            # 2) stream REAL contínuo de candles (candles subscribe)
-            req_stream = {
-                "candles": symbol,
-                "subscribe": 1,
-                "count": 1,
-                "granularity": GRANULARITY_SECONDS
-            }
-            await ws.send(json.dumps(req_stream))
-            log(f"{symbol} Stream iniciado 🔴", "info")
-
-            # loop infinito recebendo candle ao vivo
-            while True:
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=WS_CANDLE_TIMEOUT_SECONDS)
-                except asyncio.TimeoutError:
-                    log(f"{symbol} Sem candle por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
-                    raise Exception("WS mudo")
-
-                data = json.loads(raw)
-
-                if "error" in data:
-                    log(f"{symbol} WS retornou erro: {data.get('error')}", "error")
-                    raise Exception("Erro retornado pelo WS")
-
-                # candle ao vivo vem em "ohlc"
-                if "ohlc" in data:
-                    o = data["ohlc"]
-                    row = {
-                        "epoch": int(o["epoch"]),
-                        "open": float(o["open"]),
-                        "high": float(o["high"]),
-                        "low": float(o["low"]),
-                        "close": float(o["close"])
-                    }
-
-                    # atualiza dataframe incremental (sem apagar)
-                    df = candles[symbol]
-                    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-
-                    # limita dataset para não explodir memória
-                    df = df.tail(ML_MAX_SAMPLES + 300).reset_index(drop=True)
-
-                    candles[symbol] = calcular_indicadores(df)
-
-                    current_epoch = int(candles[symbol].iloc[-1]["epoch"])
-                    if last_trained_epoch[symbol] != current_epoch:
-                        last_trained_epoch[symbol] = current_epoch
-                        train_ml(symbol)
-                        avaliar_sinal(symbol)
+                        if last_processed_epoch[symbol] != current_epoch:
+                            last_processed_epoch[symbol] = current_epoch
+                            train_ml(symbol)
+                            avaliar_sinal(symbol)
 
         except Exception as e:
-            log(f"{symbol} WS falhou: {e}", "error")
-
-            # fecha WS corretamente
-            try:
-                if ws is not None:
-                    await ws.close()
-            except Exception:
-                pass
-
-            # backoff progressivo (não spamma a Deriv)
-            log(f"{symbol} aguardando {backoff}s para reconectar...", "warning")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, backoff_max)
+            log(f"{symbol} WS erro: {e}", "error")
+            await asyncio.sleep(5)
 
 # ---------------- Flask ----------------
 
 app = Flask(__name__)
 
-@app.route("/", methods=["GET", "HEAD"])
+@app.route("/", methods=["GET","HEAD"])
 def health():
     return "OK", 200
 
