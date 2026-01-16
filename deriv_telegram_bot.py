@@ -1,24 +1,16 @@
-# Indicador Trading S1000
-
 import asyncio
 import websockets
 import json
 import pandas as pd
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator
-from ta.volatility import BollingerBands
-from ta.volume import MFIIndicator
+import numpy as np
 import requests
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
+from flask import Flask
+import threading
 import os
 import time
 import logging
-from flask import Flask
-import threading
 from typing import Optional
-
-# ---------------- ML availability ----------------
 
 try:
     from sklearn.ensemble import RandomForestClassifier
@@ -26,11 +18,6 @@ try:
 except Exception:
     SKLEARN_AVAILABLE = False
 
-# ---------------- Inicialização ----------------
-
-load_dotenv()
-
-# ---------------- Configurações ----------------
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -40,15 +27,13 @@ APP_ID = os.getenv("DERIV_APP_ID", "111022")
 CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))
 GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
 
-# ✅ quantos minutos ANTES você quer receber a mensagem (5, 10, 15...)
 SIGNAL_ADVANCE_MINUTES = int(os.getenv("SIGNAL_ADVANCE_MINUTES", "5"))
 
-WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
+WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "25"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
-WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "180"))
 
-# watchdog para reconectar se WS ficar "mudo"
-WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "300"))
+WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 SYMBOLS = [
     "frxEURUSD","frxUSDJPY","frxGBPUSD","frxUSDCHF","frxAUDUSD",
@@ -56,40 +41,27 @@ SYMBOLS = [
     "frxEURAUD","frxAUDJPY","frxGBPAUD","frxGBPCAD","frxAUDNZD","frxEURCAD"
 ]
 
-# ---------------- Parâmetros Técnicos ----------------
-
 EMA_FAST = 9
 EMA_MID = 21
 EMA_SLOW = 34
 
+RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.3
-
 MFI_PERIOD = 14
 
-# RSI
-RSI_PERIOD = 14
-
-# ---------------- ML ----------------
-
 ML_ENABLED = SKLEARN_AVAILABLE
-ML_MIN_TRAINED_SAMPLES = 300
-ML_MAX_SAMPLES = 2000
+ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "240"))
+ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "1200"))
 ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
-ML_N_ESTIMATORS = 60
-ML_MAX_DEPTH = 5
+ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "45"))
+ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "5"))
 
-# ---------------- Estado ----------------
+MAX_CANDLES_IN_RAM = int(os.getenv("MAX_CANDLES_IN_RAM", "1350"))
+TRAIN_EVERY_N_CANDLES = int(os.getenv("TRAIN_EVERY_N_CANDLES", "3"))
 
-candles = {s: pd.DataFrame() for s in SYMBOLS}
-ml_models = {}
-ml_model_ready = {}
-last_signal_epoch = {s: None for s in SYMBOLS}
-
-# evita reprocessar candle repetido
-last_processed_epoch = {s: None for s in SYMBOLS}
-
-# ---------------- Logging ----------------
+STARTUP_NOTIFY_COOLDOWN_MIN = int(os.getenv("STARTUP_NOTIFY_COOLDOWN_MIN", "60"))
+STARTUP_NOTIFY_FILE = "startup_notify.txt"
 
 logger = logging.getLogger("IndicadorTradingS1000")
 logger.setLevel(logging.INFO)
@@ -99,215 +71,273 @@ handler.setFormatter(formatter)
 logger.handlers.clear()
 logger.addHandler(handler)
 
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
 def log(msg: str, level: str = "info"):
-    brt = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S BRT")
-    utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    utc = utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    brt = (utc_now() - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S BRT")
     full = f"{utc} | {brt} | {msg}"
     if level == "info":
         logger.info(full)
     elif level == "warning":
         logger.warning(full)
-    elif level == "error":
+    else:
         logger.error(full)
 
-# ---------------- Telegram ----------------
 
 def send_telegram(message: str):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
-        requests.post(url, data=payload, timeout=10)
+        requests.post(url, data=payload, timeout=8)
     except Exception as e:
         log(f"Erro Telegram: {e}", "error")
 
-# ---------------- Indicadores ----------------
 
-def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy().reset_index(drop=True)
-    if len(df) < EMA_SLOW + 10:
+def maybe_send_startup_message():
+    try:
+        now = time.time()
+        if os.path.exists(STARTUP_NOTIFY_FILE):
+            with open(STARTUP_NOTIFY_FILE, "r", encoding="utf-8") as f:
+                last = float(f.read().strip() or "0")
+            if now - last < STARTUP_NOTIFY_COOLDOWN_MIN * 60:
+                return
+        with open(STARTUP_NOTIFY_FILE, "w", encoding="utf-8") as f:
+            f.write(str(now))
+        send_telegram("🚀 BOT INICIADO — M5 ATIVO")
+    except Exception:
+        send_telegram("🚀 BOT INICIADO — M5 ATIVO")
+
+
+def ema(arr: np.ndarray, period: int) -> np.ndarray:
+    if len(arr) < period + 2:
+        return np.full_like(arr, np.nan, dtype=float)
+    alpha = 2.0 / (period + 1.0)
+    out = np.empty(len(arr), dtype=float)
+    out[:] = np.nan
+    out[period - 1] = np.mean(arr[:period])
+    for i in range(period, len(arr)):
+        out[i] = alpha * arr[i] + (1 - alpha) * out[i - 1]
+    return out
+
+
+def rsi(close: np.ndarray, period: int) -> np.ndarray:
+    if len(close) < period + 2:
+        return np.full(len(close), np.nan, dtype=float)
+    delta = np.diff(close)
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    avg_gain = np.empty(len(close), dtype=float); avg_gain[:] = np.nan
+    avg_loss = np.empty(len(close), dtype=float); avg_loss[:] = np.nan
+    avg_gain[period] = np.mean(gain[:period])
+    avg_loss[period] = np.mean(loss[:period])
+    for i in range(period + 1, len(close)):
+        avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gain[i - 1]) / period
+        avg_loss[i] = (avg_loss[i - 1] * (period - 1) + loss[i - 1]) / period
+    rs = avg_gain / (avg_loss + 1e-12)
+    out = 100 - (100 / (1 + rs))
+    out[:period] = np.nan
+    return out
+
+
+def bollinger_mid(close: np.ndarray, period: int) -> np.ndarray:
+    if len(close) < period:
+        return np.full(len(close), np.nan, dtype=float)
+    out = np.full(len(close), np.nan, dtype=float)
+    c = pd.Series(close)
+    out[period - 1:] = c.rolling(period).mean().values[period - 1:]
+    return out
+
+
+def mfi(high: np.ndarray, low: np.ndarray, close: np.ndarray, volume: np.ndarray, period: int) -> np.ndarray:
+    n = len(close)
+    if n < period + 2:
+        return np.full(n, np.nan, dtype=float)
+    tp = (high + low + close) / 3.0
+    mf = tp * volume
+    delta_tp = np.diff(tp)
+    pos_mf = np.where(delta_tp > 0, mf[1:], 0.0)
+    neg_mf = np.where(delta_tp < 0, mf[1:], 0.0)
+    pos = pd.Series(pos_mf).rolling(period).sum().values
+    neg = pd.Series(neg_mf).rolling(period).sum().values
+    out = np.full(n, np.nan, dtype=float)
+    ratio = pos / (neg + 1e-12)
+    mfi_vals = 100 - (100 / (1 + ratio))
+    out[period + 1:] = mfi_vals[period:]
+    return out
+
+
+def compute_features(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    need = max(EMA_SLOW + 5, BB_PERIOD + 5, RSI_PERIOD + 5, MFI_PERIOD + 5)
+    if len(df) < need:
         return df
 
-    df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
-    df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
-    df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
+    close = df["close"].astype(float).to_numpy()
+    high = df["high"].astype(float).to_numpy()
+    low = df["low"].astype(float).to_numpy()
 
-    df["rsi"] = RSIIndicator(df["close"], RSI_PERIOD).rsi()
-
-    bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
-    df["bb_mid"] = bb.bollinger_mavg()
-    df["bb_upper"] = bb.bollinger_hband()
-    df["bb_lower"] = bb.bollinger_lband()
-
-    # MFI (volume neutro em Forex)
     if "volume" not in df.columns:
-        df["volume"] = 1
+        vol = np.ones(len(df), dtype=float)
+    else:
+        vol = df["volume"].fillna(1).astype(float).to_numpy()
 
-    df["mfi"] = MFIIndicator(
-        high=df["high"],
-        low=df["low"],
-        close=df["close"],
-        volume=df["volume"],
-        window=MFI_PERIOD
-    ).money_flow_index()
+    e_fast = ema(close, EMA_FAST)
+    e_mid = ema(close, EMA_MID)
+    e_slow = ema(close, EMA_SLOW)
+    r = rsi(close, RSI_PERIOD)
+    bbm = bollinger_mid(close, BB_PERIOD)
+    mf = mfi(high, low, close, vol, MFI_PERIOD)
 
+    df["ema_fast"] = e_fast
+    df["ema_mid"] = e_mid
+    df["ema_slow"] = e_slow
+    df["rsi"] = r
+    df["bb_mid"] = bbm
+    df["mfi"] = mf
     return df
 
-# ---------------- ML ----------------
 
 def build_ml_dataset(df: pd.DataFrame):
     df = df.dropna().copy()
+    if len(df) < ML_MIN_TRAINED_SAMPLES:
+        return None, None
+
     df["future"] = (df["close"].shift(-1) > df["close"]).astype(int)
-    X = df.drop(columns=["future","epoch"]).iloc[:-1]
-    y = df["future"].iloc[:-1]
-    return X.tail(ML_MAX_SAMPLES), y.tail(ML_MAX_SAMPLES)
+
+    feat_cols = ["open", "high", "low", "close", "ema_fast", "ema_mid", "ema_slow", "rsi", "bb_mid", "mfi"]
+    for c in feat_cols:
+        df[c] = df[c].astype(float)
+
+    X = df[feat_cols].iloc[:-1].tail(ML_MAX_SAMPLES)
+    y = df["future"].iloc[:-1].tail(ML_MAX_SAMPLES)
+    return X, y
+
+
+candles = {s: pd.DataFrame() for s in SYMBOLS}
+ml_models = {}
+ml_ready = {s: False for s in SYMBOLS}
+
+last_signal_epoch = {s: None for s in SYMBOLS}
+last_processed_epoch = {s: None for s in SYMBOLS}
+candle_counter = {s: 0 for s in SYMBOLS}
+
 
 def train_ml(symbol: str):
-    df = candles[symbol]
-    if len(df) < ML_MIN_TRAINED_SAMPLES:
-        ml_model_ready[symbol] = False
+    if not ML_ENABLED:
         return
-
+    df = candles[symbol]
     X, y = build_ml_dataset(df)
+    if X is None:
+        ml_ready[symbol] = False
+        return
     model = RandomForestClassifier(
         n_estimators=ML_N_ESTIMATORS,
         max_depth=ML_MAX_DEPTH,
-        random_state=42
+        random_state=42,
+        n_jobs=1
     )
     model.fit(X, y)
+    ml_models[symbol] = model
+    ml_ready[symbol] = True
 
-    ml_models[symbol] = (model, X.columns.tolist())
-    ml_model_ready[symbol] = True
 
 def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
-    if not ml_model_ready.get(symbol):
+    if not ML_ENABLED or not ml_ready.get(symbol):
         return None
-    model, cols = ml_models[symbol]
-    vals = [float(row[c]) for c in cols]
-    return model.predict_proba([vals])[0][1]
+    model = ml_models.get(symbol)
+    if model is None:
+        return None
+    try:
+        feat = np.array([[
+            float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"]),
+            float(row["ema_fast"]), float(row["ema_mid"]), float(row["ema_slow"]),
+            float(row["rsi"]), float(row["bb_mid"]), float(row["mfi"])
+        ]], dtype=float)
+        return float(model.predict_proba(feat)[0][1])
+    except Exception:
+        return None
 
-# ---------------- SETUP / CONTEXTO DE MERCADO ----------------
 
-def has_market_context(row: pd.Series, direction: str) -> bool:
-    """
-    Só manda sinal quando existir SETUP com contexto,
-    usando EMA + RSI + Bollinger + MFI.
-    """
+def align_entry_epoch(epoch: int) -> int:
+    base = (epoch // GRANULARITY_SECONDS) * GRANULARITY_SECONDS
+    return base + GRANULARITY_SECONDS
 
-    close = float(row["close"])
-    ema_fast = float(row["ema_fast"])
-    ema_mid = float(row["ema_mid"])
-    ema_slow = float(row["ema_slow"])
-    rsi = float(row["rsi"])
-    mfi = float(row["mfi"])
-    bb_mid = float(row["bb_mid"])
 
-    # COMPRA
-    if direction == "COMPRA":
-        if not (ema_fast > ema_mid > ema_slow):
-            return False
+def format_brt_time_from_epoch(epoch: int) -> str:
+    dt = datetime.fromtimestamp(epoch, tz=timezone.utc) - timedelta(hours=3)
+    return dt.strftime("%H:%M")
 
-        if not (35 <= rsi <= 55):
-            return False
 
-        if close > bb_mid:
-            return False
+def should_send_signal(symbol: str, row: pd.Series) -> Optional[str]:
+    if pd.isna(row.get("ema_fast")) or pd.isna(row.get("ema_mid")) or pd.isna(row.get("ema_slow")):
+        return None
+    direction = "COMPRA" if float(row["ema_fast"]) >= float(row["ema_mid"]) else "VENDA"
+    return direction
 
-        if mfi >= 75:
-            return False
 
-        return True
-
-    # VENDA
-    if direction == "VENDA":
-        if not (ema_fast < ema_mid < ema_slow):
-            return False
-
-        if not (45 <= rsi <= 65):
-            return False
-
-        if close < bb_mid:
-            return False
-
-        if mfi <= 25:
-            return False
-
-        return True
-
-    return False
-
-# ---------------- SINAL ----------------
-
-def avaliar_sinal(symbol: str):
-    df = candles[symbol]
-    if len(df) < EMA_SLOW + 50:
-        return
-
-    row = df.iloc[-1]
-
-    direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
-
-    # 1) contexto
-    if not has_market_context(row, direction):
-        return
-
-    # 2) ML filtra probabilidade
-    ml_prob = ml_predict(symbol, row)
-    if ml_prob is None or ml_prob < ML_CONF_THRESHOLD:
-        return
-
-    epoch = int(row["epoch"])
-
-    # evita duplicar sinal na mesma vela
-    if last_signal_epoch[symbol] == epoch:
-        return
-    last_signal_epoch[symbol] = epoch
-
-    # ==========================================================
-    # ✅ CORREÇÃO DEFINITIVA DO HORÁRIO:
-    # - alinha no início do candle M5
-    # - calcula a entrada em múltiplos de 5min
-    # - manda mensagem "SIGNAL_ADVANCE_MINUTES" antes (por candles)
-    # ==========================================================
-
-    # quantos candles à frente equivale aos minutos desejados
-    candles_a_frente = max(1, int(round(SIGNAL_ADVANCE_MINUTES / CANDLE_INTERVAL)))
-
-    # ✅ alinha o epoch no começo exato do candle
-    base_epoch = (epoch // GRANULARITY_SECONDS) * GRANULARITY_SECONDS
-
-    # ✅ entrada exatamente na abertura do candle futuro
-    entry_epoch = base_epoch + (candles_a_frente * GRANULARITY_SECONDS)
-
-    entry_time = datetime.utcfromtimestamp(entry_epoch) - timedelta(hours=3)
+async def send_signal_at_time(symbol: str, direction: str, ml_prob: float, entry_epoch: int):
+    send_epoch = entry_epoch - (SIGNAL_ADVANCE_MINUTES * 60)
+    now = int(time.time())
+    delay = send_epoch - now
+    if delay > 0:
+        await asyncio.sleep(delay)
 
     ativo = symbol.replace("frx", "")
+    entry_time = format_brt_time_from_epoch(entry_epoch)
 
     msg = (
         f"📊 <b>ATIVO:</b> {ativo}\n"
         f"📈 <b>DIREÇÃO:</b> {direction}\n"
-        f"⏰ <b>ENTRADA:</b> {entry_time.strftime('%H:%M')}\n"
+        f"⏰ <b>ENTRADA:</b> {entry_time}\n"
         f"🤖 <b>ML:</b> {ml_prob*100:.0f}%"
     )
-
     send_telegram(msg)
-    log(f"{symbol} — sinal enviado {direction} (ML {ml_prob*100:.0f}%)")
+    log(f"{symbol} — sinal enviado {direction} (ML {ml_prob*100:.0f}%)", "info")
 
-# ---------------- WebSocket ----------------
+
+def evaluate_signal(symbol: str):
+    df = candles[symbol]
+    if len(df) < max(EMA_SLOW + 60, ML_MIN_TRAINED_SAMPLES):
+        return
+
+    row = df.iloc[-1]
+    direction = should_send_signal(symbol, row)
+    if not direction:
+        return
+
+    ml_prob = ml_predict(symbol, row)
+    if ml_prob is None or ml_prob < ML_CONF_THRESHOLD:
+        return
+
+    candle_epoch = int(row["epoch"])
+    entry_epoch = align_entry_epoch(candle_epoch)
+
+    if last_signal_epoch[symbol] == entry_epoch:
+        return
+    last_signal_epoch[symbol] = entry_epoch
+
+    asyncio.create_task(send_signal_at_time(symbol, direction, ml_prob, entry_epoch))
+
 
 async def ws_loop(symbol: str):
     while True:
         try:
             log(f"{symbol} WS conectando...", "info")
-
             async with websockets.connect(
                 WS_URL,
                 ping_interval=WS_PING_INTERVAL,
-                ping_timeout=WS_PING_TIMEOUT
+                ping_timeout=WS_PING_TIMEOUT,
+                close_timeout=5
             ) as ws:
-
                 log(f"{symbol} WS conectado ✅", "info")
 
-                # 1) histórico
                 req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
@@ -319,28 +349,38 @@ async def ws_loop(symbol: str):
                 await ws.send(json.dumps(req_hist))
                 log(f"{symbol} Histórico solicitado 📥", "info")
 
-                hist_raw = await ws.recv()
-                hist_data = json.loads(hist_raw)
-
-                if "error" in hist_data:
-                    log(f"{symbol} WS retornou erro: {hist_data.get('error')}", "error")
+                raw = await ws.recv()
+                data = json.loads(raw)
+                if "error" in data:
+                    log(f"{symbol} WS erro hist: {data.get('error')}", "error")
                     await ws.close()
                     continue
 
-                df = pd.DataFrame(hist_data.get("candles", []))
+                df = pd.DataFrame(data.get("candles", []))
                 if df.empty:
-                    log(f"{symbol} Histórico vazio — reconectando 🔁", "warning")
+                    log(f"{symbol} Histórico vazio — reconectando", "warning")
                     await ws.close()
                     continue
 
-                df = calcular_indicadores(df)
+                for col in ["open", "high", "low", "close"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df["epoch"] = pd.to_numeric(df["epoch"], errors="coerce").astype("Int64")
+
+                df = df.tail(MAX_CANDLES_IN_RAM).reset_index(drop=True)
+                df = compute_features(df)
                 candles[symbol] = df
 
-                # 2) stream candles
+                if ML_ENABLED:
+                    train_ml(symbol)
+
                 req_stream = {
-                    "candles_subscribe": 1,
-                    "symbol": symbol,
-                    "granularity": GRANULARITY_SECONDS
+                    "ticks_history": symbol,
+                    "adjust_start_time": 1,
+                    "count": 1,
+                    "end": "latest",
+                    "granularity": GRANULARITY_SECONDS,
+                    "style": "candles",
+                    "subscribe": 1
                 }
                 await ws.send(json.dumps(req_stream))
                 log(f"{symbol} Stream (candles) ligado 🔴", "info")
@@ -349,72 +389,89 @@ async def ws_loop(symbol: str):
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=WS_CANDLE_TIMEOUT_SECONDS)
                     except asyncio.TimeoutError:
-                        log(f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
+                        log(f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando", "warning")
                         try:
                             await ws.close()
                         except Exception:
                             pass
                         break
 
-                    data = json.loads(raw)
+                    msg = json.loads(raw)
 
-                    if "error" in data:
-                        log(f"{symbol} WS retornou erro: {data.get('error')}", "error")
+                    if "error" in msg:
+                        log(f"{symbol} WS retornou erro: {msg.get('error')}", "error")
                         try:
                             await ws.close()
                         except Exception:
                             pass
                         break
 
-                    # candle update
-                    if "candles" in data:
-                        new_row = data["candles"][0]
-                        df = candles[symbol]
+                    if "candles" not in msg:
+                        continue
 
-                        last_epoch = int(df.iloc[-1]["epoch"])
-                        new_epoch = int(new_row["epoch"])
+                    new_row = msg["candles"][0]
+                    if not new_row:
+                        continue
 
-                        # ✅ CORREÇÃO: atualiza somente campos base sem quebrar df
-                        if new_epoch == last_epoch:
-                            for k, v in new_row.items():
-                                df.at[df.index[-1], k] = v
-                        else:
-                            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                    df = candles[symbol]
+                    if df.empty:
+                        continue
 
-                        df = calcular_indicadores(df)
-                        candles[symbol] = df
+                    try:
+                        new_epoch = int(new_row.get("epoch"))
+                    except Exception:
+                        continue
 
-                        # processar só quando epoch muda
-                        try:
-                            current_epoch = int(df.iloc[-1]["epoch"])
-                        except Exception:
-                            continue
+                    last_epoch = int(df.iloc[-1]["epoch"])
 
-                        if last_processed_epoch[symbol] != current_epoch:
-                            last_processed_epoch[symbol] = current_epoch
-                            train_ml(symbol)
-                            avaliar_sinal(symbol)
+                    if new_epoch == last_epoch:
+                        for k in ("open", "high", "low", "close"):
+                            if k in new_row:
+                                df.at[df.index[-1], k] = float(new_row[k])
+                    else:
+                        row_df = pd.DataFrame([new_row])
+                        for col in ["open", "high", "low", "close"]:
+                            row_df[col] = pd.to_numeric(row_df[col], errors="coerce")
+                        row_df["epoch"] = pd.to_numeric(row_df["epoch"], errors="coerce").astype("Int64")
+                        df = pd.concat([df, row_df], ignore_index=True)
+
+                    df = df.tail(MAX_CANDLES_IN_RAM).reset_index(drop=True)
+                    df = compute_features(df)
+                    candles[symbol] = df
+
+                    cur_epoch = int(df.iloc[-1]["epoch"])
+                    if last_processed_epoch[symbol] == cur_epoch:
+                        continue
+                    last_processed_epoch[symbol] = cur_epoch
+
+                    candle_counter[symbol] += 1
+                    if ML_ENABLED and (candle_counter[symbol] % TRAIN_EVERY_N_CANDLES == 0):
+                        train_ml(symbol)
+
+                    evaluate_signal(symbol)
 
         except Exception as e:
             log(f"{symbol} WS erro: {e}", "error")
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
-# ---------------- Flask ----------------
 
 app = Flask(__name__)
 
-@app.route("/", methods=["GET","HEAD"])
+@app.route("/", methods=["GET", "HEAD"])
 def health():
     return "OK", 200
 
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
 
-# ---------------- MAIN ----------------
+def run_flask():
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
 
 async def main():
-    send_telegram("🚀 BOT INICIADO — M5 ATIVO")
-    await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
+    maybe_send_startup_message()
+    tasks = [ws_loop(s) for s in SYMBOLS]
+    await asyncio.gather(*tasks)
+
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
