@@ -57,24 +57,26 @@ SYMBOLS = [
 
 # ---------------- Parâmetros Técnicos ----------------
 
-EMA_FAST = 9
-EMA_MID = 21
-EMA_SLOW = 34
+EMA_FAST = int(os.getenv("EMA_FAST", "9"))
+EMA_MID = int(os.getenv("EMA_MID", "21"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "34"))
 
-BB_PERIOD = 20
-BB_STD = 2.3
+BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
+BB_STD = float(os.getenv("BB_STD", "2.3"))
 
-MFI_PERIOD = 14
-RSI_PERIOD = 14
+MFI_PERIOD = int(os.getenv("MFI_PERIOD", "14"))
+
+# RSI (configurável)
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 
 # ---------------- ML ----------------
 
 ML_ENABLED = SKLEARN_AVAILABLE
-ML_MIN_TRAINED_SAMPLES = 300
-ML_MAX_SAMPLES = 2000
+ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "300"))
+ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "2000"))
 ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
-ML_N_ESTIMATORS = 60
-ML_MAX_DEPTH = 5
+ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "60"))
+ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "5"))
 
 # ---------------- Estado ----------------
 
@@ -97,6 +99,7 @@ logger.handlers.clear()
 logger.addHandler(handler)
 
 def log(msg: str, level: str = "info"):
+    # mantém seu padrão UTC + BRT
     brt = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S BRT")
     utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     full = f"{utc} | {brt} | {msg}"
@@ -121,7 +124,9 @@ def send_telegram(message: str):
 
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().reset_index(drop=True)
-    if len(df) < EMA_SLOW + 10:
+
+    # precisa ter candles suficientes pra indicadores ficarem consistentes
+    if len(df) < EMA_SLOW + 30:
         return df
 
     df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
@@ -154,17 +159,25 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 def build_ml_dataset(df: pd.DataFrame):
     df = df.dropna().copy()
     df["future"] = (df["close"].shift(-1) > df["close"]).astype(int)
-    X = df.drop(columns=["future","epoch"]).iloc[:-1]
+    X = df.drop(columns=["future", "epoch"]).iloc[:-1]
     y = df["future"].iloc[:-1]
     return X.tail(ML_MAX_SAMPLES), y.tail(ML_MAX_SAMPLES)
 
 def train_ml(symbol: str):
+    if not ML_ENABLED:
+        ml_model_ready[symbol] = False
+        return
+
     df = candles[symbol]
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         ml_model_ready[symbol] = False
         return
 
     X, y = build_ml_dataset(df)
+    if len(X) < ML_MIN_TRAINED_SAMPLES:
+        ml_model_ready[symbol] = False
+        return
+
     model = RandomForestClassifier(
         n_estimators=ML_N_ESTIMATORS,
         max_depth=ML_MAX_DEPTH,
@@ -176,45 +189,75 @@ def train_ml(symbol: str):
     ml_model_ready[symbol] = True
 
 def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
+    if not ML_ENABLED:
+        return None
     if not ml_model_ready.get(symbol):
         return None
+
     model, cols = ml_models[symbol]
-    vals = [float(row[c]) for c in cols]
+
+    # garante ordem idêntica às colunas treinadas
+    try:
+        vals = [float(row[c]) for c in cols]
+    except Exception:
+        return None
+
     return model.predict_proba([vals])[0][1]
 
-# ---------------- CONTEXTO DE MERCADO ----------------
+# ---------------- SETUP / CONTEXTO DE MERCADO ----------------
 
 def has_market_context(row: pd.Series, direction: str) -> bool:
+    """
+    Contexto REAL baseado em:
+    EMA (tendência), RSI (força), Bollinger (pullback/volatilidade), MFI (volume/contexto).
+    """
+
     close = float(row["close"])
     ema_fast = float(row["ema_fast"])
-    ema_mid  = float(row["ema_mid"])
+    ema_mid = float(row["ema_mid"])
     ema_slow = float(row["ema_slow"])
     rsi = float(row["rsi"])
     mfi = float(row["mfi"])
     bb_mid = float(row["bb_mid"])
 
-    # COMPRA (tendência alta + pullback)
+    # =====================
+    # COMPRA (tendência de alta + pullback)
+    # =====================
     if direction == "COMPRA":
+        # tendência
         if not (ema_fast > ema_mid > ema_slow):
             return False
+
+        # RSI: faixa saudável (evita lateral neutro puro e evita exaustão)
         if not (35 <= rsi <= 55):
             return False
+
+        # pullback: preço no meio/abaixo da média BB
         if close > bb_mid:
             return False
+
+        # MFI: não compra em saturação
         if mfi >= 75:
             return False
+
         return True
 
-    # VENDA (tendência baixa + pullback)
+    # =====================
+    # VENDA (tendência de baixa + pullback)
+    # =====================
     if direction == "VENDA":
         if not (ema_fast < ema_mid < ema_slow):
             return False
+
         if not (45 <= rsi <= 65):
             return False
+
         if close < bb_mid:
             return False
+
         if mfi <= 25:
             return False
+
         return True
 
     return False
@@ -228,22 +271,24 @@ def avaliar_sinal(symbol: str):
 
     row = df.iloc[-1]
 
+    # direção base (não é o único critério!)
     direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
-    # 1) contexto (INDICADORES)
+    # 1) contexto do mercado: EMA + RSI + BB + MFI
     if not has_market_context(row, direction):
         return
 
-    # 2) ML decide
+    # 2) ML filtra probabilidade
     ml_prob = ml_predict(symbol, row)
     if ml_prob is None or ml_prob < ML_CONF_THRESHOLD:
         return
 
     epoch = int(row["epoch"])
 
-    # 1 sinal por candle por ativo
+    # 3) trava simples: não manda 2 sinais na MESMA vela pro MESMO ativo
     if last_signal_epoch[symbol] == epoch:
         return
+
     last_signal_epoch[symbol] = epoch
 
     entry_time = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
@@ -276,26 +321,21 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
-                # ✅ 1) HISTÓRICO (SEM subscribe)
-                req_hist = {
+                # ✅ CORREÇÃO DEFINITIVA:
+                # NÃO usar candles_subscribe/candles (isso é request inválida)
+                # o stream correto é via ticks_history + style=candles + subscribe=True
+                req = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
                     "count": 1200,
                     "end": "latest",
                     "granularity": GRANULARITY_SECONDS,
-                    "style": "candles"
+                    "style": "candles",
+                    "subscribe": True  # ✅ TEM QUE SER boolean
                 }
-                await ws.send(json.dumps(req_hist))
-                log(f"{symbol} Histórico solicitado 📥", "info")
 
-                # ✅ 2) STREAM (COM candles + subscribe)
-                req_stream = {
-                    "candles": symbol,
-                    "granularity": GRANULARITY_SECONDS,
-                    "subscribe": 1
-                }
-                await ws.send(json.dumps(req_stream))
-                log(f"{symbol} Stream (candles) ligado 🔴", "info")
+                await ws.send(json.dumps(req))
+                log(f"{symbol} Histórico + stream solicitado 📥", "info")
 
                 while True:
                     try:
@@ -304,10 +344,7 @@ async def ws_loop(symbol: str):
                             timeout=WS_CANDLE_TIMEOUT_SECONDS
                         )
                     except asyncio.TimeoutError:
-                        log(
-                            f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁",
-                            "warning"
-                        )
+                        log(f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
                         try:
                             await ws.close()
                         except Exception:
@@ -325,55 +362,22 @@ async def ws_loop(symbol: str):
                             pass
                         break
 
-                    # histórico vem como "candles"
+                    # ticks_history retorna candles em "candles"
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         df = calcular_indicadores(df)
                         candles[symbol] = df
 
-                    # stream vem como "ohlc"
-                    elif "ohlc" in data:
-                        # rebuild dataset: pega o último snapshot conhecido e atualiza
-                        if candles[symbol].empty:
+                        # processar só quando epoch muda
+                        try:
+                            current_epoch = int(df.iloc[-1]["epoch"])
+                        except Exception:
                             continue
 
-                        last_df = candles[symbol].copy()
-                        o = data["ohlc"]
-
-                        # atualiza/insere candle novo
-                        new_row = {
-                            "epoch": int(o["open_time"]),
-                            "open": float(o["open"]),
-                            "high": float(o["high"]),
-                            "low": float(o["low"]),
-                            "close": float(o["close"]),
-                        }
-
-                        # se já existe epoch, substitui a última linha
-                        if int(last_df.iloc[-1]["epoch"]) == new_row["epoch"]:
-                            last_df.iloc[-1] = pd.Series(new_row)
-                        else:
-                            last_df = pd.concat([last_df, pd.DataFrame([new_row])], ignore_index=True)
-
-                        # limita a 2000 candles
-                        last_df = last_df.tail(ML_MAX_SAMPLES).reset_index(drop=True)
-
-                        df = calcular_indicadores(last_df)
-                        candles[symbol] = df
-
-                    else:
-                        continue
-
-                    # processar só quando epoch muda
-                    try:
-                        current_epoch = int(candles[symbol].iloc[-1]["epoch"])
-                    except Exception:
-                        continue
-
-                    if last_processed_epoch[symbol] != current_epoch:
-                        last_processed_epoch[symbol] = current_epoch
-                        train_ml(symbol)
-                        avaliar_sinal(symbol)
+                        if last_processed_epoch[symbol] != current_epoch:
+                            last_processed_epoch[symbol] = current_epoch
+                            train_ml(symbol)
+                            avaliar_sinal(symbol)
 
         except Exception as e:
             log(f"{symbol} WS erro: {e}", "error")
@@ -383,7 +387,7 @@ async def ws_loop(symbol: str):
 
 app = Flask(__name__)
 
-@app.route("/", methods=["GET","HEAD"])
+@app.route("/", methods=["GET", "HEAD"])
 def health():
     return "OK", 200
 
