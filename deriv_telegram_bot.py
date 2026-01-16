@@ -95,6 +95,12 @@ SIGNAL_ANTI_REVERSAL_CANDLES = int(os.getenv("SIGNAL_ANTI_REVERSAL_CANDLES", "3"
 WARMUP_CANDLES_AFTER_BOOT = int(os.getenv("WARMUP_CANDLES_AFTER_BOOT", "30"))
 # evita sinal "cru" logo após restart (30 candles = 150 min em M5)
 
+# <<< ADICIONADO: tolerância mínima para envio ANTES da entrada
+# se estiver faltando menos que isso, ignora o sinal (pra nunca mandar atrasado)
+MIN_SECONDS_BEFORE_ENTRY = int(os.getenv("MIN_SECONDS_BEFORE_ENTRY", "60"))
+# padrão: precisa chegar pelo menos 60s antes da entrada
+
+
 # ---------------- Estado ----------------
 
 candles = {s: pd.DataFrame() for s in SYMBOLS}
@@ -110,7 +116,7 @@ last_signal_time = {s: 0.0 for s in SYMBOLS}
 last_signal_direction = {s: None for s in SYMBOLS}
 last_signal_index = {s: None for s in SYMBOLS}
 
-# <<< ADICIONADO: warmup global após boot (não bloqueia ML, só evita sinais ruins no boot)
+# <<< ADICIONADO: warmup global após boot
 boot_time = time.time()
 
 # ---------------- Logging ----------------
@@ -213,8 +219,7 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
 
 def can_send_signal(symbol: str, direction: str, epoch: int) -> bool:
     """
-    <<< ADICIONADO: impede spam, sinal duplicado, e reversão rápida.
-    NÃO altera o ML (ML continua sendo o único filtro da assertividade).
+    Impede spam, sinal duplicado e reversão rápida.
     """
     now = time.time()
 
@@ -244,7 +249,7 @@ def can_send_signal(symbol: str, direction: str, epoch: int) -> bool:
             if last_idx is not None and (idx - last_idx) < SIGNAL_ANTI_REVERSAL_CANDLES:
                 return False
 
-    # 5) warmup após boot (evita sinais "crus" do restart)
+    # 5) warmup após boot
     df = candles[symbol]
     if len(df) < ML_MIN_TRAINED_SAMPLES + WARMUP_CANDLES_AFTER_BOOT:
         return False
@@ -269,7 +274,17 @@ def avaliar_sinal(symbol: str):
 
     epoch = int(row["epoch"])
 
-    # <<< ADICIONADO: anti-spam inteligente (sem mexer na lógica do ML)
+    # entry_time = candle_epoch + advance
+    entry_time = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
+    entry_time += timedelta(minutes=SIGNAL_ADVANCE_MINUTES)
+
+    # ✅✅✅ CORREÇÃO PRINCIPAL: NUNCA ENVIAR SINAL ATRASADO
+    now_brt = datetime.utcnow() - timedelta(hours=3)
+    if entry_time <= (now_brt + timedelta(seconds=MIN_SECONDS_BEFORE_ENTRY)):
+        # sinal atrasado ou muito em cima da hora => ignora
+        return
+
+    # anti-spam inteligente
     if not can_send_signal(symbol, direction, epoch):
         return
 
@@ -278,9 +293,6 @@ def avaliar_sinal(symbol: str):
     last_signal_time[symbol] = time.time()
     last_signal_direction[symbol] = direction
     last_signal_index[symbol] = len(df) - 1
-
-    entry_time = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
-    entry_time += timedelta(minutes=SIGNAL_ADVANCE_MINUTES)
 
     ativo = symbol.replace("frx", "")
 
@@ -340,7 +352,7 @@ async def ws_loop(symbol: str):
 
                     data = json.loads(raw)
 
-                    # resposta de erro do WS
+                    # erro do WS
                     if "error" in data:
                         log(f"{symbol} WS erro retorno: {data.get('error')}", "error")
                         break
@@ -355,44 +367,6 @@ async def ws_loop(symbol: str):
                             continue
 
                         # treinar e avaliar SOMENTE quando mudar candle (epoch novo)
-                        if last_trained_epoch[symbol] != current_epoch:
-                            last_trained_epoch[symbol] = current_epoch
-                            train_ml(symbol)
-                            avaliar_sinal(symbol)
-
-                    # <<< ADICIONADO: Deriv pode enviar stream como "ohlc" (se não tratar, fica mudo)
-                    elif "ohlc" in data:
-                        o = data["ohlc"]
-
-                        try:
-                            row = {
-                                "epoch": int(o.get("open_time")),
-                                "open": float(o.get("open")),
-                                "high": float(o.get("high")),
-                                "low": float(o.get("low")),
-                                "close": float(o.get("close")),
-                            }
-                        except Exception:
-                            continue
-
-                        df_old = candles.get(symbol)
-                        if df_old is None or len(df_old) == 0:
-                            candles[symbol] = calcular_indicadores(pd.DataFrame([row]))
-                        else:
-                            candles[symbol] = pd.concat(
-                                [df_old, pd.DataFrame([row])],
-                                ignore_index=True
-                            )
-
-                            # mantém histórico com buffer (não estoura RAM fácil)
-                            max_keep = ML_MAX_SAMPLES + 300
-                            if len(candles[symbol]) > max_keep:
-                                candles[symbol] = candles[symbol].tail(max_keep).reset_index(drop=True)
-
-                            candles[symbol] = calcular_indicadores(candles[symbol])
-
-                        current_epoch = row["epoch"]
-
                         if last_trained_epoch[symbol] != current_epoch:
                             last_trained_epoch[symbol] = current_epoch
                             train_ml(symbol)
