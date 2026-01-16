@@ -66,6 +66,10 @@ BB_STD = 2.3
 
 MFI_PERIOD = 14
 
+# <<< ADICIONADO: MFI thresholds configuráveis (via Render)
+MFI_BUY_MAX = float(os.getenv("MFI_BUY_MAX", "75"))    # compra bloqueia se mfi >= 75
+MFI_SELL_MIN = float(os.getenv("MFI_SELL_MIN", "25"))  # venda bloqueia se mfi <= 25
+
 # RSI (usado como filtro real de setup)
 RSI_PERIOD = 14
 
@@ -201,12 +205,10 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
 
 def has_market_context(row: pd.Series, direction: str) -> bool:
     """
-    Aqui é a correção principal:
     Só manda sinal quando existir um SETUP com contexto,
     usando EMA + RSI + Bollinger + MFI.
     """
 
-    # valores
     close = float(row["close"])
     ema_fast = float(row["ema_fast"])
     ema_mid = float(row["ema_mid"])
@@ -214,27 +216,22 @@ def has_market_context(row: pd.Series, direction: str) -> bool:
     rsi = float(row["rsi"])
     mfi = float(row["mfi"])
     bb_mid = float(row["bb_mid"])
-    bb_upper = float(row["bb_upper"])
-    bb_lower = float(row["bb_lower"])
 
     # =====================
     # COMPRA (pullback)
     # =====================
     if direction == "COMPRA":
-        # tendência real
         if not (ema_fast > ema_mid > ema_slow):
             return False
 
-        # RSI saudável: sem exaustão e sem neutro demais
         if not (35 <= rsi <= 55):
             return False
 
-        # pullback: preço perto/abaixo da BB mid
         if close > bb_mid:
             return False
 
-        # MFI: não comprar quando já está saturado
-        if mfi >= 75:
+        # <<< ALTERADO: usa MFI_BUY_MAX configurável
+        if mfi >= MFI_BUY_MAX:
             return False
 
         return True
@@ -249,12 +246,11 @@ def has_market_context(row: pd.Series, direction: str) -> bool:
         if not (45 <= rsi <= 65):
             return False
 
-        # pullback: preço perto/acima da BB mid
         if close < bb_mid:
             return False
 
-        # MFI: não vender quando já está esgotado pra baixo
-        if mfi <= 25:
+        # <<< ALTERADO: usa MFI_SELL_MIN configurável
+        if mfi <= MFI_SELL_MIN:
             return False
 
         return True
@@ -266,15 +262,12 @@ def has_market_context(row: pd.Series, direction: str) -> bool:
 def can_send_signal(symbol: str, direction: str, epoch: int, idx: int) -> bool:
     now = time.time()
 
-    # 1) 1 sinal por candle por ativo
     if last_signal_epoch[symbol] == epoch:
         return False
 
-    # 2) cooldown por tempo (20m por ativo)
     if (now - last_signal_time[symbol]) < SIGNAL_COOLDOWN_SECONDS:
         return False
 
-    # 3) anti reversão rápida
     prev_dir = last_signal_dir[symbol]
     last_idx = last_signal_idx[symbol]
     if prev_dir is not None and prev_dir != direction and last_idx is not None:
@@ -292,14 +285,11 @@ def avaliar_sinal(symbol: str):
 
     row = df.iloc[-1]
 
-    # direção base (mas agora NÃO é mais o único critério)
     direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
-    # 1) contexto de mercado (correção principal)
     if not has_market_context(row, direction):
         return
 
-    # 2) ML filtra probabilidade
     ml_prob = ml_predict(symbol, row)
     if ml_prob is None or ml_prob < ML_CONF_THRESHOLD:
         return
@@ -307,11 +297,9 @@ def avaliar_sinal(symbol: str):
     epoch = int(row["epoch"])
     idx = len(df) - 1
 
-    # 3) anti-spam leve
     if not can_send_signal(symbol, direction, epoch, idx):
         return
 
-    # marcações
     last_signal_epoch[symbol] = epoch
     last_signal_time[symbol] = time.time()
     last_signal_dir[symbol] = direction
@@ -375,7 +363,6 @@ async def ws_loop(symbol: str):
 
                     data = json.loads(raw)
 
-                    # erro no retorno
                     if "error" in data:
                         log(f"{symbol} WS retornou erro: {data.get('error')}", "error")
                         try:
@@ -389,7 +376,6 @@ async def ws_loop(symbol: str):
                         df = calcular_indicadores(df)
                         candles[symbol] = df
 
-                        # processar só quando epoch muda
                         try:
                             current_epoch = int(df.iloc[-1]["epoch"])
                         except Exception:
