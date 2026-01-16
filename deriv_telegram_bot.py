@@ -65,7 +65,6 @@ BB_PERIOD = 20
 BB_STD = 2.3
 
 MFI_PERIOD = 14
-
 RSI_PERIOD = 14
 
 # ---------------- ML ----------------
@@ -136,6 +135,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_upper"] = bb.bollinger_hband()
     df["bb_lower"] = bb.bollinger_lband()
 
+    # MFI (volume neutro em Forex)
     if "volume" not in df.columns:
         df["volume"] = 1
 
@@ -182,17 +182,18 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
     vals = [float(row[c]) for c in cols]
     return model.predict_proba([vals])[0][1]
 
-# ---------------- SETUP / CONTEXTO DE MERCADO ----------------
+# ---------------- CONTEXTO DE MERCADO ----------------
 
 def has_market_context(row: pd.Series, direction: str) -> bool:
     close = float(row["close"])
     ema_fast = float(row["ema_fast"])
-    ema_mid = float(row["ema_mid"])
+    ema_mid  = float(row["ema_mid"])
     ema_slow = float(row["ema_slow"])
     rsi = float(row["rsi"])
     mfi = float(row["mfi"])
     bb_mid = float(row["bb_mid"])
 
+    # COMPRA (tendência alta + pullback)
     if direction == "COMPRA":
         if not (ema_fast > ema_mid > ema_slow):
             return False
@@ -204,6 +205,7 @@ def has_market_context(row: pd.Series, direction: str) -> bool:
             return False
         return True
 
+    # VENDA (tendência baixa + pullback)
     if direction == "VENDA":
         if not (ema_fast < ema_mid < ema_slow):
             return False
@@ -228,14 +230,18 @@ def avaliar_sinal(symbol: str):
 
     direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
+    # 1) contexto (INDICADORES)
     if not has_market_context(row, direction):
         return
 
+    # 2) ML decide
     ml_prob = ml_predict(symbol, row)
     if ml_prob is None or ml_prob < ML_CONF_THRESHOLD:
         return
 
     epoch = int(row["epoch"])
+
+    # 1 sinal por candle por ativo
     if last_signal_epoch[symbol] == epoch:
         return
     last_signal_epoch[symbol] = epoch
@@ -270,27 +276,26 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
-                # 1) HISTÓRICO (SEM SUBSCRIBE)
+                # ✅ 1) HISTÓRICO (SEM subscribe)
                 req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
                     "count": 1200,
                     "end": "latest",
                     "granularity": GRANULARITY_SECONDS,
-                    "style": "candles",
-                    "subscribe": 0
+                    "style": "candles"
                 }
                 await ws.send(json.dumps(req_hist))
                 log(f"{symbol} Histórico solicitado 📥", "info")
 
-                # 2) STREAM REAL (candles_subscribe)
+                # ✅ 2) STREAM (COM candles + subscribe)
                 req_stream = {
-                    "candles_subscribe": 1,
-                    "symbol": symbol,
-                    "granularity": GRANULARITY_SECONDS
+                    "candles": symbol,
+                    "granularity": GRANULARITY_SECONDS,
+                    "subscribe": 1
                 }
                 await ws.send(json.dumps(req_stream))
-                log(f"{symbol} Stream (candles_subscribe) ligado 🔴", "info")
+                log(f"{symbol} Stream (candles) ligado 🔴", "info")
 
                 while True:
                     try:
@@ -299,7 +304,10 @@ async def ws_loop(symbol: str):
                             timeout=WS_CANDLE_TIMEOUT_SECONDS
                         )
                     except asyncio.TimeoutError:
-                        log(f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
+                        log(
+                            f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁",
+                            "warning"
+                        )
                         try:
                             await ws.close()
                         except Exception:
@@ -317,44 +325,55 @@ async def ws_loop(symbol: str):
                             pass
                         break
 
-                    # histórico inicial
-                    if "candles" in data and isinstance(data["candles"], list):
+                    # histórico vem como "candles"
+                    if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         df = calcular_indicadores(df)
                         candles[symbol] = df
 
-                    # stream ao vivo
-                    if "candle" in data:
-                        candle = data["candle"]
-                        if not candle.get("is_closed", True):
+                    # stream vem como "ohlc"
+                    elif "ohlc" in data:
+                        # rebuild dataset: pega o último snapshot conhecido e atualiza
+                        if candles[symbol].empty:
                             continue
 
-                        df = candles.get(symbol, pd.DataFrame())
-                        row = pd.DataFrame([candle])
+                        last_df = candles[symbol].copy()
+                        o = data["ohlc"]
 
-                        if df is None or len(df) == 0:
-                            df = row
+                        # atualiza/insere candle novo
+                        new_row = {
+                            "epoch": int(o["open_time"]),
+                            "open": float(o["open"]),
+                            "high": float(o["high"]),
+                            "low": float(o["low"]),
+                            "close": float(o["close"]),
+                        }
+
+                        # se já existe epoch, substitui a última linha
+                        if int(last_df.iloc[-1]["epoch"]) == new_row["epoch"]:
+                            last_df.iloc[-1] = pd.Series(new_row)
                         else:
-                            df = pd.concat([df, row], ignore_index=True)
+                            last_df = pd.concat([last_df, pd.DataFrame([new_row])], ignore_index=True)
 
-                        # mantém o dataset controlado
-                        if len(df) > ML_MAX_SAMPLES:
-                            df = df.iloc[-ML_MAX_SAMPLES:].reset_index(drop=True)
+                        # limita a 2000 candles
+                        last_df = last_df.tail(ML_MAX_SAMPLES).reset_index(drop=True)
 
-                        df = calcular_indicadores(df)
+                        df = calcular_indicadores(last_df)
                         candles[symbol] = df
 
-                        try:
-                            current_epoch = int(df.iloc[-1]["epoch"])
-                        except Exception:
-                            continue
+                    else:
+                        continue
 
-                        # log mínimo: confirma candle novo chegando (não é spam)
-                        if last_processed_epoch[symbol] != current_epoch:
-                            last_processed_epoch[symbol] = current_epoch
-                            log(f"{symbol} candle novo epoch={current_epoch}", "info")
-                            train_ml(symbol)
-                            avaliar_sinal(symbol)
+                    # processar só quando epoch muda
+                    try:
+                        current_epoch = int(candles[symbol].iloc[-1]["epoch"])
+                    except Exception:
+                        continue
+
+                    if last_processed_epoch[symbol] != current_epoch:
+                        last_processed_epoch[symbol] = current_epoch
+                        train_ml(symbol)
+                        avaliar_sinal(symbol)
 
         except Exception as e:
             log(f"{symbol} WS erro: {e}", "error")
