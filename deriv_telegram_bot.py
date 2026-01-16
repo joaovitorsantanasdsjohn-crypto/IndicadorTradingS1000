@@ -5,17 +5,15 @@ import websockets
 import json
 import pandas as pd
 from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, MACD
+from ta.trend import EMAIndicator
 from ta.volatility import BollingerBands
-from ta.volume import MFIIndicator   # <<< ADICIONADO
+from ta.volume import MFIIndicator
 import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
-from pathlib import Path
 import time
 import logging
-import traceback
 from flask import Flask
 import threading
 from typing import Optional
@@ -48,7 +46,7 @@ WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-# <<< watchdog para reconectar se WS ficar "mudo"
+# Watchdog para reconectar se ficar sem receber nada
 WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "300"))
 
 SYMBOLS = [
@@ -69,7 +67,7 @@ RSI_SELL_MIN = 55
 BB_PERIOD = 20
 BB_STD = 2.3
 
-MFI_PERIOD = 14   # <<< ADICIONADO (configurável)
+MFI_PERIOD = 14
 
 # ---------------- ML ----------------
 
@@ -80,44 +78,16 @@ ML_CONF_THRESHOLD = 0.55
 ML_N_ESTIMATORS = 60
 ML_MAX_DEPTH = 5
 
-# ---------------- CONTROLE DE SINAIS (ANTI-SPAM) ----------------
-# <<< ADICIONADO: controla frequência e evita reversão rápida
-
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "900"))
-# 900s = 15 minutos (por ativo)
-
-SIGNAL_MIN_CANDLES_BETWEEN = int(os.getenv("SIGNAL_MIN_CANDLES_BETWEEN", "2"))
-# precisa pelo menos 2 candles fechados antes de liberar novo sinal no mesmo ativo
-
-SIGNAL_ANTI_REVERSAL_CANDLES = int(os.getenv("SIGNAL_ANTI_REVERSAL_CANDLES", "3"))
-# se mandou COMPRA, não pode mandar VENDA logo depois (e vice-versa) por X candles
-
-WARMUP_CANDLES_AFTER_BOOT = int(os.getenv("WARMUP_CANDLES_AFTER_BOOT", "30"))
-# evita sinal "cru" logo após restart (30 candles = 150 min em M5)
-
-# <<< ADICIONADO: tolerância mínima para envio ANTES da entrada
-# se estiver faltando menos que isso, ignora o sinal (pra nunca mandar atrasado)
-MIN_SECONDS_BEFORE_ENTRY = int(os.getenv("MIN_SECONDS_BEFORE_ENTRY", "60"))
-# padrão: precisa chegar pelo menos 60s antes da entrada
-
-
 # ---------------- Estado ----------------
 
 candles = {s: pd.DataFrame() for s in SYMBOLS}
+
 ml_models = {}
 ml_model_ready = {}
 last_signal_epoch = {s: None for s in SYMBOLS}
 
-# controla treino/avaliação só por candle novo
-last_trained_epoch = {s: None for s in SYMBOLS}
-
-# <<< ADICIONADO: anti-spam por ativo
-last_signal_time = {s: 0.0 for s in SYMBOLS}
-last_signal_direction = {s: None for s in SYMBOLS}
-last_signal_index = {s: None for s in SYMBOLS}
-
-# <<< ADICIONADO: warmup global após boot
-boot_time = time.time()
+# Garante que só treina/avalia quando realmente mudou candle
+last_processed_epoch = {s: None for s in SYMBOLS}
 
 # ---------------- Logging ----------------
 
@@ -158,18 +128,18 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
-    df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
+    df["ema_mid"]  = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
-    df["rsi"] = RSIIndicator(df["close"], 14).rsi()
+    df["rsi"]      = RSIIndicator(df["close"], 14).rsi()
 
     bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
-    df["bb_mid"] = bb.bollinger_mavg()
+    df["bb_mid"]   = bb.bollinger_mavg()
     df["bb_upper"] = bb.bollinger_hband()
     df["bb_lower"] = bb.bollinger_lband()
 
-    # ---------------- MFI (somente CONTEXTO) ----------------
+    # MFI apenas contexto (Forex não tem volume real)
     if "volume" not in df.columns:
-        df["volume"] = 1  # <<< Volume neutro para Forex (não bloqueia nada)
+        df["volume"] = 1
 
     df["mfi"] = MFIIndicator(
         high=df["high"],
@@ -178,7 +148,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         volume=df["volume"],
         window=MFI_PERIOD
     ).money_flow_index()
-    # --------------------------------------------------------
 
     return df
 
@@ -187,8 +156,10 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 def build_ml_dataset(df: pd.DataFrame):
     df = df.dropna().copy()
     df["future"] = (df["close"].shift(-1) > df["close"]).astype(int)
+
     X = df.drop(columns=["future","epoch"]).iloc[:-1]
     y = df["future"].iloc[:-1]
+
     return X.tail(ML_MAX_SAMPLES), y.tail(ML_MAX_SAMPLES)
 
 def train_ml(symbol: str):
@@ -198,6 +169,7 @@ def train_ml(symbol: str):
         return
 
     X, y = build_ml_dataset(df)
+
     model = RandomForestClassifier(
         n_estimators=ML_N_ESTIMATORS,
         max_depth=ML_MAX_DEPTH,
@@ -211,50 +183,10 @@ def train_ml(symbol: str):
 def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
     if not ml_model_ready.get(symbol):
         return None
+
     model, cols = ml_models[symbol]
     vals = [float(row[c]) for c in cols]
     return model.predict_proba([vals])[0][1]
-
-# ---------------- FILTROS ANTI-SPAM ----------------
-
-def can_send_signal(symbol: str, direction: str, epoch: int) -> bool:
-    """
-    Impede spam, sinal duplicado e reversão rápida.
-    """
-    now = time.time()
-
-    # 1) cooldown por tempo
-    if (now - last_signal_time[symbol]) < SIGNAL_COOLDOWN_SECONDS:
-        return False
-
-    # 2) 1 sinal por candle (por ativo)
-    if last_signal_epoch[symbol] == epoch:
-        return False
-
-    # 3) precisa passar X candles antes de mandar outro sinal no mesmo ativo
-    df = candles[symbol]
-    if len(df) > 5:
-        idx = len(df) - 1
-        last_idx = last_signal_index[symbol]
-        if last_idx is not None and (idx - last_idx) < SIGNAL_MIN_CANDLES_BETWEEN:
-            return False
-
-    # 4) anti reversão rápida
-    prev_dir = last_signal_direction[symbol]
-    if prev_dir is not None and prev_dir != direction:
-        df = candles[symbol]
-        if len(df) > 5:
-            idx = len(df) - 1
-            last_idx = last_signal_index[symbol]
-            if last_idx is not None and (idx - last_idx) < SIGNAL_ANTI_REVERSAL_CANDLES:
-                return False
-
-    # 5) warmup após boot
-    df = candles[symbol]
-    if len(df) < ML_MIN_TRAINED_SAMPLES + WARMUP_CANDLES_AFTER_BOOT:
-        return False
-
-    return True
 
 # ---------------- SINAL ----------------
 
@@ -265,7 +197,6 @@ def avaliar_sinal(symbol: str):
 
     row = df.iloc[-1]
 
-    # direção é apenas contexto
     direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
     ml_prob = ml_predict(symbol, row)
@@ -274,25 +205,13 @@ def avaliar_sinal(symbol: str):
 
     epoch = int(row["epoch"])
 
-    # entry_time = candle_epoch + advance
+    # 1 sinal por candle por ativo (simples e saudável)
+    if last_signal_epoch[symbol] == epoch:
+        return
+    last_signal_epoch[symbol] = epoch
+
     entry_time = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
     entry_time += timedelta(minutes=SIGNAL_ADVANCE_MINUTES)
-
-    # ✅✅✅ CORREÇÃO PRINCIPAL: NUNCA ENVIAR SINAL ATRASADO
-    now_brt = datetime.utcnow() - timedelta(hours=3)
-    if entry_time <= (now_brt + timedelta(seconds=MIN_SECONDS_BEFORE_ENTRY)):
-        # sinal atrasado ou muito em cima da hora => ignora
-        return
-
-    # anti-spam inteligente
-    if not can_send_signal(symbol, direction, epoch):
-        return
-
-    # marcações de envio
-    last_signal_epoch[symbol] = epoch
-    last_signal_time[symbol] = time.time()
-    last_signal_direction[symbol] = direction
-    last_signal_index[symbol] = len(df) - 1
 
     ativo = symbol.replace("frx", "")
 
@@ -304,7 +223,7 @@ def avaliar_sinal(symbol: str):
     )
 
     send_telegram(msg)
-    log(f"{symbol} — sinal enviado {direction}")
+    log(f"{symbol} — sinal enviado {direction} ({ml_prob*100:.0f}%)")
 
 # ---------------- WebSocket ----------------
 
@@ -321,7 +240,7 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
-                req_hist = {
+                req = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
                     "count": 1200,
@@ -330,20 +249,14 @@ async def ws_loop(symbol: str):
                     "style": "candles",
                     "subscribe": 1
                 }
-                await ws.send(json.dumps(req_hist))
+                await ws.send(json.dumps(req))
                 log(f"{symbol} Histórico solicitado 📥", "info")
 
                 while True:
                     try:
-                        raw = await asyncio.wait_for(
-                            ws.recv(),
-                            timeout=WS_CANDLE_TIMEOUT_SECONDS
-                        )
+                        raw = await asyncio.wait_for(ws.recv(), timeout=WS_CANDLE_TIMEOUT_SECONDS)
                     except asyncio.TimeoutError:
-                        log(
-                            f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁",
-                            "warning"
-                        )
+                        log(f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
                         try:
                             await ws.close()
                         except Exception:
@@ -352,23 +265,23 @@ async def ws_loop(symbol: str):
 
                     data = json.loads(raw)
 
-                    # erro do WS
                     if "error" in data:
-                        log(f"{symbol} WS erro retorno: {data.get('error')}", "error")
+                        log(f"{symbol} WS retornou erro: {data.get('error')}", "error")
                         break
 
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
-                        candles[symbol] = calcular_indicadores(df)
+                        df = calcular_indicadores(df)
+                        candles[symbol] = df
 
                         try:
-                            current_epoch = int(candles[symbol].iloc[-1]["epoch"])
+                            current_epoch = int(df.iloc[-1]["epoch"])
                         except Exception:
                             continue
 
-                        # treinar e avaliar SOMENTE quando mudar candle (epoch novo)
-                        if last_trained_epoch[symbol] != current_epoch:
-                            last_trained_epoch[symbol] = current_epoch
+                        # só processa candle novo
+                        if last_processed_epoch[symbol] != current_epoch:
+                            last_processed_epoch[symbol] = current_epoch
                             train_ml(symbol)
                             avaliar_sinal(symbol)
 
