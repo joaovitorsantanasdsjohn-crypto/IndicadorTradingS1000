@@ -66,9 +66,9 @@ BB_STD = 2.3
 
 MFI_PERIOD = 14
 
-# <<< ADICIONADO: MFI thresholds configuráveis (via Render)
-MFI_BUY_MAX = float(os.getenv("MFI_BUY_MAX", "75"))    # compra bloqueia se mfi >= 75
-MFI_SELL_MIN = float(os.getenv("MFI_SELL_MIN", "25"))  # venda bloqueia se mfi <= 25
+# thresholds configuráveis do MFI (via Render)
+MFI_BUY_MAX = float(os.getenv("MFI_BUY_MAX", "75"))
+MFI_SELL_MIN = float(os.getenv("MFI_SELL_MIN", "25"))
 
 # RSI (usado como filtro real de setup)
 RSI_PERIOD = 14
@@ -82,14 +82,6 @@ ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
 ML_N_ESTIMATORS = 60
 ML_MAX_DEPTH = 5
 
-# ---------------- CONTROLE DE SINAIS (anti-spam leve) ----------------
-
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1200"))
-# 1200s = 20 minutos por ativo
-
-ANTI_REVERSAL_CANDLES = int(os.getenv("ANTI_REVERSAL_CANDLES", "2"))
-# impede COMPRA -> VENDA imediata (ou vice versa) em poucos candles
-
 # ---------------- Estado ----------------
 
 candles = {s: pd.DataFrame() for s in SYMBOLS}
@@ -97,13 +89,8 @@ ml_models = {}
 ml_model_ready = {}
 last_signal_epoch = {s: None for s in SYMBOLS}
 
-# evita reprocessar candle repetido
+# evita reprocessar candle repetido (epoch)
 last_processed_epoch = {s: None for s in SYMBOLS}
-
-# anti-spam por ativo
-last_signal_time = {s: 0.0 for s in SYMBOLS}
-last_signal_dir = {s: None for s in SYMBOLS}
-last_signal_idx = {s: None for s in SYMBOLS}
 
 # ---------------- Logging ----------------
 
@@ -205,8 +192,9 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
 
 def has_market_context(row: pd.Series, direction: str) -> bool:
     """
-    Só manda sinal quando existir um SETUP com contexto,
-    usando EMA + RSI + Bollinger + MFI.
+    Indicadores criam o cenário:
+    EMA + RSI + Bollinger + MFI
+    ML decide a vela (probabilidade).
     """
 
     close = float(row["close"])
@@ -218,26 +206,29 @@ def has_market_context(row: pd.Series, direction: str) -> bool:
     bb_mid = float(row["bb_mid"])
 
     # =====================
-    # COMPRA (pullback)
+    # COMPRA (pullback em tendência de alta)
     # =====================
     if direction == "COMPRA":
+        # tendência real
         if not (ema_fast > ema_mid > ema_slow):
             return False
 
+        # RSI saudável
         if not (35 <= rsi <= 55):
             return False
 
+        # pullback
         if close > bb_mid:
             return False
 
-        # <<< ALTERADO: usa MFI_BUY_MAX configurável
+        # MFI: evitar compra saturada
         if mfi >= MFI_BUY_MAX:
             return False
 
         return True
 
     # =====================
-    # VENDA (pullback)
+    # VENDA (pullback em tendência de baixa)
     # =====================
     if direction == "VENDA":
         if not (ema_fast < ema_mid < ema_slow):
@@ -249,32 +240,13 @@ def has_market_context(row: pd.Series, direction: str) -> bool:
         if close < bb_mid:
             return False
 
-        # <<< ALTERADO: usa MFI_SELL_MIN configurável
+        # MFI: evitar venda no fundo esgotado
         if mfi <= MFI_SELL_MIN:
             return False
 
         return True
 
     return False
-
-# ---------------- ANTI-SPAM LEVE ----------------
-
-def can_send_signal(symbol: str, direction: str, epoch: int, idx: int) -> bool:
-    now = time.time()
-
-    if last_signal_epoch[symbol] == epoch:
-        return False
-
-    if (now - last_signal_time[symbol]) < SIGNAL_COOLDOWN_SECONDS:
-        return False
-
-    prev_dir = last_signal_dir[symbol]
-    last_idx = last_signal_idx[symbol]
-    if prev_dir is not None and prev_dir != direction and last_idx is not None:
-        if (idx - last_idx) < ANTI_REVERSAL_CANDLES:
-            return False
-
-    return True
 
 # ---------------- SINAL ----------------
 
@@ -285,25 +257,23 @@ def avaliar_sinal(symbol: str):
 
     row = df.iloc[-1]
 
+    # direção base (contexto)
     direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
+    # 1) cenário/contexto real
     if not has_market_context(row, direction):
         return
 
+    # 2) ML decide (único filtro final)
     ml_prob = ml_predict(symbol, row)
     if ml_prob is None or ml_prob < ML_CONF_THRESHOLD:
         return
 
+    # evita mandar 2x no mesmo candle
     epoch = int(row["epoch"])
-    idx = len(df) - 1
-
-    if not can_send_signal(symbol, direction, epoch, idx):
+    if last_signal_epoch[symbol] == epoch:
         return
-
     last_signal_epoch[symbol] = epoch
-    last_signal_time[symbol] = time.time()
-    last_signal_dir[symbol] = direction
-    last_signal_idx[symbol] = idx
 
     entry_time = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
     entry_time += timedelta(minutes=SIGNAL_ADVANCE_MINUTES)
@@ -376,6 +346,7 @@ async def ws_loop(symbol: str):
                         df = calcular_indicadores(df)
                         candles[symbol] = df
 
+                        # processar só quando epoch muda
                         try:
                             current_epoch = int(df.iloc[-1]["epoch"])
                         except Exception:
