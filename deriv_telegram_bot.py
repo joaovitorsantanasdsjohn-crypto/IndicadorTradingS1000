@@ -247,7 +247,6 @@ def can_send_signal(symbol: str, direction: str, epoch: int) -> bool:
     # 5) warmup após boot (evita sinais "crus" do restart)
     df = candles[symbol]
     if len(df) < ML_MIN_TRAINED_SAMPLES + WARMUP_CANDLES_AFTER_BOOT:
-        # aqui é pra impedir aquele spam inicial e evitar que você opere sinais ruins do boot
         return False
 
     return True
@@ -356,6 +355,44 @@ async def ws_loop(symbol: str):
                             continue
 
                         # treinar e avaliar SOMENTE quando mudar candle (epoch novo)
+                        if last_trained_epoch[symbol] != current_epoch:
+                            last_trained_epoch[symbol] = current_epoch
+                            train_ml(symbol)
+                            avaliar_sinal(symbol)
+
+                    # <<< ADICIONADO: Deriv pode enviar stream como "ohlc" (se não tratar, fica mudo)
+                    elif "ohlc" in data:
+                        o = data["ohlc"]
+
+                        try:
+                            row = {
+                                "epoch": int(o.get("open_time")),
+                                "open": float(o.get("open")),
+                                "high": float(o.get("high")),
+                                "low": float(o.get("low")),
+                                "close": float(o.get("close")),
+                            }
+                        except Exception:
+                            continue
+
+                        df_old = candles.get(symbol)
+                        if df_old is None or len(df_old) == 0:
+                            candles[symbol] = calcular_indicadores(pd.DataFrame([row]))
+                        else:
+                            candles[symbol] = pd.concat(
+                                [df_old, pd.DataFrame([row])],
+                                ignore_index=True
+                            )
+
+                            # mantém histórico com buffer (não estoura RAM fácil)
+                            max_keep = ML_MAX_SAMPLES + 300
+                            if len(candles[symbol]) > max_keep:
+                                candles[symbol] = candles[symbol].tail(max_keep).reset_index(drop=True)
+
+                            candles[symbol] = calcular_indicadores(candles[symbol])
+
+                        current_epoch = row["epoch"]
+
                         if last_trained_epoch[symbol] != current_epoch:
                             last_trained_epoch[symbol] = current_epoch
                             train_ml(symbol)
