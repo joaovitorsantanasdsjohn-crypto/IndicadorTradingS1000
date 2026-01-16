@@ -66,7 +66,6 @@ BB_STD = 2.3
 
 MFI_PERIOD = 14
 
-# RSI (usado como filtro real de setup)
 RSI_PERIOD = 14
 
 # ---------------- ML ----------------
@@ -78,14 +77,6 @@ ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
 ML_N_ESTIMATORS = 60
 ML_MAX_DEPTH = 5
 
-# ---------------- CONTROLE DE SINAIS (anti-spam leve) ----------------
-
-SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "1200"))
-# 1200s = 20 minutos por ativo
-
-ANTI_REVERSAL_CANDLES = int(os.getenv("ANTI_REVERSAL_CANDLES", "2"))
-# impede COMPRA -> VENDA imediata (ou vice versa) em poucos candles
-
 # ---------------- Estado ----------------
 
 candles = {s: pd.DataFrame() for s in SYMBOLS}
@@ -95,11 +86,6 @@ last_signal_epoch = {s: None for s in SYMBOLS}
 
 # evita reprocessar candle repetido
 last_processed_epoch = {s: None for s in SYMBOLS}
-
-# anti-spam por ativo
-last_signal_time = {s: 0.0 for s in SYMBOLS}
-last_signal_dir = {s: None for s in SYMBOLS}
-last_signal_idx = {s: None for s in SYMBOLS}
 
 # ---------------- Logging ----------------
 
@@ -150,7 +136,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_upper"] = bb.bollinger_hband()
     df["bb_lower"] = bb.bollinger_lband()
 
-    # MFI (volume neutro em Forex)
     if "volume" not in df.columns:
         df["volume"] = 1
 
@@ -200,12 +185,6 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
 # ---------------- SETUP / CONTEXTO DE MERCADO ----------------
 
 def has_market_context(row: pd.Series, direction: str) -> bool:
-    """
-    Só manda sinal quando existir um SETUP com contexto,
-    usando EMA + RSI + Bollinger + MFI.
-    """
-
-    # valores
     close = float(row["close"])
     ema_fast = float(row["ema_fast"])
     ema_mid = float(row["ema_mid"])
@@ -214,71 +193,29 @@ def has_market_context(row: pd.Series, direction: str) -> bool:
     mfi = float(row["mfi"])
     bb_mid = float(row["bb_mid"])
 
-    # =====================
-    # COMPRA (pullback)
-    # =====================
     if direction == "COMPRA":
-        # tendência real
         if not (ema_fast > ema_mid > ema_slow):
             return False
-
-        # RSI saudável
         if not (35 <= rsi <= 55):
             return False
-
-        # pullback: preço perto/abaixo da BB mid
         if close > bb_mid:
             return False
-
-        # MFI: não comprar saturado
         if mfi >= 75:
             return False
-
         return True
 
-    # =====================
-    # VENDA (pullback)
-    # =====================
     if direction == "VENDA":
         if not (ema_fast < ema_mid < ema_slow):
             return False
-
         if not (45 <= rsi <= 65):
             return False
-
-        # pullback: preço perto/acima da BB mid
         if close < bb_mid:
             return False
-
-        # MFI: não vender esgotado
         if mfi <= 25:
             return False
-
         return True
 
     return False
-
-# ---------------- ANTI-SPAM LEVE ----------------
-
-def can_send_signal(symbol: str, direction: str, epoch: int, idx: int) -> bool:
-    now = time.time()
-
-    # 1) 1 sinal por candle por ativo
-    if last_signal_epoch[symbol] == epoch:
-        return False
-
-    # 2) cooldown por tempo (20m por ativo)
-    if (now - last_signal_time[symbol]) < SIGNAL_COOLDOWN_SECONDS:
-        return False
-
-    # 3) anti reversão rápida
-    prev_dir = last_signal_dir[symbol]
-    last_idx = last_signal_idx[symbol]
-    if prev_dir is not None and prev_dir != direction and last_idx is not None:
-        if (idx - last_idx) < ANTI_REVERSAL_CANDLES:
-            return False
-
-    return True
 
 # ---------------- SINAL ----------------
 
@@ -289,30 +226,19 @@ def avaliar_sinal(symbol: str):
 
     row = df.iloc[-1]
 
-    # direção base
     direction = "COMPRA" if row["ema_fast"] >= row["ema_mid"] else "VENDA"
 
-    # 1) contexto de mercado
     if not has_market_context(row, direction):
         return
 
-    # 2) ML filtra probabilidade
     ml_prob = ml_predict(symbol, row)
     if ml_prob is None or ml_prob < ML_CONF_THRESHOLD:
         return
 
     epoch = int(row["epoch"])
-    idx = len(df) - 1
-
-    # 3) anti-spam leve
-    if not can_send_signal(symbol, direction, epoch, idx):
+    if last_signal_epoch[symbol] == epoch:
         return
-
-    # marcações
     last_signal_epoch[symbol] = epoch
-    last_signal_time[symbol] = time.time()
-    last_signal_dir[symbol] = direction
-    last_signal_idx[symbol] = idx
 
     entry_time = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
     entry_time += timedelta(minutes=SIGNAL_ADVANCE_MINUTES)
@@ -344,6 +270,7 @@ async def ws_loop(symbol: str):
 
                 log(f"{symbol} WS conectado ✅", "info")
 
+                # 1) HISTÓRICO (SEM SUBSCRIBE)
                 req_hist = {
                     "ticks_history": symbol,
                     "adjust_start_time": 1,
@@ -351,10 +278,19 @@ async def ws_loop(symbol: str):
                     "end": "latest",
                     "granularity": GRANULARITY_SECONDS,
                     "style": "candles",
-                    "subscribe": 1
+                    "subscribe": 0
                 }
                 await ws.send(json.dumps(req_hist))
-                log(f"{symbol} Histórico + stream solicitado 📥", "info")
+                log(f"{symbol} Histórico solicitado 📥", "info")
+
+                # 2) STREAM REAL (candles_subscribe)
+                req_stream = {
+                    "candles_subscribe": 1,
+                    "symbol": symbol,
+                    "granularity": GRANULARITY_SECONDS
+                }
+                await ws.send(json.dumps(req_stream))
+                log(f"{symbol} Stream (candles_subscribe) ligado 🔴", "info")
 
                 while True:
                     try:
@@ -381,19 +317,42 @@ async def ws_loop(symbol: str):
                             pass
                         break
 
-                    if "candles" in data:
+                    # histórico inicial
+                    if "candles" in data and isinstance(data["candles"], list):
                         df = pd.DataFrame(data["candles"])
                         df = calcular_indicadores(df)
                         candles[symbol] = df
 
-                        # processar só quando epoch muda
+                    # stream ao vivo
+                    if "candle" in data:
+                        candle = data["candle"]
+                        if not candle.get("is_closed", True):
+                            continue
+
+                        df = candles.get(symbol, pd.DataFrame())
+                        row = pd.DataFrame([candle])
+
+                        if df is None or len(df) == 0:
+                            df = row
+                        else:
+                            df = pd.concat([df, row], ignore_index=True)
+
+                        # mantém o dataset controlado
+                        if len(df) > ML_MAX_SAMPLES:
+                            df = df.iloc[-ML_MAX_SAMPLES:].reset_index(drop=True)
+
+                        df = calcular_indicadores(df)
+                        candles[symbol] = df
+
                         try:
                             current_epoch = int(df.iloc[-1]["epoch"])
                         except Exception:
                             continue
 
+                        # log mínimo: confirma candle novo chegando (não é spam)
                         if last_processed_epoch[symbol] != current_epoch:
                             last_processed_epoch[symbol] = current_epoch
+                            log(f"{symbol} candle novo epoch={current_epoch}", "info")
                             train_ml(symbol)
                             avaliar_sinal(symbol)
 
@@ -416,14 +375,7 @@ def run_flask():
 
 async def main():
     send_telegram("🚀 BOT INICIADO — M5 ATIVO")
-
-    # <<< ADICIONADO: evita overload na Deriv (corrige WrongResponse)
-    tasks = []
-    for i, s in enumerate(SYMBOLS):
-        tasks.append(asyncio.create_task(ws_loop(s)))
-        await asyncio.sleep(1.2)  # delay entre conexões
-
-    await asyncio.gather(*tasks)
+    await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
