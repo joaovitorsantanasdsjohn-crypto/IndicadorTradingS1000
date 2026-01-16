@@ -81,7 +81,7 @@ ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "1200"))
 ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
 
 # ✅ REDUZIDO PRA CABER NO RENDER FREE (menos RAM)
-ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "30"))
+ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "60"))
 ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "5"))
 
 # ✅ MUITO IMPORTANTE: evita treinar ML em TODO candle (isso explode RAM/CPU)
