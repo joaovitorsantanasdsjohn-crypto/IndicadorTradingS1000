@@ -309,12 +309,11 @@ def avaliar_sinal(symbol: str):
     ativo = symbol.replace("frx", "")
 
     msg = (
-        f"🚀 <b>ATIVO:</b> {ativo}\n"
-        f"📌 <b>DIREÇÃO:</b> {direction}\n"
-        f"🕒 <b>MENSAGEM:</b> {notify_time_brt.strftime('%H:%M')}\n"
-        f"⏰ <b>ENTRADA:</b> {entry_time_brt.strftime('%H:%M')}\n"
-        f"🤖 <b>ML:</b> {confidence*100:.0f}%"
-    )
+    f"🚀 <b>ATIVO:</b> {ativo}\n"
+    f"📌 <b>DIREÇÃO:</b> {direction}\n"
+    f"⏰ <b>ENTRADA:</b> {entry_time_brt.strftime('%H:%M')}\n"
+    f"🤖 <b>ML:</b> {confidence*100:.0f}%"
+)
 
     send_telegram(msg)
 
