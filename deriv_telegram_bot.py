@@ -1,15 +1,18 @@
 import asyncio
-import websockets
 import json
+import os
+import random
+import time
+import threading
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Tuple
+
 import pandas as pd
 import requests
-import os
-import logging
-import threading
-from datetime import datetime, timedelta
+import websockets
 from flask import Flask
 from dotenv import load_dotenv
-from typing import Optional
 
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
@@ -23,32 +26,18 @@ except Exception:
     SKLEARN_AVAILABLE = False
 
 
-# =========================================================
-# [BLOCO 1] INICIALIZAÇÃO / CONFIG
-# =========================================================
+# ============================================================
+# ✅ BLOCO 1 — CONFIGURAÇÕES / PARÂMETROS (AJUSTE AQUI)
+# ============================================================
 
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
-
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-
-CANDLE_INTERVAL = int(os.getenv("CANDLE_INTERVAL", "5"))
-GRANULARITY_SECONDS = CANDLE_INTERVAL * 60
-
-SIGNAL_ADVANCE_MINUTES = int(os.getenv("SIGNAL_ADVANCE_MINUTES", "5"))
-
-ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
-
-WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
-WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
-
-WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "300"))
-
-MARKET_CLOSED_BACKOFF_SECONDS = int(os.getenv("MARKET_CLOSED_BACKOFF_SECONDS", "1800"))
 
 SYMBOLS = [
     "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
@@ -56,60 +45,86 @@ SYMBOLS = [
     "frxEURAUD", "frxAUDJPY", "frxGBPAUD", "frxGBPCAD", "frxAUDNZD", "frxEURCAD"
 ]
 
+CANDLE_INTERVAL_MINUTES = int(os.getenv("CANDLE_INTERVAL", "5"))
+GRANULARITY_SECONDS = CANDLE_INTERVAL_MINUTES * 60
 
-# =========================================================
-# [BLOCO 2] PARÂMETROS TÉCNICOS (SOMENTE FEATURES DO ML)
-# =========================================================
+FINAL_ADVANCE_MINUTES = int(os.getenv("FINAL_ADVANCE_MINUTES", "5"))
 
-EMA_FAST = 9
-EMA_MID = 21
-EMA_SLOW = 34
+WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
+WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
+WS_OPEN_TIMEOUT = int(os.getenv("WS_OPEN_TIMEOUT", "20"))
+WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "600"))
 
-BB_PERIOD = 20
-BB_STD = 2.3
+HISTORY_COUNT = int(os.getenv("HISTORY_COUNT", "1200"))
+MAX_CANDLES_IN_RAM = int(os.getenv("MAX_CANDLES_IN_RAM", "1800"))
 
-MFI_PERIOD = 14
-RSI_PERIOD = 14
+EMA_FAST = int(os.getenv("EMA_FAST", "9"))
+EMA_MID = int(os.getenv("EMA_MID", "21"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "34"))
 
+BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
+BB_STD = float(os.getenv("BB_STD", "2.3"))
 
-# =========================================================
-# [BLOCO 3] ML
-# =========================================================
+MFI_PERIOD = int(os.getenv("MFI_PERIOD", "14"))
 
-ML_ENABLED = SKLEARN_AVAILABLE
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+RSI_MIN = float(os.getenv("RSI_MIN", "0"))
+RSI_MAX = float(os.getenv("RSI_MAX", "100"))
+
+ML_ENABLED = bool(int(os.getenv("ML_ENABLED", "1"))) and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "300"))
 ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "2000"))
+ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
+
 ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "60"))
 ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "5"))
+ML_TRAIN_EVERY_N_CANDLES = int(os.getenv("ML_TRAIN_EVERY_N_CANDLES", "3"))
+
+MIN_SECONDS_BETWEEN_SIGNALS = int(os.getenv("MIN_SECONDS_BETWEEN_SIGNALS", "3"))
+STARTUP_STAGGER_MAX_SECONDS = int(os.getenv("STARTUP_STAGGER_MAX_SECONDS", "10"))
+
+# ✅ MELHORIA PEDIDA
+# Se o mercado estiver fechado: espera 30 minutos antes de tentar reconectar
+MARKET_CLOSED_RECONNECT_WAIT_SECONDS = int(os.getenv("MARKET_CLOSED_RECONNECT_WAIT_SECONDS", "1800"))  # 30 min
 
 
-# =========================================================
-# [BLOCO 4] ESTADO GLOBAL
-# =========================================================
+# ============================================================
+# ✅ BLOCO 2 — ESTADO GLOBAL
+# ============================================================
 
-candles = {s: pd.DataFrame() for s in SYMBOLS}
-ml_models = {}
-ml_model_ready = {s: False for s in SYMBOLS}
-last_signal_epoch = {s: None for s in SYMBOLS}
-last_processed_epoch = {s: None for s in SYMBOLS}
+candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
+
+ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
+ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
+
+last_signal_time: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
+last_signal_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
+last_processed_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
+candle_counter: Dict[str, int] = {s: 0 for s in SYMBOLS}
 
 
-# =========================================================
-# [BLOCO 5] LOG
-# =========================================================
+# ============================================================
+# ✅ BLOCO 3 — LOGGING
+# ============================================================
 
 logger = logging.getLogger("IndicadorTradingS1000")
 logger.setLevel(logging.INFO)
+
 handler = logging.StreamHandler()
 formatter = logging.Formatter("%(asctime)s UTC | %(levelname)s | %(message)s")
 handler.setFormatter(formatter)
+
 logger.handlers.clear()
 logger.addHandler(handler)
 
 
 def log(msg: str, level: str = "info"):
-    brt = (datetime.utcnow() - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S BRT")
-    utc = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    utc_now = datetime.now(timezone.utc)
+    brt_now = utc_now - timedelta(hours=3)
+
+    utc = utc_now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    brt = brt_now.strftime("%Y-%m-%d %H:%M:%S BRT")
+
     full = f"{utc} | {brt} | {msg}"
 
     if level == "info":
@@ -120,25 +135,30 @@ def log(msg: str, level: str = "info"):
         logger.error(full)
 
 
-# =========================================================
-# [BLOCO 6] TELEGRAM
-# =========================================================
+# ============================================================
+# ✅ BLOCO 4 — TELEGRAM
+# ============================================================
 
 def send_telegram(message: str):
     try:
+        if not TELEGRAM_TOKEN or not CHAT_ID:
+            return
+
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
         requests.post(url, data=payload, timeout=10)
+
     except Exception as e:
         log(f"Erro Telegram: {e}", "error")
 
 
-# =========================================================
-# [BLOCO 7] INDICADORES (FEATURES)
-# =========================================================
+# ============================================================
+# ✅ BLOCO 5 — INDICADORES (SOMENTE FEATURES PARA ML)
+# ============================================================
 
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().reset_index(drop=True)
+
     if len(df) < EMA_SLOW + 10:
         return df
 
@@ -147,6 +167,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
 
     df["rsi"] = RSIIndicator(df["close"], RSI_PERIOD).rsi()
+    df["rsi"] = df["rsi"].clip(lower=RSI_MIN, upper=RSI_MAX)
 
     bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
     df["bb_mid"] = bb.bollinger_mavg()
@@ -167,129 +188,238 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# =========================================================
-# [BLOCO 8] ML: TREINO + PREDIÇÃO
-# =========================================================
+# ============================================================
+# ✅ BLOCO 6 — MACHINE LEARNING (CÉREBRO DO BOT)
+# ============================================================
 
 def build_ml_dataset(df: pd.DataFrame):
     df = df.dropna().copy()
+    if "epoch" not in df.columns:
+        return None, None
+
     df["future"] = (df["close"].shift(-1) > df["close"]).astype(int)
-    X = df.drop(columns=["future", "epoch"]).iloc[:-1]
+
+    drop_cols = {"future", "epoch"}
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns]).iloc[:-1]
     y = df["future"].iloc[:-1]
-    return X.tail(ML_MAX_SAMPLES), y.tail(ML_MAX_SAMPLES)
+
+    if len(X) <= 10:
+        return None, None
+
+    X = X.tail(ML_MAX_SAMPLES)
+    y = y.tail(ML_MAX_SAMPLES)
+
+    return X, y
 
 
-def train_ml(symbol: str):
+async def train_ml_async(symbol: str):
     if not ML_ENABLED:
         ml_model_ready[symbol] = False
         return
 
     df = candles[symbol]
-    if df is None or len(df) < ML_MIN_TRAINED_SAMPLES:
+    if len(df) < ML_MIN_TRAINED_SAMPLES:
         ml_model_ready[symbol] = False
         return
 
     X, y = build_ml_dataset(df)
-    if len(X) < ML_MIN_TRAINED_SAMPLES:
+    if X is None or y is None:
         ml_model_ready[symbol] = False
         return
 
-    model = RandomForestClassifier(
-        n_estimators=ML_N_ESTIMATORS,
-        max_depth=ML_MAX_DEPTH,
-        random_state=42,
-        n_jobs=-1
-    )
-    model.fit(X, y)
+    def _fit():
+        model = RandomForestClassifier(
+            n_estimators=ML_N_ESTIMATORS,
+            max_depth=ML_MAX_DEPTH,
+            random_state=42
+        )
+        model.fit(X, y)
+        return model, X.columns.tolist()
 
-    ml_models[symbol] = (model, X.columns.tolist())
-    ml_model_ready[symbol] = True
+    try:
+        model, cols = await asyncio.to_thread(_fit)
+        ml_models[symbol] = (model, cols)
+        ml_model_ready[symbol] = True
+    except Exception as e:
+        ml_model_ready[symbol] = False
+        log(f"{symbol} ML treino falhou: {e}", "warning")
 
 
 def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
     if not ML_ENABLED:
         return None
+
     if not ml_model_ready.get(symbol):
         return None
+
     if symbol not in ml_models:
         return None
 
-    model, cols = ml_models[symbol]
     try:
+        model, cols = ml_models[symbol]
         vals = [float(row[c]) for c in cols]
-        return model.predict_proba([vals])[0][1]
+        prob_buy = model.predict_proba([vals])[0][1]
+        return float(prob_buy)
     except Exception:
         return None
 
 
-# =========================================================
-# [BLOCO 9] LÓGICA DE SINAL (SOMENTE ML)
-# =========================================================
+# ============================================================
+# ✅ BLOCO 7 — SINAIS (100% ML)
+# ============================================================
+
+def floor_to_granularity(ts_epoch: int, gran_seconds: int) -> int:
+    return (ts_epoch // gran_seconds) * gran_seconds
+
 
 def avaliar_sinal(symbol: str):
     df = candles[symbol]
-    if df is None or len(df) < EMA_SLOW + 50:
+    if len(df) < EMA_SLOW + 50:
         return
 
     row = df.iloc[-1]
+    if "epoch" not in row:
+        return
+
     epoch = int(row["epoch"])
+    candle_open_epoch = floor_to_granularity(epoch, GRANULARITY_SECONDS)
 
-    if last_signal_epoch[symbol] == epoch:
+    if last_signal_epoch[symbol] == candle_open_epoch:
         return
 
-    ml_prob = ml_predict(symbol, row)
-    if ml_prob is None:
+    now = time.time()
+    if (now - last_signal_time[symbol]) < MIN_SECONDS_BETWEEN_SIGNALS:
         return
 
-    direction = "COMPRA" if ml_prob >= 0.5 else "VENDA"
-    conf = ml_prob if direction == "COMPRA" else (1 - ml_prob)
-
-    if conf < ML_CONF_THRESHOLD:
+    ml_prob_buy = ml_predict(symbol, row)
+    if ml_prob_buy is None:
         return
 
-    last_signal_epoch[symbol] = epoch
+    direction = "COMPRA" if ml_prob_buy >= 0.5 else "VENDA"
+    confidence = ml_prob_buy if direction == "COMPRA" else (1.0 - ml_prob_buy)
 
-    candle_open_brt = datetime.utcfromtimestamp(epoch) - timedelta(hours=3)
-    entry_time_brt = candle_open_brt + timedelta(minutes=CANDLE_INTERVAL)
-    message_time_brt = entry_time_brt - timedelta(minutes=SIGNAL_ADVANCE_MINUTES)
+    if confidence < ML_CONF_THRESHOLD:
+        return
+
+    next_candle_open = candle_open_epoch + GRANULARITY_SECONDS
+
+    entry_time_brt = datetime.fromtimestamp(next_candle_open, tz=timezone.utc) - timedelta(hours=3)
+    notify_time_brt = entry_time_brt - timedelta(minutes=FINAL_ADVANCE_MINUTES)
 
     ativo = symbol.replace("frx", "")
 
     msg = (
-        f"📊 <b>ATIVO:</b> {ativo}\n"
-        f"📈 <b>DIREÇÃO:</b> {direction}\n"
-        f"🕒 <b>MENSAGEM:</b> {message_time_brt.strftime('%H:%M')}\n"
+        f"🚀 <b>ATIVO:</b> {ativo}\n"
+        f"📌 <b>DIREÇÃO:</b> {direction}\n"
+        f"🕒 <b>MENSAGEM:</b> {notify_time_brt.strftime('%H:%M')}\n"
         f"⏰ <b>ENTRADA:</b> {entry_time_brt.strftime('%H:%M')}\n"
-        f"🤖 <b>ML:</b> {conf*100:.0f}%"
+        f"🤖 <b>ML:</b> {confidence*100:.0f}%"
     )
 
     send_telegram(msg)
-    log(f"{symbol} — sinal enviado {direction} (conf {conf*100:.0f}%)")
+
+    last_signal_time[symbol] = now
+    last_signal_epoch[symbol] = candle_open_epoch
+
+    log(f"{symbol} — sinal enviado {direction} (ML {confidence*100:.0f}%)")
 
 
-# =========================================================
-# [BLOCO 10] UTILITÁRIOS DE ERRO DERIV
-# =========================================================
+# ============================================================
+# ✅ BLOCO 8 — WEBSOCKET (HISTÓRICO + STREAM)
+# ============================================================
 
-def is_market_closed_error(err_obj) -> bool:
+async def deriv_authorize(ws):
+    if not DERIV_TOKEN:
+        return
+
+    req = {"authorize": DERIV_TOKEN}
+    await ws.send(json.dumps(req))
+    raw = await ws.recv()
+    data = json.loads(raw)
+
+    if "error" in data:
+        raise RuntimeError(f"Authorize error: {data['error']}")
+
+
+async def request_history(ws, symbol: str) -> pd.DataFrame:
+    req_hist = {
+        "ticks_history": symbol,
+        "adjust_start_time": 1,
+        "count": HISTORY_COUNT,
+        "end": "latest",
+        "granularity": GRANULARITY_SECONDS,
+        "style": "candles"
+    }
+
+    await ws.send(json.dumps(req_hist))
+    log(f"{symbol} Histórico solicitado 📥", "info")
+
+    raw = await ws.recv()
+    data = json.loads(raw)
+
+    if "error" in data:
+        raise RuntimeError(str(data.get("error")))
+
+    df = pd.DataFrame(data.get("candles", []))
+    if df.empty:
+        raise RuntimeError("Histórico vazio")
+
+    return df
+
+
+async def subscribe_candles(ws, symbol: str):
+    req_sub = {
+        "ticks_history": symbol,
+        "adjust_start_time": 1,
+        "count": 1,
+        "end": "latest",
+        "granularity": GRANULARITY_SECONDS,
+        "style": "candles",
+        "subscribe": 1
+    }
+
+    await ws.send(json.dumps(req_sub))
+    log(f"{symbol} Stream (candles) ligado 🔴", "info")
+
+
+def df_trim(df: pd.DataFrame) -> pd.DataFrame:
+    if len(df) <= MAX_CANDLES_IN_RAM:
+        return df
+    return df.tail(MAX_CANDLES_IN_RAM).reset_index(drop=True)
+
+
+def _is_market_closed_payload(data: dict) -> bool:
+    """
+    Detecta MarketIsClosed no payload JSON do WS.
+    """
     try:
-        if not isinstance(err_obj, dict):
+        if not isinstance(data, dict):
             return False
-        return err_obj.get("code") == "MarketIsClosed"
+        err = data.get("error")
+        if isinstance(err, dict) and err.get("code") == "MarketIsClosed":
+            return True
+        return False
     except Exception:
         return False
 
 
-async def handle_market_closed(symbol: str):
-    log(f"{symbol} MarketIsClosed — aguardando {MARKET_CLOSED_BACKOFF_SECONDS//60}min para reconectar ⏳", "warning")
-    await asyncio.sleep(MARKET_CLOSED_BACKOFF_SECONDS)
+def _is_market_closed_exception(e: Exception) -> bool:
+    """
+    Detecta MarketIsClosed quando vem em texto/exception.
+    """
+    try:
+        s = str(e)
+        return ("MarketIsClosed" in s)
+    except Exception:
+        return False
 
-
-# =========================================================
-# [BLOCO 11] WEBSOCKET (1 CONEXÃO POR ATIVO)
-# =========================================================
 
 async def ws_loop(symbol: str):
+    backoff = 2
+    max_backoff = 90
+
+    await asyncio.sleep(random.uniform(0.0, float(STARTUP_STAGGER_MAX_SECONDS)))
+
     while True:
         try:
             log(f"{symbol} WS conectando...", "info")
@@ -298,91 +428,85 @@ async def ws_loop(symbol: str):
                 WS_URL,
                 ping_interval=WS_PING_INTERVAL,
                 ping_timeout=WS_PING_TIMEOUT,
-                close_timeout=5
+                open_timeout=WS_OPEN_TIMEOUT,
+                close_timeout=10,
+                max_queue=32
             ) as ws:
-
                 log(f"{symbol} WS conectado ✅", "info")
 
-                req_hist = {
-                    "ticks_history": symbol,
-                    "adjust_start_time": 1,
-                    "count": 1200,
-                    "end": "latest",
-                    "granularity": GRANULARITY_SECONDS,
-                    "style": "candles"
-                }
+                try:
+                    await deriv_authorize(ws)
+                except Exception as e:
+                    log(f"{symbol} authorize falhou: {e}", "warning")
 
-                await ws.send(json.dumps(req_hist))
-                log(f"{symbol} Histórico solicitado 📥", "info")
-
-                hist_raw = await ws.recv()
-                hist_data = json.loads(hist_raw)
-
-                if "error" in hist_data:
-                    err = hist_data.get("error")
-                    log(f"{symbol} WS retornou erro: {err}", "error")
-
-                    if is_market_closed_error(err):
-                        await handle_market_closed(symbol)
-                    else:
-                        await asyncio.sleep(5)
-
-                    continue
-
-                df = pd.DataFrame(hist_data.get("candles", []))
-                if df.empty:
-                    log(f"{symbol} Histórico vazio — reconectando 🔁", "warning")
-                    await asyncio.sleep(5)
-                    continue
-
+                df = await request_history(ws, symbol)
                 df = calcular_indicadores(df)
+                df = df_trim(df)
                 candles[symbol] = df
 
-                req_stream = {
-                    "candles_subscribe": 1,
-                    "symbol": symbol,
-                    "granularity": GRANULARITY_SECONDS
-                }
+                if ML_ENABLED:
+                    await train_ml_async(symbol)
 
-                await ws.send(json.dumps(req_stream))
-                log(f"{symbol} Stream (candles) ligado 🔴", "info")
+                await subscribe_candles(ws, symbol)
+
+                backoff = 2
 
                 while True:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=WS_CANDLE_TIMEOUT_SECONDS)
                     except asyncio.TimeoutError:
-                        log(f"{symbol} Sem candles por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando 🔁", "warning")
+                        log(f"{symbol} Watchdog: sem candle por {WS_CANDLE_TIMEOUT_SECONDS}s — reconectando...", "warning")
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
                         break
 
                     data = json.loads(raw)
 
+                    # ✅ CASO 1: erro MarketIsClosed vindo no payload
+                    if _is_market_closed_payload(data):
+                        log(
+                            f"{symbol} Mercado fechado (MarketIsClosed) — aguardando {MARKET_CLOSED_RECONNECT_WAIT_SECONDS}s para reconectar...",
+                            "warning"
+                        )
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(MARKET_CLOSED_RECONNECT_WAIT_SECONDS)
+                        break
+
+                    # Outros erros do WS
                     if "error" in data:
-                        err = data.get("error")
-                        log(f"{symbol} WS retornou erro: {err}", "error")
-
-                        if is_market_closed_error(err):
-                            await handle_market_closed(symbol)
-                        else:
-                            await asyncio.sleep(5)
-
+                        log(f"{symbol} WS retornou erro: {data.get('error')}", "error")
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
                         break
 
                     if "candles" in data:
                         new_row = data["candles"][0]
                         df = candles[symbol]
 
-                        if df is None or df.empty:
+                        if df.empty:
                             df = pd.DataFrame([new_row])
                         else:
-                            last_epoch = int(df.iloc[-1]["epoch"])
-                            new_epoch = int(new_row["epoch"])
+                            try:
+                                last_epoch = int(df.iloc[-1]["epoch"])
+                                new_epoch = int(new_row["epoch"])
+                            except Exception:
+                                last_epoch = None
+                                new_epoch = None
 
-                            if new_epoch == last_epoch:
+                            if last_epoch is not None and new_epoch == last_epoch:
                                 for k, v in new_row.items():
                                     df.at[df.index[-1], k] = v
                             else:
                                 df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
 
+                        df = df_trim(df)
                         df = calcular_indicadores(df)
                         candles[symbol] = df
 
@@ -393,24 +517,39 @@ async def ws_loop(symbol: str):
 
                         if last_processed_epoch[symbol] != current_epoch:
                             last_processed_epoch[symbol] = current_epoch
-                            train_ml(symbol)
+                            candle_counter[symbol] += 1
+
+                            if ML_ENABLED and (candle_counter[symbol] % ML_TRAIN_EVERY_N_CANDLES == 0):
+                                asyncio.create_task(train_ml_async(symbol))
+
                             avaliar_sinal(symbol)
 
-        except websockets.exceptions.InvalidStatusCode as e:
-            log(f"{symbol} WS erro status: {e}", "error")
-            await asyncio.sleep(10)
         except Exception as e:
-            msg = str(e).lower()
-            log(f"{symbol} WS erro: {e}", "error")
-            if "handshake" in msg or "timed out" in msg:
-                await asyncio.sleep(15)
+            # ✅ CASO 2: MarketIsClosed vindo como exception/texto
+            if _is_market_closed_exception(e):
+                log(
+                    f"{symbol} Mercado fechado (MarketIsClosed exception) — aguardando {MARKET_CLOSED_RECONNECT_WAIT_SECONDS}s para reconectar...",
+                    "warning"
+                )
+                await asyncio.sleep(MARKET_CLOSED_RECONNECT_WAIT_SECONDS)
+                backoff = 2
+                continue
+
+            msg = str(e)
+
+            if "UnrecognisedRequest" in msg or "WrongResponse" in msg:
+                log(f"{symbol} WS request inválido/erro Deriv: {e}", "error")
             else:
-                await asyncio.sleep(5)
+                log(f"{symbol} WS erro: {e}", "error")
+
+            sleep_s = backoff + random.uniform(0.0, 1.5)
+            await asyncio.sleep(sleep_s)
+            backoff = min(max_backoff, backoff * 2)
 
 
-# =========================================================
-# [BLOCO 12] FLASK KEEP-ALIVE
-# =========================================================
+# ============================================================
+# ✅ BLOCO 9 — FLASK HEALTHCHECK (RENDER)
+# ============================================================
 
 app = Flask(__name__)
 
@@ -422,13 +561,14 @@ def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
 
 
-# =========================================================
-# [BLOCO 13] MAIN
-# =========================================================
+# ============================================================
+# ✅ BLOCO 10 — MAIN
+# ============================================================
 
 async def main():
     send_telegram("🚀 BOT INICIADO — M5 ATIVO")
-    await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
+    tasks = [ws_loop(s) for s in SYMBOLS]
+    await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
