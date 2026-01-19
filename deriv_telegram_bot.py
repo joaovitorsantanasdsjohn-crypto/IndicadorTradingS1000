@@ -59,7 +59,12 @@ SYMBOLS = [
 
 CANDLE_INTERVAL_MINUTES = int(os.getenv("CANDLE_INTERVAL", "5"))
 GRANULARITY_SECONDS = CANDLE_INTERVAL_MINUTES * 60
+
+# ✅ quanto tempo antes avisar (em minutos)
 FINAL_ADVANCE_MINUTES = int(os.getenv("FINAL_ADVANCE_MINUTES", "5"))
+
+# ✅ NOVO: quantas velas à frente prever (2 velas = 10min no M5)
+PREDICT_CANDLES_AHEAD = int(os.getenv("PREDICT_CANDLES_AHEAD", "2"))
 
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
 WS_PING_TIMEOUT = int(os.getenv("WS_PING_TIMEOUT", "10"))
@@ -113,7 +118,7 @@ last_signal_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 last_processed_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 candle_counter: Dict[str, int] = {s: 0 for s in SYMBOLS}
 
-# ✅ NOVO (CORREÇÃO DO HORÁRIO): controla sinal já agendado por vela
+# ✅ NOVO: trava para não agendar 2x o mesmo candle alvo
 scheduled_signal_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 
 
@@ -220,7 +225,6 @@ def build_ml_dataset(df: pd.DataFrame):
     return X, y
 
 
-# ✅ NOVO: Função de "realce" — lista as features do ML de forma clara
 def get_ml_feature_list(symbol: str) -> list:
     """
     Retorna as colunas/features usadas pelo ML para o símbolo.
@@ -269,7 +273,6 @@ async def train_ml_async(symbol: str):
         ml_models[symbol] = (model, cols)
         ml_model_ready[symbol] = True
 
-        # ✅ NOVO: Realce das features quando o ML fica pronto
         feats = cols
         if feats:
             log(f"{symbol} ML pronto ✅ | Features: {', '.join(feats)}", "info")
@@ -310,20 +313,20 @@ def floor_to_granularity(ts_epoch: int, gran_seconds: int) -> int:
     return (ts_epoch // gran_seconds) * gran_seconds
 
 
-async def _send_scheduled_signal(symbol: str, msg: str, notify_epoch_utc: int, entry_time_brt: datetime):
+async def schedule_telegram_signal(symbol: str, when_epoch_utc: int, msg: str):
     """
-    ✅ NOVO: agenda e envia a mensagem exatamente FINAL_ADVANCE_MINUTES antes da entrada.
+    ✅ NOVO: agenda o envio da mensagem exatamente no horário correto.
     """
     try:
-        now_utc = int(time.time())
-        wait_s = notify_epoch_utc - now_utc
+        now = int(time.time())
+        wait_s = when_epoch_utc - now
         if wait_s > 0:
             await asyncio.sleep(wait_s)
 
         send_telegram(msg)
-        log(f"{symbol} — sinal ENVIADO (AGENDADO) para entrada {entry_time_brt.strftime('%H:%M')}", "info")
+        log(f"{symbol} — sinal enviado no horário agendado ✅", "info")
     except Exception as e:
-        log(f"{symbol} — falha ao enviar sinal agendado: {e}", "warning")
+        log(f"{symbol} schedule_telegram_signal erro: {e}", "warning")
 
 
 def avaliar_sinal(symbol: str):
@@ -338,12 +341,11 @@ def avaliar_sinal(symbol: str):
     epoch = int(row["epoch"])
     candle_open_epoch = floor_to_granularity(epoch, GRANULARITY_SECONDS)
 
-    # não repete por vela
-    if last_signal_epoch[symbol] == candle_open_epoch:
-        return
+    # candle alvo (entrada): prever N velas à frente
+    target_candle_open = candle_open_epoch + (GRANULARITY_SECONDS * PREDICT_CANDLES_AHEAD)
 
-    # ✅ NOVO: não agenda duas vezes a mesma vela
-    if scheduled_signal_epoch[symbol] == candle_open_epoch:
+    # evita duplicar mesmo alvo
+    if scheduled_signal_epoch[symbol] == target_candle_open:
         return
 
     now = time.time()
@@ -360,12 +362,8 @@ def avaliar_sinal(symbol: str):
     if confidence < ML_CONF_THRESHOLD:
         return
 
-    # entrada = próxima vela
-    next_candle_open = candle_open_epoch + GRANULARITY_SECONDS
-    entry_time_brt = datetime.fromtimestamp(next_candle_open, tz=timezone.utc) - timedelta(hours=3)
-
-    # ✅ CORREÇÃO: notify_epoch em UTC (5 min antes)
-    notify_epoch_utc = next_candle_open - (FINAL_ADVANCE_MINUTES * 60)
+    entry_time_brt = datetime.fromtimestamp(target_candle_open, tz=timezone.utc) - timedelta(hours=3)
+    notify_epoch_utc = target_candle_open - int(FINAL_ADVANCE_MINUTES * 60)
 
     ativo = symbol.replace("frx", "")
 
@@ -376,17 +374,17 @@ def avaliar_sinal(symbol: str):
         f"🤖 ML: {confidence*100:.0f}%"
     )
 
-    # ✅ Agenda o envio para 5 min antes (ou envia já se atrasou)
-    scheduled_signal_epoch[symbol] = candle_open_epoch
-    asyncio.create_task(_send_scheduled_signal(symbol, msg, notify_epoch_utc, entry_time_brt))
+    # ✅ AGENDAR (não envia agora)
+    asyncio.create_task(schedule_telegram_signal(symbol, notify_epoch_utc, msg))
 
-    # marca que um sinal foi gerado para essa vela
+    # marca travas
     last_signal_time[symbol] = now
     last_signal_epoch[symbol] = candle_open_epoch
+    scheduled_signal_epoch[symbol] = target_candle_open
 
     log(
-        f"{symbol} — sinal AGENDADO {direction} (ML {confidence*100:.0f}%) "
-        f"| entrada {entry_time_brt.strftime('%H:%M')} | notify -{FINAL_ADVANCE_MINUTES}min",
+        f"{symbol} — sinal AGENDADO {direction} (ML {confidence*100:.0f}%) | "
+        f"entrada={entry_time_brt.strftime('%H:%M')} | aviso em {FINAL_ADVANCE_MINUTES}min antes",
         "info"
     )
 
@@ -455,7 +453,6 @@ def df_trim(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _is_market_closed_payload(data: dict) -> bool:
-    """Detecta MarketIsClosed no payload JSON do WS."""
     try:
         if not isinstance(data, dict):
             return False
@@ -468,7 +465,6 @@ def _is_market_closed_payload(data: dict) -> bool:
 
 
 def _is_market_closed_exception(e: Exception) -> bool:
-    """Detecta MarketIsClosed quando vem em texto/exception."""
     try:
         s = str(e)
         return ("MarketIsClosed" in s)
@@ -527,7 +523,6 @@ async def ws_loop(symbol: str):
 
                     data = json.loads(raw)
 
-                    # ✅ CASO 1: erro MarketIsClosed vindo no payload
                     if _is_market_closed_payload(data):
                         log(
                             f"{symbol} Mercado fechado (MarketIsClosed) — aguardando {MARKET_CLOSED_RECONNECT_WAIT_SECONDS}s para reconectar...",
@@ -540,7 +535,6 @@ async def ws_loop(symbol: str):
                         await asyncio.sleep(MARKET_CLOSED_RECONNECT_WAIT_SECONDS)
                         break
 
-                    # Outros erros do WS
                     if "error" in data:
                         log(f"{symbol} WS retornou erro: {data.get('error')}", "error")
                         try:
@@ -589,7 +583,6 @@ async def ws_loop(symbol: str):
                             avaliar_sinal(symbol)
 
         except Exception as e:
-            # ✅ CASO 2: MarketIsClosed vindo como exception/texto
             if _is_market_closed_exception(e):
                 log(
                     f"{symbol} Mercado fechado (MarketIsClosed exception) — aguardando {MARKET_CLOSED_RECONNECT_WAIT_SECONDS}s para reconectar...",
