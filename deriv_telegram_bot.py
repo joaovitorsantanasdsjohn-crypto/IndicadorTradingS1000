@@ -37,12 +37,14 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
+
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 SYMBOLS = [
-    "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF", "frxAUDUSD",
-    "frxUSDCAD", "frxNZDUSD", "frxEURJPY", "frxGBPJPY", "frxEURGBP",
-    "frxEURAUD", "frxAUDJPY", "frxGBPAUD", "frxGBPCAD", "frxAUDNZD", "frxEURCAD"
+    "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF",
+    "frxAUDUSD", "frxUSDCAD", "frxNZDUSD", "frxEURJPY",
+    "frxGBPJPY", "frxEURGBP", "frxEURAUD", "frxAUDJPY",
+    "frxGBPAUD", "frxGBPCAD", "frxAUDNZD", "frxEURCAD"
 ]
 
 CANDLE_INTERVAL_MINUTES = int(os.getenv("CANDLE_INTERVAL", "5"))
@@ -75,7 +77,6 @@ ML_ENABLED = bool(int(os.getenv("ML_ENABLED", "1"))) and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "300"))
 ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "2000"))
 ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
-
 ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "60"))
 ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "5"))
 ML_TRAIN_EVERY_N_CANDLES = int(os.getenv("ML_TRAIN_EVERY_N_CANDLES", "3"))
@@ -100,7 +101,11 @@ ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 last_signal_time: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
 last_signal_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 last_processed_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
+
 candle_counter: Dict[str, int] = {s: 0 for s in SYMBOLS}
+
+# ✅ NOVO: controle para evitar agendar sinal duplicado no mesmo candle
+scheduled_signal_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 
 
 # ============================================================
@@ -121,10 +126,8 @@ logger.addHandler(handler)
 def log(msg: str, level: str = "info"):
     utc_now = datetime.now(timezone.utc)
     brt_now = utc_now - timedelta(hours=3)
-
     utc = utc_now.strftime("%Y-%m-%d %H:%M:%S UTC")
     brt = brt_now.strftime("%Y-%m-%d %H:%M:%S BRT")
-
     full = f"{utc} | {brt} | {msg}"
 
     if level == "info":
@@ -194,6 +197,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_ml_dataset(df: pd.DataFrame):
     df = df.dropna().copy()
+
     if "epoch" not in df.columns:
         return None, None
 
@@ -218,6 +222,7 @@ async def train_ml_async(symbol: str):
         return
 
     df = candles[symbol]
+
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         ml_model_ready[symbol] = False
         return
@@ -248,10 +253,8 @@ async def train_ml_async(symbol: str):
 def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
     if not ML_ENABLED:
         return None
-
     if not ml_model_ready.get(symbol):
         return None
-
     if symbol not in ml_models:
         return None
 
@@ -272,8 +275,40 @@ def floor_to_granularity(ts_epoch: int, gran_seconds: int) -> int:
     return (ts_epoch // gran_seconds) * gran_seconds
 
 
-def avaliar_sinal(symbol: str):
+async def _send_signal_at_time(symbol: str, msg: str, direction: str, confidence: float, candle_open_epoch: int, notify_epoch: int):
+    """
+    ✅ NOVO: envia o sinal exatamente no horário certo (5 min antes)
+    """
+    try:
+        now_epoch = int(time.time())
+
+        # Se passou do horário de notificação, cancela (não envia atrasado)
+        if now_epoch > notify_epoch + 2:
+            log(f"{symbol} — notificação atrasada, cancelando envio (notify já passou).", "warning")
+            return
+
+        delay = max(0, notify_epoch - now_epoch)
+
+        if delay > 0:
+            log(f"{symbol} — sinal agendado para {delay}s (5 min antes da entrada).", "info")
+            await asyncio.sleep(delay)
+
+        # Envia
+        send_telegram(msg)
+
+        last_signal_time[symbol] = time.time()
+        last_signal_epoch[symbol] = candle_open_epoch
+        scheduled_signal_epoch[symbol] = None
+
+        log(f"{symbol} — sinal enviado {direction} (ML {confidence*100:.0f}%) [AGENDADO]")
+
+    except Exception as e:
+        log(f"{symbol} — erro ao agendar/enviar sinal: {e}", "error")
+
+
+async def avaliar_sinal(symbol: str):
     df = candles[symbol]
+
     if len(df) < EMA_SLOW + 50:
         return
 
@@ -284,6 +319,7 @@ def avaliar_sinal(symbol: str):
     epoch = int(row["epoch"])
     candle_open_epoch = floor_to_granularity(epoch, GRANULARITY_SECONDS)
 
+    # evita sinal duplicado do mesmo candle
     if last_signal_epoch[symbol] == candle_open_epoch:
         return
 
@@ -301,26 +337,35 @@ def avaliar_sinal(symbol: str):
     if confidence < ML_CONF_THRESHOLD:
         return
 
+    # candle de entrada é o PRÓXIMO
     next_candle_open = candle_open_epoch + GRANULARITY_SECONDS
 
+    # ✅ horário exato que deve notificar (5 min antes)
+    notify_epoch = next_candle_open - (FINAL_ADVANCE_MINUTES * 60)
+
+    # ✅ Evita agendar duas vezes
+    if scheduled_signal_epoch[symbol] == candle_open_epoch:
+        return
+
     entry_time_brt = datetime.fromtimestamp(next_candle_open, tz=timezone.utc) - timedelta(hours=3)
-    notify_time_brt = entry_time_brt - timedelta(minutes=FINAL_ADVANCE_MINUTES)
 
     ativo = symbol.replace("frx", "")
-
     msg = (
-    f"🚀 <b>ATIVO:</b> {ativo}\n"
-    f"📌 <b>DIREÇÃO:</b> {direction}\n"
-    f"⏰ <b>ENTRADA:</b> {entry_time_brt.strftime('%H:%M')}\n"
-    f"🤖 <b>ML:</b> {confidence*100:.0f}%"
-)
+        f"🚀 <b>ATIVO:</b> {ativo}\n"
+        f"📌 <b>DIREÇÃO:</b> {direction}\n"
+        f"⏰ <b>ENTRADA:</b> {entry_time_brt.strftime('%H:%M')}\n"
+        f"🤖 <b>ML:</b> {confidence*100:.0f}%"
+    )
 
-    send_telegram(msg)
+    # ✅ Se já passou do horário de notificar, NÃO envia atrasado
+    now_epoch = int(time.time())
+    if now_epoch > notify_epoch + 2:
+        log(f"{symbol} — sinal calculado tarde demais (notify já passou), ignorando.", "warning")
+        return
 
-    last_signal_time[symbol] = now
-    last_signal_epoch[symbol] = candle_open_epoch
-
-    log(f"{symbol} — sinal enviado {direction} (ML {confidence*100:.0f}%)")
+    # ✅ Agenda envio para o horário correto
+    scheduled_signal_epoch[symbol] = candle_open_epoch
+    asyncio.create_task(_send_signal_at_time(symbol, msg, direction, confidence, candle_open_epoch, notify_epoch))
 
 
 # ============================================================
@@ -333,6 +378,7 @@ async def deriv_authorize(ws):
 
     req = {"authorize": DERIV_TOKEN}
     await ws.send(json.dumps(req))
+
     raw = await ws.recv()
     data = json.loads(raw)
 
@@ -388,9 +434,7 @@ def df_trim(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _is_market_closed_payload(data: dict) -> bool:
-    """
-    Detecta MarketIsClosed no payload JSON do WS.
-    """
+    """ Detecta MarketIsClosed no payload JSON do WS. """
     try:
         if not isinstance(data, dict):
             return False
@@ -403,9 +447,7 @@ def _is_market_closed_payload(data: dict) -> bool:
 
 
 def _is_market_closed_exception(e: Exception) -> bool:
-    """
-    Detecta MarketIsClosed quando vem em texto/exception.
-    """
+    """ Detecta MarketIsClosed quando vem em texto/exception. """
     try:
         s = str(e)
         return ("MarketIsClosed" in s)
@@ -431,6 +473,7 @@ async def ws_loop(symbol: str):
                 close_timeout=10,
                 max_queue=32
             ) as ws:
+
                 log(f"{symbol} WS conectado ✅", "info")
 
                 try:
@@ -521,7 +564,7 @@ async def ws_loop(symbol: str):
                             if ML_ENABLED and (candle_counter[symbol] % ML_TRAIN_EVERY_N_CANDLES == 0):
                                 asyncio.create_task(train_ml_async(symbol))
 
-                            avaliar_sinal(symbol)
+                            await avaliar_sinal(symbol)
 
         except Exception as e:
             # ✅ CASO 2: MarketIsClosed vindo como exception/texto
@@ -535,7 +578,6 @@ async def ws_loop(symbol: str):
                 continue
 
             msg = str(e)
-
             if "UnrecognisedRequest" in msg or "WrongResponse" in msg:
                 log(f"{symbol} WS request inválido/erro Deriv: {e}", "error")
             else:
@@ -552,9 +594,11 @@ async def ws_loop(symbol: str):
 
 app = Flask(__name__)
 
+
 @app.route("/", methods=["GET", "HEAD"])
 def health():
     return "OK", 200
+
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
@@ -566,8 +610,10 @@ def run_flask():
 
 async def main():
     send_telegram("🚀 BOT INICIADO — M5 ATIVO")
+
     tasks = [ws_loop(s) for s in SYMBOLS]
     await asyncio.gather(*tasks)
+
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
