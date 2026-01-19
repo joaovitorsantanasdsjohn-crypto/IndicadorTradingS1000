@@ -96,6 +96,9 @@ STARTUP_STAGGER_MAX_SECONDS = int(os.getenv("STARTUP_STAGGER_MAX_SECONDS", "10")
 # Se o mercado estiver fechado: espera 30 minutos antes de tentar reconectar
 MARKET_CLOSED_RECONNECT_WAIT_SECONDS = int(os.getenv("MARKET_CLOSED_RECONNECT_WAIT_SECONDS", "1800"))  # 30 min
 
+# ✅ NOVO: se quiser mandar 1x mensagem explicando as features do ML no Telegram
+ML_FEATURES_SEND_ON_READY = bool(int(os.getenv("ML_FEATURES_SEND_ON_READY", "0")))  # 0 = desligado
+
 
 # ============================================================
 # ✅ BLOCO 2 — ESTADO GLOBAL
@@ -110,7 +113,7 @@ last_signal_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 last_processed_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 candle_counter: Dict[str, int] = {s: 0 for s in SYMBOLS}
 
-# ✅ NOVO (somente para corrigir o horário de envio)
+# ✅ NOVO (CORREÇÃO DO HORÁRIO): controla sinal já agendado por vela
 scheduled_signal_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 
 
@@ -217,6 +220,26 @@ def build_ml_dataset(df: pd.DataFrame):
     return X, y
 
 
+# ✅ NOVO: Função de "realce" — lista as features do ML de forma clara
+def get_ml_feature_list(symbol: str) -> list:
+    """
+    Retorna as colunas/features usadas pelo ML para o símbolo.
+    Obs: inclui OHLC (price action) + indicadores calculados.
+    """
+    try:
+        if symbol not in candles:
+            return []
+        df = candles[symbol]
+        if df is None or df.empty:
+            return []
+        X, y = build_ml_dataset(df)
+        if X is None:
+            return []
+        return list(X.columns)
+    except Exception:
+        return []
+
+
 async def train_ml_async(symbol: str):
     if not ML_ENABLED:
         ml_model_ready[symbol] = False
@@ -245,6 +268,19 @@ async def train_ml_async(symbol: str):
         model, cols = await asyncio.to_thread(_fit)
         ml_models[symbol] = (model, cols)
         ml_model_ready[symbol] = True
+
+        # ✅ NOVO: Realce das features quando o ML fica pronto
+        feats = cols
+        if feats:
+            log(f"{symbol} ML pronto ✅ | Features: {', '.join(feats)}", "info")
+            if ML_FEATURES_SEND_ON_READY:
+                ativo = symbol.replace("frx", "")
+                send_telegram(
+                    f"🧠 ML READY ({ativo})\n"
+                    f"Features usadas:\n"
+                    + "\n".join([f"- {f}" for f in feats])
+                )
+
     except Exception as e:
         ml_model_ready[symbol] = False
         log(f"{symbol} ML treino falhou: {e}", "warning")
@@ -274,19 +310,20 @@ def floor_to_granularity(ts_epoch: int, gran_seconds: int) -> int:
     return (ts_epoch // gran_seconds) * gran_seconds
 
 
-async def _send_signal_at_time(symbol: str, msg: str, notify_epoch: int):
+async def _send_scheduled_signal(symbol: str, msg: str, notify_epoch_utc: int, entry_time_brt: datetime):
     """
-    Envia a mensagem exatamente no horário notify_epoch (UTC epoch).
-    Se já passou do horário, envia imediatamente.
+    ✅ NOVO: agenda e envia a mensagem exatamente FINAL_ADVANCE_MINUTES antes da entrada.
     """
     try:
-        now_epoch = int(time.time())
-        delay = notify_epoch - now_epoch
-        if delay > 0:
-            await asyncio.sleep(delay)
+        now_utc = int(time.time())
+        wait_s = notify_epoch_utc - now_utc
+        if wait_s > 0:
+            await asyncio.sleep(wait_s)
+
         send_telegram(msg)
+        log(f"{symbol} — sinal ENVIADO (AGENDADO) para entrada {entry_time_brt.strftime('%H:%M')}", "info")
     except Exception as e:
-        log(f"{symbol} erro ao agendar/enviar sinal: {e}", "warning")
+        log(f"{symbol} — falha ao enviar sinal agendado: {e}", "warning")
 
 
 def avaliar_sinal(symbol: str):
@@ -301,8 +338,12 @@ def avaliar_sinal(symbol: str):
     epoch = int(row["epoch"])
     candle_open_epoch = floor_to_granularity(epoch, GRANULARITY_SECONDS)
 
-    # evita duplicar sinal por candle
+    # não repete por vela
     if last_signal_epoch[symbol] == candle_open_epoch:
+        return
+
+    # ✅ NOVO: não agenda duas vezes a mesma vela
+    if scheduled_signal_epoch[symbol] == candle_open_epoch:
         return
 
     now = time.time()
@@ -319,12 +360,12 @@ def avaliar_sinal(symbol: str):
     if confidence < ML_CONF_THRESHOLD:
         return
 
+    # entrada = próxima vela
     next_candle_open = candle_open_epoch + GRANULARITY_SECONDS
-
-    # ✅ ESTE é o horário correto do aviso (5 min antes)
-    notify_epoch = next_candle_open - int(FINAL_ADVANCE_MINUTES * 60)
-
     entry_time_brt = datetime.fromtimestamp(next_candle_open, tz=timezone.utc) - timedelta(hours=3)
+
+    # ✅ CORREÇÃO: notify_epoch em UTC (5 min antes)
+    notify_epoch_utc = next_candle_open - (FINAL_ADVANCE_MINUTES * 60)
 
     ativo = symbol.replace("frx", "")
 
@@ -335,17 +376,19 @@ def avaliar_sinal(symbol: str):
         f"🤖 ML: {confidence*100:.0f}%"
     )
 
-    # ✅ NOVO: não deixar agendar repetido pro mesmo candle
-    if scheduled_signal_epoch[symbol] == candle_open_epoch:
-        return
+    # ✅ Agenda o envio para 5 min antes (ou envia já se atrasou)
     scheduled_signal_epoch[symbol] = candle_open_epoch
+    asyncio.create_task(_send_scheduled_signal(symbol, msg, notify_epoch_utc, entry_time_brt))
 
-    # ✅ Agenda o envio para notify_epoch
-    asyncio.create_task(_send_signal_at_time(symbol, msg, notify_epoch))
-
+    # marca que um sinal foi gerado para essa vela
     last_signal_time[symbol] = now
     last_signal_epoch[symbol] = candle_open_epoch
-    log(f"{symbol} — sinal agendado {direction} p/ enviar {FINAL_ADVANCE_MINUTES}min antes (ML {confidence*100:.0f}%)")
+
+    log(
+        f"{symbol} — sinal AGENDADO {direction} (ML {confidence*100:.0f}%) "
+        f"| entrada {entry_time_brt.strftime('%H:%M')} | notify -{FINAL_ADVANCE_MINUTES}min",
+        "info"
+    )
 
 
 # ============================================================
