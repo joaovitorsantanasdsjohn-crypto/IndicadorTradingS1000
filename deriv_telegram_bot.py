@@ -29,7 +29,6 @@ except Exception:
 # ============================================================
 # ✅ BLOCO 1 — CONFIGURAÇÕES / PARÂMETROS (AJUSTE AQUI)
 # ============================================================
-
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -37,19 +36,29 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
-
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 SYMBOLS = [
-    "frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxUSDCHF",
-    "frxAUDUSD", "frxUSDCAD", "frxNZDUSD", "frxEURJPY",
-    "frxGBPJPY", "frxEURGBP", "frxEURAUD", "frxAUDJPY",
-    "frxGBPAUD", "frxGBPCAD", "frxAUDNZD", "frxEURCAD"
+    "frxEURUSD",
+    "frxUSDJPY",
+    "frxGBPUSD",
+    "frxUSDCHF",
+    "frxAUDUSD",
+    "frxUSDCAD",
+    "frxNZDUSD",
+    "frxEURJPY",
+    "frxGBPJPY",
+    "frxEURGBP",
+    "frxEURAUD",
+    "frxAUDJPY",
+    "frxGBPAUD",
+    "frxGBPCAD",
+    "frxAUDNZD",
+    "frxEURCAD"
 ]
 
 CANDLE_INTERVAL_MINUTES = int(os.getenv("CANDLE_INTERVAL", "5"))
 GRANULARITY_SECONDS = CANDLE_INTERVAL_MINUTES * 60
-
 FINAL_ADVANCE_MINUTES = int(os.getenv("FINAL_ADVANCE_MINUTES", "5"))
 
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
@@ -68,7 +77,6 @@ BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
 BB_STD = float(os.getenv("BB_STD", "2.3"))
 
 MFI_PERIOD = int(os.getenv("MFI_PERIOD", "14"))
-
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_MIN = float(os.getenv("RSI_MIN", "0"))
 RSI_MAX = float(os.getenv("RSI_MAX", "100"))
@@ -88,11 +96,13 @@ STARTUP_STAGGER_MAX_SECONDS = int(os.getenv("STARTUP_STAGGER_MAX_SECONDS", "10")
 # Se o mercado estiver fechado: espera 30 minutos antes de tentar reconectar
 MARKET_CLOSED_RECONNECT_WAIT_SECONDS = int(os.getenv("MARKET_CLOSED_RECONNECT_WAIT_SECONDS", "1800"))  # 30 min
 
+# ✅ NOVO: se quiser mandar 1x mensagem explicando as features do ML no Telegram
+ML_FEATURES_SEND_ON_READY = bool(int(os.getenv("ML_FEATURES_SEND_ON_READY", "0")))  # 0 = desligado
+
 
 # ============================================================
 # ✅ BLOCO 2 — ESTADO GLOBAL
 # ============================================================
-
 candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
 
 ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
@@ -101,17 +111,12 @@ ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 last_signal_time: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
 last_signal_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 last_processed_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
-
 candle_counter: Dict[str, int] = {s: 0 for s in SYMBOLS}
-
-# ✅ NOVO: controle para evitar agendar sinal duplicado no mesmo candle
-scheduled_signal_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 
 
 # ============================================================
 # ✅ BLOCO 3 — LOGGING
 # ============================================================
-
 logger = logging.getLogger("IndicadorTradingS1000")
 logger.setLevel(logging.INFO)
 
@@ -141,7 +146,6 @@ def log(msg: str, level: str = "info"):
 # ============================================================
 # ✅ BLOCO 4 — TELEGRAM
 # ============================================================
-
 def send_telegram(message: str):
     try:
         if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -150,7 +154,6 @@ def send_telegram(message: str):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
         requests.post(url, data=payload, timeout=10)
-
     except Exception as e:
         log(f"Erro Telegram: {e}", "error")
 
@@ -158,7 +161,6 @@ def send_telegram(message: str):
 # ============================================================
 # ✅ BLOCO 5 — INDICADORES (SOMENTE FEATURES PARA ML)
 # ============================================================
-
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().reset_index(drop=True)
 
@@ -194,7 +196,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # ✅ BLOCO 6 — MACHINE LEARNING (CÉREBRO DO BOT)
 # ============================================================
-
 def build_ml_dataset(df: pd.DataFrame):
     df = df.dropna().copy()
 
@@ -216,13 +217,32 @@ def build_ml_dataset(df: pd.DataFrame):
     return X, y
 
 
+# ✅ NOVO: Função de "realce" — lista as features do ML de forma clara
+def get_ml_feature_list(symbol: str) -> list:
+    """
+    Retorna as colunas/features usadas pelo ML para o símbolo.
+    Obs: inclui OHLC (price action) + indicadores calculados.
+    """
+    try:
+        if symbol not in candles:
+            return []
+        df = candles[symbol]
+        if df is None or df.empty:
+            return []
+        X, y = build_ml_dataset(df)
+        if X is None:
+            return []
+        return list(X.columns)
+    except Exception:
+        return []
+
+
 async def train_ml_async(symbol: str):
     if not ML_ENABLED:
         ml_model_ready[symbol] = False
         return
 
     df = candles[symbol]
-
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         ml_model_ready[symbol] = False
         return
@@ -245,6 +265,19 @@ async def train_ml_async(symbol: str):
         model, cols = await asyncio.to_thread(_fit)
         ml_models[symbol] = (model, cols)
         ml_model_ready[symbol] = True
+
+        # ✅ NOVO: Realce das features quando o ML fica pronto
+        feats = cols
+        if feats:
+            log(f"{symbol} ML pronto ✅ | Features: {', '.join(feats)}", "info")
+            if ML_FEATURES_SEND_ON_READY:
+                ativo = symbol.replace("frx", "")
+                send_telegram(
+                    f"🧠 ML READY ({ativo})\n"
+                    f"Features usadas:\n"
+                    + "\n".join([f"- {f}" for f in feats])
+                )
+
     except Exception as e:
         ml_model_ready[symbol] = False
         log(f"{symbol} ML treino falhou: {e}", "warning")
@@ -270,45 +303,12 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
 # ============================================================
 # ✅ BLOCO 7 — SINAIS (100% ML)
 # ============================================================
-
 def floor_to_granularity(ts_epoch: int, gran_seconds: int) -> int:
     return (ts_epoch // gran_seconds) * gran_seconds
 
 
-async def _send_signal_at_time(symbol: str, msg: str, direction: str, confidence: float, candle_open_epoch: int, notify_epoch: int):
-    """
-    ✅ NOVO: envia o sinal exatamente no horário certo (5 min antes)
-    """
-    try:
-        now_epoch = int(time.time())
-
-        # Se passou do horário de notificação, cancela (não envia atrasado)
-        if now_epoch > notify_epoch + 2:
-            log(f"{symbol} — notificação atrasada, cancelando envio (notify já passou).", "warning")
-            return
-
-        delay = max(0, notify_epoch - now_epoch)
-
-        if delay > 0:
-            log(f"{symbol} — sinal agendado para {delay}s (5 min antes da entrada).", "info")
-            await asyncio.sleep(delay)
-
-        # Envia
-        send_telegram(msg)
-
-        last_signal_time[symbol] = time.time()
-        last_signal_epoch[symbol] = candle_open_epoch
-        scheduled_signal_epoch[symbol] = None
-
-        log(f"{symbol} — sinal enviado {direction} (ML {confidence*100:.0f}%) [AGENDADO]")
-
-    except Exception as e:
-        log(f"{symbol} — erro ao agendar/enviar sinal: {e}", "error")
-
-
-async def avaliar_sinal(symbol: str):
+def avaliar_sinal(symbol: str):
     df = candles[symbol]
-
     if len(df) < EMA_SLOW + 50:
         return
 
@@ -319,7 +319,6 @@ async def avaliar_sinal(symbol: str):
     epoch = int(row["epoch"])
     candle_open_epoch = floor_to_granularity(epoch, GRANULARITY_SECONDS)
 
-    # evita sinal duplicado do mesmo candle
     if last_signal_epoch[symbol] == candle_open_epoch:
         return
 
@@ -337,41 +336,29 @@ async def avaliar_sinal(symbol: str):
     if confidence < ML_CONF_THRESHOLD:
         return
 
-    # candle de entrada é o PRÓXIMO
     next_candle_open = candle_open_epoch + GRANULARITY_SECONDS
-
-    # ✅ horário exato que deve notificar (5 min antes)
-    notify_epoch = next_candle_open - (FINAL_ADVANCE_MINUTES * 60)
-
-    # ✅ Evita agendar duas vezes
-    if scheduled_signal_epoch[symbol] == candle_open_epoch:
-        return
-
     entry_time_brt = datetime.fromtimestamp(next_candle_open, tz=timezone.utc) - timedelta(hours=3)
+    notify_time_brt = entry_time_brt - timedelta(minutes=FINAL_ADVANCE_MINUTES)
 
     ativo = symbol.replace("frx", "")
+
     msg = (
-        f"🚀 <b>ATIVO:</b> {ativo}\n"
-        f"📌 <b>DIREÇÃO:</b> {direction}\n"
-        f"⏰ <b>ENTRADA:</b> {entry_time_brt.strftime('%H:%M')}\n"
-        f"🤖 <b>ML:</b> {confidence*100:.0f}%"
+        f"📊 ATIVO: {ativo}\n"
+        f"📌 DIREÇÃO: {direction}\n"
+        f"⏰ ENTRADA: {entry_time_brt.strftime('%H:%M')}\n"
+        f"🤖 ML: {confidence*100:.0f}%"
     )
 
-    # ✅ Se já passou do horário de notificar, NÃO envia atrasado
-    now_epoch = int(time.time())
-    if now_epoch > notify_epoch + 2:
-        log(f"{symbol} — sinal calculado tarde demais (notify já passou), ignorando.", "warning")
-        return
+    send_telegram(msg)
 
-    # ✅ Agenda envio para o horário correto
-    scheduled_signal_epoch[symbol] = candle_open_epoch
-    asyncio.create_task(_send_signal_at_time(symbol, msg, direction, confidence, candle_open_epoch, notify_epoch))
+    last_signal_time[symbol] = now
+    last_signal_epoch[symbol] = candle_open_epoch
+    log(f"{symbol} — sinal enviado {direction} (ML {confidence*100:.0f}%)")
 
 
 # ============================================================
 # ✅ BLOCO 8 — WEBSOCKET (HISTÓRICO + STREAM)
 # ============================================================
-
 async def deriv_authorize(ws):
     if not DERIV_TOKEN:
         return
@@ -395,8 +382,8 @@ async def request_history(ws, symbol: str) -> pd.DataFrame:
         "granularity": GRANULARITY_SECONDS,
         "style": "candles"
     }
-
     await ws.send(json.dumps(req_hist))
+
     log(f"{symbol} Histórico solicitado 📥", "info")
 
     raw = await ws.recv()
@@ -422,7 +409,6 @@ async def subscribe_candles(ws, symbol: str):
         "style": "candles",
         "subscribe": 1
     }
-
     await ws.send(json.dumps(req_sub))
     log(f"{symbol} Stream (candles) ligado 🔴", "info")
 
@@ -434,7 +420,7 @@ def df_trim(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _is_market_closed_payload(data: dict) -> bool:
-    """ Detecta MarketIsClosed no payload JSON do WS. """
+    """Detecta MarketIsClosed no payload JSON do WS."""
     try:
         if not isinstance(data, dict):
             return False
@@ -447,7 +433,7 @@ def _is_market_closed_payload(data: dict) -> bool:
 
 
 def _is_market_closed_exception(e: Exception) -> bool:
-    """ Detecta MarketIsClosed quando vem em texto/exception. """
+    """Detecta MarketIsClosed quando vem em texto/exception."""
     try:
         s = str(e)
         return ("MarketIsClosed" in s)
@@ -484,13 +470,13 @@ async def ws_loop(symbol: str):
                 df = await request_history(ws, symbol)
                 df = calcular_indicadores(df)
                 df = df_trim(df)
+
                 candles[symbol] = df
 
                 if ML_ENABLED:
                     await train_ml_async(symbol)
 
                 await subscribe_candles(ws, symbol)
-
                 backoff = 2
 
                 while True:
@@ -550,6 +536,7 @@ async def ws_loop(symbol: str):
 
                         df = df_trim(df)
                         df = calcular_indicadores(df)
+
                         candles[symbol] = df
 
                         try:
@@ -564,7 +551,7 @@ async def ws_loop(symbol: str):
                             if ML_ENABLED and (candle_counter[symbol] % ML_TRAIN_EVERY_N_CANDLES == 0):
                                 asyncio.create_task(train_ml_async(symbol))
 
-                            await avaliar_sinal(symbol)
+                            avaliar_sinal(symbol)
 
         except Exception as e:
             # ✅ CASO 2: MarketIsClosed vindo como exception/texto
@@ -591,7 +578,6 @@ async def ws_loop(symbol: str):
 # ============================================================
 # ✅ BLOCO 9 — FLASK HEALTHCHECK (RENDER)
 # ============================================================
-
 app = Flask(__name__)
 
 
@@ -607,10 +593,8 @@ def run_flask():
 # ============================================================
 # ✅ BLOCO 10 — MAIN
 # ============================================================
-
 async def main():
-    send_telegram("🚀 BOT INICIADO — M5 ATIVO")
-
+    send_telegram("✅ BOT INICIADO — M5 ATIVO")
     tasks = [ws_loop(s) for s in SYMBOLS]
     await asyncio.gather(*tasks)
 
