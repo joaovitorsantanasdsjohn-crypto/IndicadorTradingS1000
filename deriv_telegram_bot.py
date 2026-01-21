@@ -63,7 +63,7 @@ GRANULARITY_SECONDS = CANDLE_INTERVAL_MINUTES * 60
 # ✅ quanto tempo antes avisar (em minutos)
 FINAL_ADVANCE_MINUTES = int(os.getenv("FINAL_ADVANCE_MINUTES", "5"))
 
-# ✅ NOVO: quantas velas à frente prever (2 velas = 10min no M5)
+# ✅ quantas velas à frente prever (2 velas = 10min no M5)
 PREDICT_CANDLES_AHEAD = int(os.getenv("PREDICT_CANDLES_AHEAD", "2"))
 
 WS_PING_INTERVAL = int(os.getenv("WS_PING_INTERVAL", "30"))
@@ -101,7 +101,7 @@ STARTUP_STAGGER_MAX_SECONDS = int(os.getenv("STARTUP_STAGGER_MAX_SECONDS", "10")
 # Se o mercado estiver fechado: espera 30 minutos antes de tentar reconectar
 MARKET_CLOSED_RECONNECT_WAIT_SECONDS = int(os.getenv("MARKET_CLOSED_RECONNECT_WAIT_SECONDS", "1800"))  # 30 min
 
-# ✅ NOVO: se quiser mandar 1x mensagem explicando as features do ML no Telegram
+# ✅ se quiser mandar 1x mensagem explicando as features do ML no Telegram
 ML_FEATURES_SEND_ON_READY = bool(int(os.getenv("ML_FEATURES_SEND_ON_READY", "0")))  # 0 = desligado
 
 
@@ -118,7 +118,7 @@ last_signal_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 last_processed_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 candle_counter: Dict[str, int] = {s: 0 for s in SYMBOLS}
 
-# ✅ NOVO: trava para não agendar 2x o mesmo candle alvo
+# ✅ trava para não agendar 2x o mesmo candle alvo
 scheduled_signal_epoch: Dict[str, Optional[int]] = {s: None for s in SYMBOLS}
 
 
@@ -210,11 +210,19 @@ def build_ml_dataset(df: pd.DataFrame):
     if "epoch" not in df.columns:
         return None, None
 
-    df["future"] = (df["close"].shift(-1) > df["close"]).astype(int)
+    # ============================================================
+    # ✅ CORREÇÃO PRINCIPAL:
+    # O label agora é baseado em PREDICT_CANDLES_AHEAD
+    # (antes era sempre shift(-1))
+    # ============================================================
+    shift_n = int(max(1, PREDICT_CANDLES_AHEAD))
+    df["future"] = (df["close"].shift(-shift_n) > df["close"]).astype(int)
 
     drop_cols = {"future", "epoch"}
-    X = df.drop(columns=[c for c in drop_cols if c in df.columns]).iloc[:-1]
-    y = df["future"].iloc[:-1]
+
+    # corta as últimas N linhas (que não têm futuro)
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns]).iloc[:-shift_n]
+    y = df["future"].iloc[:-shift_n]
 
     if len(X) <= 10:
         return None, None
@@ -315,7 +323,7 @@ def floor_to_granularity(ts_epoch: int, gran_seconds: int) -> int:
 
 async def schedule_telegram_signal(symbol: str, when_epoch_utc: int, msg: str):
     """
-    ✅ NOVO: agenda o envio da mensagem exatamente no horário correto.
+    ✅ agenda o envio da mensagem exatamente no horário correto.
     """
     try:
         now = int(time.time())
@@ -377,7 +385,7 @@ def avaliar_sinal(symbol: str):
     # ✅ AGENDAR (não envia agora)
     asyncio.create_task(schedule_telegram_signal(symbol, notify_epoch_utc, msg))
 
-    # marca travas
+    # marca
     last_signal_time[symbol] = now
     last_signal_epoch[symbol] = candle_open_epoch
     scheduled_signal_epoch[symbol] = target_candle_open
