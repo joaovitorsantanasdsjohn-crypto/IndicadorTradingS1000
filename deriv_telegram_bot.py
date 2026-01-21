@@ -15,8 +15,8 @@ from flask import Flask
 from dotenv import load_dotenv
 
 from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator
-from ta.volatility import BollingerBands
+from ta.trend import EMAIndicator, ADXIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
 from ta.volume import MFIIndicator
 
 try:
@@ -85,6 +85,10 @@ MFI_PERIOD = int(os.getenv("MFI_PERIOD", "14"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_MIN = float(os.getenv("RSI_MIN", "0"))
 RSI_MAX = float(os.getenv("RSI_MAX", "100"))
+
+# ✅ NOVO (somente features pro ML)
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+ADX_PERIOD = int(os.getenv("ADX_PERIOD", "14"))
 
 ML_ENABLED = bool(int(os.getenv("ML_ENABLED", "1"))) and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "300"))
@@ -172,20 +176,21 @@ def send_telegram(message: str):
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().reset_index(drop=True)
 
-    if len(df) < EMA_SLOW + 10:
+    if len(df) < EMA_SLOW + 30:
         return df
 
+    # =========================
+    # ✅ 1) EMAs
+    # =========================
     df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
 
+    # =========================
+    # ✅ 2) RSI / MFI
+    # =========================
     df["rsi"] = RSIIndicator(df["close"], RSI_PERIOD).rsi()
     df["rsi"] = df["rsi"].clip(lower=RSI_MIN, upper=RSI_MAX)
-
-    bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
-    df["bb_mid"] = bb.bollinger_mavg()
-    df["bb_upper"] = bb.bollinger_hband()
-    df["bb_lower"] = bb.bollinger_lband()
 
     if "volume" not in df.columns:
         df["volume"] = 1
@@ -197,6 +202,80 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         volume=df["volume"],
         window=MFI_PERIOD
     ).money_flow_index()
+
+    # =========================
+    # ✅ 3) Bollinger
+    # =========================
+    bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
+    df["bb_mid"] = bb.bollinger_mavg()
+    df["bb_upper"] = bb.bollinger_hband()
+    df["bb_lower"] = bb.bollinger_lband()
+
+    # ✅ NOVO: largura das bandas (volatilidade)
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / (df["bb_mid"].replace(0, 1e-9))
+
+    # =========================
+    # ✅ 4) ATR / ADX (FORÇA + VOLATILIDADE)
+    # =========================
+    try:
+        atr = AverageTrueRange(
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            window=ATR_PERIOD
+        )
+        df["atr"] = atr.average_true_range()
+    except Exception:
+        pass
+
+    try:
+        adx = ADXIndicator(
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            window=ADX_PERIOD
+        )
+        df["adx"] = adx.adx()
+        df["adx_pos"] = adx.adx_pos()
+        df["adx_neg"] = adx.adx_neg()
+    except Exception:
+        pass
+
+    # =========================
+    # ✅ 5) PRICE ACTION FEATURES (CENÁRIO)
+    # =========================
+    # corpo e pavios
+    df["candle_body"] = (df["close"] - df["open"]).abs()
+    df["candle_range"] = (df["high"] - df["low"]).abs()
+
+    # evita divisão por zero
+    safe_range = df["candle_range"].replace(0, 1e-9)
+
+    df["body_pct"] = df["candle_body"] / safe_range
+    df["upper_wick"] = (df["high"] - df[["open", "close"]].max(axis=1)).clip(lower=0)
+    df["lower_wick"] = (df[["open", "close"]].min(axis=1) - df["low"]).clip(lower=0)
+    df["upper_wick_pct"] = df["upper_wick"] / safe_range
+    df["lower_wick_pct"] = df["lower_wick"] / safe_range
+
+    # direção (pressão)
+    df["close_gt_open"] = (df["close"] > df["open"]).astype(int)
+
+    # momentum simples
+    df["ret_1"] = df["close"].pct_change(1)
+    df["ret_2"] = df["close"].pct_change(2)
+    df["ret_3"] = df["close"].pct_change(3)
+
+    # inclinação das EMAs (tendência real, não só cruzamento)
+    df["ema_fast_slope"] = df["ema_fast"].diff()
+    df["ema_mid_slope"] = df["ema_mid"].diff()
+    df["ema_slow_slope"] = df["ema_slow"].diff()
+
+    # distância do preço até EMA lenta
+    df["dist_close_ema_slow"] = (df["close"] - df["ema_slow"]) / (df["ema_slow"].replace(0, 1e-9))
+
+    # separação entre EMAs
+    df["ema_sep_fast_mid"] = (df["ema_fast"] - df["ema_mid"]) / (df["ema_mid"].replace(0, 1e-9))
+    df["ema_sep_mid_slow"] = (df["ema_mid"] - df["ema_slow"]) / (df["ema_slow"].replace(0, 1e-9))
 
     return df
 
@@ -210,19 +289,11 @@ def build_ml_dataset(df: pd.DataFrame):
     if "epoch" not in df.columns:
         return None, None
 
-    # ============================================================
-    # ✅ CORREÇÃO PRINCIPAL:
-    # O label agora é baseado em PREDICT_CANDLES_AHEAD
-    # (antes era sempre shift(-1))
-    # ============================================================
-    shift_n = int(max(1, PREDICT_CANDLES_AHEAD))
-    df["future"] = (df["close"].shift(-shift_n) > df["close"]).astype(int)
+    df["future"] = (df["close"].shift(-1) > df["close"]).astype(int)
 
     drop_cols = {"future", "epoch"}
-
-    # corta as últimas N linhas (que não têm futuro)
-    X = df.drop(columns=[c for c in drop_cols if c in df.columns]).iloc[:-shift_n]
-    y = df["future"].iloc[:-shift_n]
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns]).iloc[:-1]
+    y = df["future"].iloc[:-1]
 
     if len(X) <= 10:
         return None, None
@@ -339,7 +410,7 @@ async def schedule_telegram_signal(symbol: str, when_epoch_utc: int, msg: str):
 
 def avaliar_sinal(symbol: str):
     df = candles[symbol]
-    if len(df) < EMA_SLOW + 50:
+    if len(df) < EMA_SLOW + 80:
         return
 
     row = df.iloc[-1]
