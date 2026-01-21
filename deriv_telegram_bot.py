@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
-from ta.volatility import BollingerBands
+from ta.volatility import BollingerBands, AverageTrueRange
 from ta.volume import MFIIndicator
 
 try:
@@ -248,6 +248,55 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     # largura das bandas BB (regime)
     df["bb_width"] = (df["bb_upper"] - df["bb_lower"]).abs()
     df["bb_width_pct"] = (df["bb_width"] / df["bb_mid"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+
+    # =========================================================
+    # ✅ ATR (Average True Range) — FEATURE DO ML
+    # =========================================================
+    try:
+        atr = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14)
+        df["atr_14"] = atr.average_true_range()
+        df["atr_14_pct"] = (df["atr_14"] / df["close"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+    except Exception:
+        df["atr_14"] = 0
+        df["atr_14_pct"] = 0
+
+    # =========================================================
+    # ✅ ADR (Average Daily Range) — FEATURE DO ML
+    # ADR = média da amplitude diária (High do dia - Low do dia)
+    # =========================================================
+    try:
+        if "epoch" in df.columns:
+            dt = pd.to_datetime(df["epoch"], unit="s", utc=True)
+            df["_day"] = dt.dt.floor("D")
+
+            daily = df.groupby("_day").agg(day_high=("high", "max"), day_low=("low", "min"))
+            daily["day_range"] = (daily["day_high"] - daily["day_low"]).abs()
+
+            # ADR em dias
+            daily["adr_5"] = daily["day_range"].rolling(5).mean()
+            daily["adr_10"] = daily["day_range"].rolling(10).mean()
+
+            # junta de volta no df de candles
+            df = df.merge(
+                daily[["adr_5", "adr_10"]],
+                left_on="_day",
+                right_index=True,
+                how="left"
+            )
+
+            # normaliza (pct do preço)
+            df["adr_5_pct"] = (df["adr_5"] / df["close"]).replace([float("inf"), -float("inf")], 0)
+            df["adr_10_pct"] = (df["adr_10"] / df["close"]).replace([float("inf"), -float("inf")], 0)
+
+            df.drop(columns=["_day"], inplace=True, errors="ignore")
+
+            for c in ["adr_5", "adr_10", "adr_5_pct", "adr_10_pct"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    except Exception:
+        df["adr_5"] = 0
+        df["adr_10"] = 0
+        df["adr_5_pct"] = 0
+        df["adr_10_pct"] = 0
 
     return df
 
