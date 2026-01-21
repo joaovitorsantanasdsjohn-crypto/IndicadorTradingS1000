@@ -15,12 +15,13 @@ from flask import Flask
 from dotenv import load_dotenv
 
 from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, ADXIndicator
-from ta.volatility import BollingerBands, AverageTrueRange
+from ta.trend import EMAIndicator
+from ta.volatility import BollingerBands
 from ta.volume import MFIIndicator
 
 try:
     from sklearn.ensemble import RandomForestClassifier
+    from sklearn.calibration import CalibratedClassifierCV
     SKLEARN_AVAILABLE = True
 except Exception:
     SKLEARN_AVAILABLE = False
@@ -86,17 +87,18 @@ RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_MIN = float(os.getenv("RSI_MIN", "0"))
 RSI_MAX = float(os.getenv("RSI_MAX", "100"))
 
-# ✅ NOVO (somente features pro ML)
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-ADX_PERIOD = int(os.getenv("ADX_PERIOD", "14"))
-
 ML_ENABLED = bool(int(os.getenv("ML_ENABLED", "1"))) and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "300"))
 ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "2000"))
 ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
-ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "60"))
-ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "5"))
+ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "80"))  # 👈 um pouco maior melhora consistência
+ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "6"))         # 👈 um pouco maior dá mais poder
 ML_TRAIN_EVERY_N_CANDLES = int(os.getenv("ML_TRAIN_EVERY_N_CANDLES", "3"))
+
+# ✅ CALIBRAÇÃO DE PROBABILIDADE (para % ser mais confiável)
+ML_CALIBRATION_ENABLED = bool(int(os.getenv("ML_CALIBRATION_ENABLED", "1"))) and SKLEARN_AVAILABLE
+ML_CALIBRATION_METHOD = os.getenv("ML_CALIBRATION_METHOD", "sigmoid")  # "sigmoid" ou "isotonic"
+ML_CALIBRATION_CV = int(os.getenv("ML_CALIBRATION_CV", "3"))
 
 MIN_SECONDS_BETWEEN_SIGNALS = int(os.getenv("MIN_SECONDS_BETWEEN_SIGNALS", "3"))
 STARTUP_STAGGER_MAX_SECONDS = int(os.getenv("STARTUP_STAGGER_MAX_SECONDS", "10"))
@@ -171,27 +173,43 @@ def send_telegram(message: str):
 
 
 # ============================================================
-# ✅ BLOCO 5 — INDICADORES (SOMENTE FEATURES PARA ML)
+# ✅ BLOCO 5 — INDICADORES + PRICE ACTION (FEATURES PARA ML)
 # ============================================================
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().reset_index(drop=True)
 
-    if len(df) < EMA_SLOW + 30:
+    if len(df) < EMA_SLOW + 60:
         return df
 
-    # =========================
-    # ✅ 1) EMAs
-    # =========================
+    # garante numéricos
+    for c in ["open", "high", "low", "close"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # =============================
+    # ✅ EMAs
+    # =============================
     df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
 
-    # =========================
-    # ✅ 2) RSI / MFI
-    # =========================
+    # =============================
+    # ✅ RSI
+    # =============================
     df["rsi"] = RSIIndicator(df["close"], RSI_PERIOD).rsi()
     df["rsi"] = df["rsi"].clip(lower=RSI_MIN, upper=RSI_MAX)
 
+    # =============================
+    # ✅ Bollinger
+    # =============================
+    bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
+    df["bb_mid"] = bb.bollinger_mavg()
+    df["bb_upper"] = bb.bollinger_hband()
+    df["bb_lower"] = bb.bollinger_lband()
+
+    # =============================
+    # ✅ Volume / MFI
+    # =============================
     if "volume" not in df.columns:
         df["volume"] = 1
 
@@ -203,79 +221,33 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         window=MFI_PERIOD
     ).money_flow_index()
 
-    # =========================
-    # ✅ 3) Bollinger
-    # =========================
-    bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
-    df["bb_mid"] = bb.bollinger_mavg()
-    df["bb_upper"] = bb.bollinger_hband()
-    df["bb_lower"] = bb.bollinger_lband()
-
-    # ✅ NOVO: largura das bandas (volatilidade)
-    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / (df["bb_mid"].replace(0, 1e-9))
-
-    # =========================
-    # ✅ 4) ATR / ADX (FORÇA + VOLATILIDADE)
-    # =========================
-    try:
-        atr = AverageTrueRange(
-            high=df["high"],
-            low=df["low"],
-            close=df["close"],
-            window=ATR_PERIOD
-        )
-        df["atr"] = atr.average_true_range()
-    except Exception:
-        pass
-
-    try:
-        adx = ADXIndicator(
-            high=df["high"],
-            low=df["low"],
-            close=df["close"],
-            window=ADX_PERIOD
-        )
-        df["adx"] = adx.adx()
-        df["adx_pos"] = adx.adx_pos()
-        df["adx_neg"] = adx.adx_neg()
-    except Exception:
-        pass
-
-    # =========================
-    # ✅ 5) PRICE ACTION FEATURES (CENÁRIO)
-    # =========================
-    # corpo e pavios
-    df["candle_body"] = (df["close"] - df["open"]).abs()
+    # =========================================================
+    # ✅ NOVO: PRICE ACTION REAL (vira feature do ML)
+    # =========================================================
     df["candle_range"] = (df["high"] - df["low"]).abs()
-
-    # evita divisão por zero
-    safe_range = df["candle_range"].replace(0, 1e-9)
-
-    df["body_pct"] = df["candle_body"] / safe_range
+    df["candle_body"] = (df["close"] - df["open"]).abs()
     df["upper_wick"] = (df["high"] - df[["open", "close"]].max(axis=1)).clip(lower=0)
     df["lower_wick"] = (df[["open", "close"]].min(axis=1) - df["low"]).clip(lower=0)
-    df["upper_wick_pct"] = df["upper_wick"] / safe_range
-    df["lower_wick_pct"] = df["lower_wick"] / safe_range
 
-    # direção (pressão)
-    df["close_gt_open"] = (df["close"] > df["open"]).astype(int)
+    # retorno (momentum) — close vs close anterior
+    df["ret_1"] = df["close"].pct_change().fillna(0)
 
-    # momentum simples
-    df["ret_1"] = df["close"].pct_change(1)
-    df["ret_2"] = df["close"].pct_change(2)
-    df["ret_3"] = df["close"].pct_change(3)
+    # posição do close no range (0=low, 1=high)
+    df["close_pos"] = ((df["close"] - df["low"]) / (df["candle_range"].replace(0, 1))).clip(0, 1)
 
-    # inclinação das EMAs (tendência real, não só cruzamento)
-    df["ema_fast_slope"] = df["ema_fast"].diff()
-    df["ema_mid_slope"] = df["ema_mid"].diff()
-    df["ema_slow_slope"] = df["ema_slow"].diff()
+    # volatilidade rolling
+    df["volatility_10"] = df["ret_1"].rolling(10).std().fillna(0)
+    df["volatility_20"] = df["ret_1"].rolling(20).std().fillna(0)
 
-    # distância do preço até EMA lenta
-    df["dist_close_ema_slow"] = (df["close"] - df["ema_slow"]) / (df["ema_slow"].replace(0, 1e-9))
+    # slope EMA34 (tendência)
+    df["ema_slow_slope"] = df["ema_slow"].diff().fillna(0)
 
-    # separação entre EMAs
-    df["ema_sep_fast_mid"] = (df["ema_fast"] - df["ema_mid"]) / (df["ema_mid"].replace(0, 1e-9))
-    df["ema_sep_mid_slow"] = (df["ema_mid"] - df["ema_slow"]) / (df["ema_slow"].replace(0, 1e-9))
+    # distância percentual do preço para EMA34
+    df["dist_close_ema_slow"] = ((df["close"] - df["ema_slow"]) / df["ema_slow"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+
+    # largura das bandas BB (regime)
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]).abs()
+    df["bb_width_pct"] = (df["bb_width"] / df["bb_mid"]).replace([float("inf"), -float("inf")], 0).fillna(0)
 
     return df
 
@@ -289,11 +261,18 @@ def build_ml_dataset(df: pd.DataFrame):
     if "epoch" not in df.columns:
         return None, None
 
-    df["future"] = (df["close"].shift(-1) > df["close"]).astype(int)
+    # ============================================================
+    # ✅ LABEL CORRETO:
+    # se prever 2 velas à frente, o label precisa ser shift(-2)
+    # ============================================================
+    shift_n = int(max(1, PREDICT_CANDLES_AHEAD))
+    df["future"] = (df["close"].shift(-shift_n) > df["close"]).astype(int)
 
     drop_cols = {"future", "epoch"}
-    X = df.drop(columns=[c for c in drop_cols if c in df.columns]).iloc[:-1]
-    y = df["future"].iloc[:-1]
+
+    # corta as últimas N linhas (não tem futuro)
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns]).iloc[:-shift_n]
+    y = df["future"].iloc[:-shift_n]
 
     if len(X) <= 10:
         return None, None
@@ -307,7 +286,6 @@ def build_ml_dataset(df: pd.DataFrame):
 def get_ml_feature_list(symbol: str) -> list:
     """
     Retorna as colunas/features usadas pelo ML para o símbolo.
-    Obs: inclui OHLC (price action) + indicadores calculados.
     """
     try:
         if symbol not in candles:
@@ -339,28 +317,39 @@ async def train_ml_async(symbol: str):
         return
 
     def _fit():
-        model = RandomForestClassifier(
+        base_model = RandomForestClassifier(
             n_estimators=ML_N_ESTIMATORS,
             max_depth=ML_MAX_DEPTH,
-            random_state=42
+            random_state=42,
+            n_jobs=-1
         )
-        model.fit(X, y)
-        return model, X.columns.tolist()
+        base_model.fit(X, y)
+
+        # ✅ CALIBRAÇÃO: transforma as probabilidades em algo mais confiável
+        if ML_CALIBRATION_ENABLED:
+            calibrated = CalibratedClassifierCV(
+                estimator=base_model,
+                method=ML_CALIBRATION_METHOD,
+                cv=ML_CALIBRATION_CV
+            )
+            calibrated.fit(X, y)
+            return calibrated, X.columns.tolist()
+
+        return base_model, X.columns.tolist()
 
     try:
         model, cols = await asyncio.to_thread(_fit)
         ml_models[symbol] = (model, cols)
         ml_model_ready[symbol] = True
 
-        feats = cols
-        if feats:
-            log(f"{symbol} ML pronto ✅ | Features: {', '.join(feats)}", "info")
+        if cols:
+            log(f"{symbol} ML pronto ✅ | Features: {', '.join(cols)}", "info")
             if ML_FEATURES_SEND_ON_READY:
                 ativo = symbol.replace("frx", "")
                 send_telegram(
                     f"🧠 ML READY ({ativo})\n"
                     f"Features usadas:\n"
-                    + "\n".join([f"- {f}" for f in feats])
+                    + "\n".join([f"- {f}" for f in cols])
                 )
 
     except Exception as e:
@@ -456,7 +445,6 @@ def avaliar_sinal(symbol: str):
     # ✅ AGENDAR (não envia agora)
     asyncio.create_task(schedule_telegram_signal(symbol, notify_epoch_utc, msg))
 
-    # marca
     last_signal_time[symbol] = now
     last_signal_epoch[symbol] = candle_open_epoch
     scheduled_signal_epoch[symbol] = target_candle_open
