@@ -15,8 +15,8 @@ from flask import Flask
 from dotenv import load_dotenv
 
 from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator
-from ta.volatility import BollingerBands, AverageTrueRange
+from ta.trend import EMAIndicator, ADXIndicator
+from ta.volatility import BollingerBands
 from ta.volume import MFIIndicator
 
 try:
@@ -222,7 +222,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     ).money_flow_index()
 
     # =========================================================
-    # ✅ NOVO: PRICE ACTION REAL (vira feature do ML)
+    # ✅ PRICE ACTION REAL (vira feature do ML)
     # =========================================================
     df["candle_range"] = (df["high"] - df["low"]).abs()
     df["candle_body"] = (df["close"] - df["open"]).abs()
@@ -239,64 +239,108 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["volatility_10"] = df["ret_1"].rolling(10).std().fillna(0)
     df["volatility_20"] = df["ret_1"].rolling(20).std().fillna(0)
 
-    # slope EMA34 (tendência)
+    # slope EMA34 (tendência base)
     df["ema_slow_slope"] = df["ema_slow"].diff().fillna(0)
 
+    # =========================================================
+    # ✅ NOVO: slopes multi-janelas (estrutura de tendência)
+    # =========================================================
+    df["ema_slow_slope_3"] = df["ema_slow"].diff(3).fillna(0)
+    df["ema_slow_slope_6"] = df["ema_slow"].diff(6).fillna(0)
+    df["ema_slow_slope_12"] = df["ema_slow"].diff(12).fillna(0)
+
     # distância percentual do preço para EMA34
-    df["dist_close_ema_slow"] = ((df["close"] - df["ema_slow"]) / df["ema_slow"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+    df["dist_close_ema_slow"] = (
+        ((df["close"] - df["ema_slow"]) / df["ema_slow"])
+        .replace([float("inf"), -float("inf")], 0)
+        .fillna(0)
+    )
 
     # largura das bandas BB (regime)
     df["bb_width"] = (df["bb_upper"] - df["bb_lower"]).abs()
-    df["bb_width_pct"] = (df["bb_width"] / df["bb_mid"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+    df["bb_width_pct"] = (
+        (df["bb_width"] / df["bb_mid"])
+        .replace([float("inf"), -float("inf")], 0)
+        .fillna(0)
+    )
 
     # =========================================================
-    # ✅ ATR (Average True Range) — FEATURE DO ML
+    # ✅ ATR 14 (estrutura de volatilidade)
+    # =========================================================
+    prev_close = df["close"].shift(1)
+    tr1 = (df["high"] - df["low"]).abs()
+    tr2 = (df["high"] - prev_close).abs()
+    tr3 = (df["low"] - prev_close).abs()
+    df["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    df["atr_14"] = df["tr"].rolling(14).mean().fillna(0)
+    df["atr_14_pct"] = (
+        (df["atr_14"] / df["close"])
+        .replace([float("inf"), -float("inf")], 0)
+        .fillna(0)
+    )
+
+    # ✅ NOVO: distância da EMA34 em ATR (muito melhor que %)
+    df["dist_close_ema_slow_atr"] = (
+        ((df["close"] - df["ema_slow"]) / df["atr_14"].replace(0, 1))
+        .replace([float("inf"), -float("inf")], 0)
+        .fillna(0)
+    )
+
+    # ✅ NOVO: regime ATR (ATR atual / ATR médio longo)
+    atr_mean_50 = df["atr_14"].rolling(50).mean()
+    df["atr_ratio"] = (
+        (df["atr_14"] / atr_mean_50.replace(0, 1))
+        .replace([float("inf"), -float("inf")], 0)
+        .fillna(0)
+    )
+
+    # =========================================================
+    # ✅ ADR (Average Daily Range aproximado em candles M5)
+    # - 1 dia ~ 288 candles de 5 minutos
+    # =========================================================
+    df["day_range"] = df["candle_range"].rolling(288).sum().fillna(0)
+
+    # ADR 5/10 dias aproximado
+    df["adr_5"] = df["day_range"].rolling(288 * 5).mean().fillna(0)
+    df["adr_10"] = df["day_range"].rolling(288 * 10).mean().fillna(0)
+
+    df["adr_5_pct"] = (
+        (df["adr_5"] / df["close"])
+        .replace([float("inf"), -float("inf")], 0)
+        .fillna(0)
+    )
+    df["adr_10_pct"] = (
+        (df["adr_10"] / df["close"])
+        .replace([float("inf"), -float("inf")], 0)
+        .fillna(0)
+    )
+
+    # =========================================================
+    # ✅ NOVO: ADX (FORÇA DA TENDÊNCIA) + DI+/DI-
     # =========================================================
     try:
-        atr = AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=14)
-        df["atr_14"] = atr.average_true_range()
-        df["atr_14_pct"] = (df["atr_14"] / df["close"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+        adx_ind = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14)
+        df["adx_14"] = adx_ind.adx().fillna(0)
+        df["di_plus_14"] = adx_ind.adx_pos().fillna(0)
+        df["di_minus_14"] = adx_ind.adx_neg().fillna(0)
+
+        # comparação DI+ vs DI- (direção/força relativa)
+        df["di_diff_14"] = (df["di_plus_14"] - df["di_minus_14"]).fillna(0)
     except Exception:
-        df["atr_14"] = 0
-        df["atr_14_pct"] = 0
+        df["adx_14"] = 0
+        df["di_plus_14"] = 0
+        df["di_minus_14"] = 0
+        df["di_diff_14"] = 0
 
     # =========================================================
-    # ✅ ADR (Average Daily Range) — FEATURE DO ML
-    # ADR = média da amplitude diária (High do dia - Low do dia)
+    # ✅ NOVO: Estrutura (breakout HH/LL)
     # =========================================================
-    try:
-        if "epoch" in df.columns:
-            dt = pd.to_datetime(df["epoch"], unit="s", utc=True)
-            df["_day"] = dt.dt.floor("D")
+    hh_20 = df["high"].rolling(20).max()
+    ll_20 = df["low"].rolling(20).min()
 
-            daily = df.groupby("_day").agg(day_high=("high", "max"), day_low=("low", "min"))
-            daily["day_range"] = (daily["day_high"] - daily["day_low"]).abs()
-
-            # ADR em dias
-            daily["adr_5"] = daily["day_range"].rolling(5).mean()
-            daily["adr_10"] = daily["day_range"].rolling(10).mean()
-
-            # junta de volta no df de candles
-            df = df.merge(
-                daily[["adr_5", "adr_10"]],
-                left_on="_day",
-                right_index=True,
-                how="left"
-            )
-
-            # normaliza (pct do preço)
-            df["adr_5_pct"] = (df["adr_5"] / df["close"]).replace([float("inf"), -float("inf")], 0)
-            df["adr_10_pct"] = (df["adr_10"] / df["close"]).replace([float("inf"), -float("inf")], 0)
-
-            df.drop(columns=["_day"], inplace=True, errors="ignore")
-
-            for c in ["adr_5", "adr_10", "adr_5_pct", "adr_10_pct"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    except Exception:
-        df["adr_5"] = 0
-        df["adr_10"] = 0
-        df["adr_5_pct"] = 0
-        df["adr_10_pct"] = 0
+    df["breakout_up_20"] = (df["close"] > hh_20.shift(1)).astype(int)
+    df["breakout_dn_20"] = (df["close"] < ll_20.shift(1)).astype(int)
 
     return df
 
@@ -403,7 +447,7 @@ async def train_ml_async(symbol: str):
 
     except Exception as e:
         ml_model_ready[symbol] = False
-        log(f"{symbol} ML treino falhou: {e}", "warning")
+        log(f"#{symbol} ML treino falhou: {e}", "warning")
 
 
 def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
