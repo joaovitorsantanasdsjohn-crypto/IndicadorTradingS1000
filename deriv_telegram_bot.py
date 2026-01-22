@@ -87,6 +87,9 @@ RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_MIN = float(os.getenv("RSI_MIN", "0"))
 RSI_MAX = float(os.getenv("RSI_MAX", "100"))
 
+# ✅ ADX / DI period
+ADX_PERIOD = int(os.getenv("ADX_PERIOD", "14"))
+
 ML_ENABLED = bool(int(os.getenv("ML_ENABLED", "1"))) and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "300"))
 ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "2000"))
@@ -178,7 +181,7 @@ def send_telegram(message: str):
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy().reset_index(drop=True)
 
-    if len(df) < EMA_SLOW + 60:
+    if len(df) < EMA_SLOW + 120:
         return df
 
     # garante numéricos
@@ -222,14 +225,14 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     ).money_flow_index()
 
     # =========================================================
-    # ✅ PRICE ACTION REAL (vira feature do ML)
+    # ✅ PRICE ACTION REAL (features do ML)
     # =========================================================
     df["candle_range"] = (df["high"] - df["low"]).abs()
     df["candle_body"] = (df["close"] - df["open"]).abs()
     df["upper_wick"] = (df["high"] - df[["open", "close"]].max(axis=1)).clip(lower=0)
     df["lower_wick"] = (df[["open", "close"]].min(axis=1) - df["low"]).clip(lower=0)
 
-    # retorno (momentum) — close vs close anterior
+    # retorno (momentum)
     df["ret_1"] = df["close"].pct_change().fillna(0)
 
     # posição do close no range (0=low, 1=high)
@@ -239,15 +242,8 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["volatility_10"] = df["ret_1"].rolling(10).std().fillna(0)
     df["volatility_20"] = df["ret_1"].rolling(20).std().fillna(0)
 
-    # slope EMA34 (tendência base)
+    # slope EMA34 (tendência)
     df["ema_slow_slope"] = df["ema_slow"].diff().fillna(0)
-
-    # =========================================================
-    # ✅ NOVO: slopes multi-janelas (estrutura de tendência)
-    # =========================================================
-    df["ema_slow_slope_3"] = df["ema_slow"].diff(3).fillna(0)
-    df["ema_slow_slope_6"] = df["ema_slow"].diff(6).fillna(0)
-    df["ema_slow_slope_12"] = df["ema_slow"].diff(12).fillna(0)
 
     # distância percentual do preço para EMA34
     df["dist_close_ema_slow"] = (
@@ -265,82 +261,37 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # =========================================================
-    # ✅ ATR 14 (estrutura de volatilidade)
+    # ✅ ATR 14 (volatilidade real)
     # =========================================================
     prev_close = df["close"].shift(1)
     tr1 = (df["high"] - df["low"]).abs()
     tr2 = (df["high"] - prev_close).abs()
     tr3 = (df["low"] - prev_close).abs()
-    df["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    df["atr_14"] = df["tr"].rolling(14).mean().fillna(0)
-    df["atr_14_pct"] = (
-        (df["atr_14"] / df["close"])
-        .replace([float("inf"), -float("inf")], 0)
-        .fillna(0)
-    )
-
-    # ✅ NOVO: distância da EMA34 em ATR (muito melhor que %)
-    df["dist_close_ema_slow_atr"] = (
-        ((df["close"] - df["ema_slow"]) / df["atr_14"].replace(0, 1))
-        .replace([float("inf"), -float("inf")], 0)
-        .fillna(0)
-    )
-
-    # ✅ NOVO: regime ATR (ATR atual / ATR médio longo)
-    atr_mean_50 = df["atr_14"].rolling(50).mean()
-    df["atr_ratio"] = (
-        (df["atr_14"] / atr_mean_50.replace(0, 1))
-        .replace([float("inf"), -float("inf")], 0)
-        .fillna(0)
-    )
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr_14"] = tr.rolling(14).mean()
+    df["atr_14_pct"] = (df["atr_14"] / df["close"]).replace([float("inf"), -float("inf")], 0).fillna(0)
 
     # =========================================================
-    # ✅ ADR (Average Daily Range aproximado em candles M5)
-    # - 1 dia ~ 288 candles de 5 minutos
+    # ✅ ADR (Average Daily Range)
     # =========================================================
-    df["day_range"] = df["candle_range"].rolling(288).sum().fillna(0)
-
-    # ADR 5/10 dias aproximado
-    df["adr_5"] = df["day_range"].rolling(288 * 5).mean().fillna(0)
-    df["adr_10"] = df["day_range"].rolling(288 * 10).mean().fillna(0)
-
-    df["adr_5_pct"] = (
-        (df["adr_5"] / df["close"])
-        .replace([float("inf"), -float("inf")], 0)
-        .fillna(0)
-    )
-    df["adr_10_pct"] = (
-        (df["adr_10"] / df["close"])
-        .replace([float("inf"), -float("inf")], 0)
-        .fillna(0)
-    )
+    df["range"] = (df["high"] - df["low"]).abs()
+    df["adr_5"] = df["range"].rolling(5).mean()
+    df["adr_10"] = df["range"].rolling(10).mean()
+    df["adr_5_pct"] = (df["adr_5"] / df["close"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+    df["adr_10_pct"] = (df["adr_10"] / df["close"]).replace([float("inf"), -float("inf")], 0).fillna(0)
 
     # =========================================================
-    # ✅ NOVO: ADX (FORÇA DA TENDÊNCIA) + DI+/DI-
+    # ✅ ADX + DI (TENDÊNCIA FORTE vs LATERAL)
     # =========================================================
     try:
-        adx_ind = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=14)
-        df["adx_14"] = adx_ind.adx().fillna(0)
-        df["di_plus_14"] = adx_ind.adx_pos().fillna(0)
-        df["di_minus_14"] = adx_ind.adx_neg().fillna(0)
-
-        # comparação DI+ vs DI- (direção/força relativa)
-        df["di_diff_14"] = (df["di_plus_14"] - df["di_minus_14"]).fillna(0)
+        adx = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=ADX_PERIOD)
+        df["adx_14"] = adx.adx()
+        df["di_plus_14"] = adx.adx_pos()
+        df["di_minus_14"] = adx.adx_neg()
     except Exception:
         df["adx_14"] = 0
         df["di_plus_14"] = 0
         df["di_minus_14"] = 0
-        df["di_diff_14"] = 0
-
-    # =========================================================
-    # ✅ NOVO: Estrutura (breakout HH/LL)
-    # =========================================================
-    hh_20 = df["high"].rolling(20).max()
-    ll_20 = df["low"].rolling(20).min()
-
-    df["breakout_up_20"] = (df["close"] > hh_20.shift(1)).astype(int)
-    df["breakout_dn_20"] = (df["close"] < ll_20.shift(1)).astype(int)
 
     return df
 
@@ -354,16 +305,12 @@ def build_ml_dataset(df: pd.DataFrame):
     if "epoch" not in df.columns:
         return None, None
 
-    # ============================================================
-    # ✅ LABEL CORRETO:
-    # se prever 2 velas à frente, o label precisa ser shift(-2)
-    # ============================================================
+    # ✅ label correto shift(-N)
     shift_n = int(max(1, PREDICT_CANDLES_AHEAD))
     df["future"] = (df["close"].shift(-shift_n) > df["close"]).astype(int)
 
     drop_cols = {"future", "epoch"}
 
-    # corta as últimas N linhas (não tem futuro)
     X = df.drop(columns=[c for c in drop_cols if c in df.columns]).iloc[:-shift_n]
     y = df["future"].iloc[:-shift_n]
 
@@ -418,7 +365,7 @@ async def train_ml_async(symbol: str):
         )
         base_model.fit(X, y)
 
-        # ✅ CALIBRAÇÃO: transforma as probabilidades em algo mais confiável
+        # ✅ CALIBRAÇÃO
         if ML_CALIBRATION_ENABLED:
             calibrated = CalibratedClassifierCV(
                 estimator=base_model,
@@ -447,7 +394,7 @@ async def train_ml_async(symbol: str):
 
     except Exception as e:
         ml_model_ready[symbol] = False
-        log(f"#{symbol} ML treino falhou: {e}", "warning")
+        log(f"{symbol} ML treino falhou: {e}", "warning")
 
 
 def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
@@ -460,8 +407,9 @@ def ml_predict(symbol: str, row: pd.Series) -> Optional[float]:
 
     try:
         model, cols = ml_models[symbol]
-        vals = [float(row[c]) for c in cols]
-        prob_buy = model.predict_proba([vals])[0][1]
+        # ✅ evita warning: passa DataFrame com feature names
+        X_pred = pd.DataFrame([[float(row[c]) for c in cols]], columns=cols)
+        prob_buy = model.predict_proba(X_pred)[0][1]
         return float(prob_buy)
     except Exception:
         return None
@@ -492,7 +440,7 @@ async def schedule_telegram_signal(symbol: str, when_epoch_utc: int, msg: str):
 
 def avaliar_sinal(symbol: str):
     df = candles[symbol]
-    if len(df) < EMA_SLOW + 80:
+    if len(df) < EMA_SLOW + 120:
         return
 
     row = df.iloc[-1]
@@ -502,7 +450,7 @@ def avaliar_sinal(symbol: str):
     epoch = int(row["epoch"])
     candle_open_epoch = floor_to_granularity(epoch, GRANULARITY_SECONDS)
 
-    # candle alvo (entrada): prever N velas à frente
+    # candle alvo (entrada)
     target_candle_open = candle_open_epoch + (GRANULARITY_SECONDS * PREDICT_CANDLES_AHEAD)
 
     # evita duplicar mesmo alvo
@@ -535,7 +483,6 @@ def avaliar_sinal(symbol: str):
         f"🤖 ML: {confidence*100:.0f}%"
     )
 
-    # ✅ AGENDAR (não envia agora)
     asyncio.create_task(schedule_telegram_signal(symbol, notify_epoch_utc, msg))
 
     last_signal_time[symbol] = now
