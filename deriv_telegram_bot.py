@@ -74,11 +74,11 @@ RSI_MAX = float(os.getenv("RSI_MAX", "100"))
 ADX_PERIOD = int(os.getenv("ADX_PERIOD", "14"))
 
 ML_ENABLED = bool(int(os.getenv("ML_ENABLED", "1"))) and SKLEARN_AVAILABLE
-ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "300"))
+ML_MIN_TRAINED_SAMPLES = int(os.getenv("ML_MIN_TRAINED_SAMPLES", "500"))
 ML_MAX_SAMPLES = int(os.getenv("ML_MAX_SAMPLES", "2000"))
-ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.55"))
-ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "80"))
-ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "6"))
+ML_CONF_THRESHOLD = float(os.getenv("ML_CONF_THRESHOLD", "0.62"))
+ML_N_ESTIMATORS = int(os.getenv("ML_N_ESTIMATORS", "120"))
+ML_MAX_DEPTH = int(os.getenv("ML_MAX_DEPTH", "7"))
 ML_TRAIN_EVERY_N_CANDLES = int(os.getenv("ML_TRAIN_EVERY_N_CANDLES", "3"))
 
 ML_CALIBRATION_ENABLED = bool(int(os.getenv("ML_CALIBRATION_ENABLED", "1"))) and SKLEARN_AVAILABLE
