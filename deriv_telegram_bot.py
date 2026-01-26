@@ -196,6 +196,14 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
 
+    # força da tendência
+    df["ema_trend_strength"] = (df["ema_fast"] - df["ema_slow"]).abs()
+    df["ema_trend_strength_pct"] = df["ema_trend_strength"] / df["close"]
+
+    # inclinação e aceleração da tendência
+    df["ema_slow_slope"] = df["ema_slow"].diff().fillna(0)
+    df["ema_slope_accel"] = df["ema_slow_slope"].diff().fillna(0)
+
     # =============================
     # ✅ RSI
     # =============================
@@ -210,8 +218,14 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_upper"] = bb.bollinger_hband()
     df["bb_lower"] = bb.bollinger_lband()
 
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]).abs()
+    df["bb_width_pct"] = (df["bb_width"] / df["bb_mid"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+
+    # squeeze (compressão de volatilidade)
+    df["bb_squeeze"] = (df["bb_width_pct"] < df["bb_width_pct"].rolling(50).mean()).astype(int)
+
     # =============================
-    # ✅ Volume / MFI
+    # ✅ Volume / MFI (volume de preço)
     # =============================
     if "volume" not in df.columns:
         df["volume"] = 1
@@ -224,41 +238,71 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         window=MFI_PERIOD
     ).money_flow_index()
 
-    # =========================================================
-    # ✅ PRICE ACTION REAL (features do ML)
-    # =========================================================
+    # =============================
+    # ✅ PRICE ACTION
+    # =============================
     df["candle_range"] = (df["high"] - df["low"]).abs()
     df["candle_body"] = (df["close"] - df["open"]).abs()
     df["upper_wick"] = (df["high"] - df[["open", "close"]].max(axis=1)).clip(lower=0)
     df["lower_wick"] = (df[["open", "close"]].min(axis=1) - df["low"]).clip(lower=0)
 
-    # retorno (momentum)
     df["ret_1"] = df["close"].pct_change().fillna(0)
-
-    # posição do close no range (0=low, 1=high)
     df["close_pos"] = ((df["close"] - df["low"]) / (df["candle_range"].replace(0, 1))).clip(0, 1)
 
-    # volatilidade rolling
     df["volatility_10"] = df["ret_1"].rolling(10).std().fillna(0)
     df["volatility_20"] = df["ret_1"].rolling(20).std().fillna(0)
 
-    # slope EMA34 (tendência)
-    df["ema_slow_slope"] = df["ema_slow"].diff().fillna(0)
-
-    # distância percentual do preço para EMA34
+    # distância do preço para EMA lenta
     df["dist_close_ema_slow"] = (
         ((df["close"] - df["ema_slow"]) / df["ema_slow"])
         .replace([float("inf"), -float("inf")], 0)
         .fillna(0)
     )
 
-    # largura das bandas BB (regime)
-    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]).abs()
-    df["bb_width_pct"] = (
-        (df["bb_width"] / df["bb_mid"])
-        .replace([float("inf"), -float("inf")], 0)
-        .fillna(0)
-    )
+    # distância extrema (possível exaustão)
+    df["dist_extreme"] = (
+        df["dist_close_ema_slow"].abs() >
+        df["dist_close_ema_slow"].rolling(100).std()
+    ).astype(int)
+
+    # =============================
+    # ✅ ATR (volatilidade real)
+    # =============================
+    prev_close = df["close"].shift(1)
+    tr1 = (df["high"] - df["low"]).abs()
+    tr2 = (df["high"] - prev_close).abs()
+    tr3 = (df["low"] - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr_14"] = tr.rolling(14).mean()
+    df["atr_14_pct"] = (df["atr_14"] / df["close"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+
+    # relação candle vs ATR (exaustão)
+    df["body_vs_atr"] = (df["candle_body"] / df["atr_14"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+    df["range_vs_atr"] = (df["candle_range"] / df["atr_14"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+
+    # =============================
+    # ✅ ADR (Average Daily Range)
+    # =============================
+    df["range"] = (df["high"] - df["low"]).abs()
+    df["adr_5"] = df["range"].rolling(5).mean()
+    df["adr_10"] = df["range"].rolling(10).mean()
+    df["adr_5_pct"] = (df["adr_5"] / df["close"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+    df["adr_10_pct"] = (df["adr_10"] / df["close"]).replace([float("inf"), -float("inf")], 0).fillna(0)
+
+    # =============================
+    # ✅ ADX + DI (força de tendência)
+    # =============================
+    try:
+        adx = ADXIndicator(high=df["high"], low=df["low"], close=df["close"], window=ADX_PERIOD)
+        df["adx_14"] = adx.adx()
+        df["di_plus_14"] = adx.adx_pos()
+        df["di_minus_14"] = adx.adx_neg()
+    except Exception:
+        df["adx_14"] = 0
+        df["di_plus_14"] = 0
+        df["di_minus_14"] = 0
+
+    return df
 
     # =========================================================
     # ✅ ATR 14 (volatilidade real)
