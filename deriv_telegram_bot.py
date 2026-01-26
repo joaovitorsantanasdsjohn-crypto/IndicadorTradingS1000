@@ -57,7 +57,7 @@ WS_OPEN_TIMEOUT = int(os.getenv("WS_OPEN_TIMEOUT", "20"))
 WS_CANDLE_TIMEOUT_SECONDS = int(os.getenv("WS_CANDLE_TIMEOUT_SECONDS", "600"))
 
 HISTORY_COUNT = int(os.getenv("HISTORY_COUNT", "1200"))
-MAX_CANDLES_IN_RAM = int(os.getenv("MAX_CANDLES_IN_RAM", "1800"))
+MAX_CANDLES_IN_RAM = int(os.getenv("MAX_CANDLES_IN_RAM", "2000"))
 
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_MID = int(os.getenv("EMA_MID", "21"))
