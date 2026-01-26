@@ -61,7 +61,7 @@ MAX_CANDLES_IN_RAM = int(os.getenv("MAX_CANDLES_IN_RAM", "2000"))
 
 EMA_FAST = int(os.getenv("EMA_FAST", "9"))
 EMA_MID = int(os.getenv("EMA_MID", "21"))
-EMA_SLOW = int(os.getenv("EMA_SLOW", "34"))
+EMA_SLOW = int(os.getenv("EMA_SLOW", "55"))
 
 BB_PERIOD = int(os.getenv("BB_PERIOD", "20"))
 BB_STD = float(os.getenv("BB_STD", "2.3"))
