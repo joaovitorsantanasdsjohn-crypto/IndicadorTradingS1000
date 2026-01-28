@@ -91,6 +91,10 @@ def log(msg, level="info"):
 # ============================================================
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
+    # 🔹 Volume fake para Forex (necessário para o MFI)
+    df["volume"] = 1.0
+
     if len(df) < EMA_SLOW + 50:
         return df
 
@@ -106,6 +110,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     adx = ADXIndicator(df["high"], df["low"], df["close"], ADX_PERIOD)
     df["adx"] = adx.adx()
     df["ret"] = df["close"].pct_change().fillna(0)
+
     return df
 
 
@@ -115,15 +120,13 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 def build_ml_dataset(df):
     df = df.dropna().copy()
 
-    # 🎯 Alvo
+    # 🔹 Remove colunas não numéricas (como datetime)
+    df = df.select_dtypes(include=["number"])
+
     df["future"] = (df["close"].shift(-2) > df["close"]).astype(int)
 
-    # ❌ Remove colunas não numéricas
-    df = df.drop(columns=["future", "epoch", "date"], errors="ignore")
-
-    # ✅ Mantém apenas números
-    X = df.select_dtypes(include=["float64", "int64"]).iloc[:-2]
-    y = (df["close"].shift(-2) > df["close"]).astype(int).iloc[:-2]
+    X = df.drop(columns=["future"]).iloc[:-2]
+    y = df["future"].iloc[:-2]
 
     return X.tail(1000), y.tail(1000)
 
@@ -131,12 +134,16 @@ def build_ml_dataset(df):
 async def train_ml(symbol):
     if not ML_ENABLED:
         return
+
     df = candles[symbol]
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         return
+
     X, y = build_ml_dataset(df)
+
     model = RandomForestClassifier(n_estimators=80, max_depth=6)
     model.fit(X, y)
+
     ml_models[symbol] = (model, X.columns.tolist())
     ml_model_ready[symbol] = True
     log(f"{symbol} ML treinado")
@@ -145,8 +152,12 @@ async def train_ml(symbol):
 def ml_predict(symbol, row):
     if not ml_model_ready[symbol]:
         return None
+
     model, cols = ml_models[symbol]
-    X = pd.DataFrame([[row[c] for c in cols]], columns=cols)
+
+    data = {c: float(row[c]) for c in cols}
+    X = pd.DataFrame([data])
+
     return model.predict_proba(X)[0][1]
 
 
@@ -154,7 +165,7 @@ def ml_predict(symbol, row):
 # 💰 TRADING
 # ============================================================
 async def open_trade(ws, symbol, direction):
-    if trading_paused or not TRADE_ENABLED:
+    if trading_paused:
         return
 
     now = time.time()
@@ -234,6 +245,7 @@ async def ws_loop(symbol):
                         c = data["ohlc"]
                         new_row = pd.DataFrame([c])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
+
                         candles[symbol] = pd.concat([candles[symbol], new_row]).tail(HISTORY_COUNT)
                         candles[symbol] = calcular_indicadores(candles[symbol])
                         await train_ml(symbol)
@@ -257,10 +269,13 @@ async def ws_loop(symbol):
                             cid = poc["contract_id"]
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
+
                             for s in SYMBOLS:
                                 if cid in open_trades[s]:
                                     open_trades[s].remove(cid)
+
                             log(f"Trade fechado {cid} | Resultado {profit} | PnL Diário {daily_pnl}")
+
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
                                 log("🚨 LIMITE DE PERDA DIÁRIA ATINGIDO — BOT PAUSADO")
