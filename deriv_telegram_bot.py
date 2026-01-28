@@ -64,15 +64,15 @@ DAILY_MAX_LOSS = 3.0
 candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
 ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
+
+# Agora guardamos (contract_id, direction)
 open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
 daily_pnl = 0.0
 current_day = datetime.now(timezone.utc).date()
 trading_paused = False
-
-# 🆕 saldo da conta
-account_balance = 0.0
+current_balance = 0.0
 
 
 # ============================================================
@@ -177,21 +177,25 @@ def ml_predict(symbol, row):
 # ============================================================
 # 💰 TRADING
 # ============================================================
+def direction_already_open(symbol, direction):
+    return any(d == direction for _, d in open_trades[symbol])
+
+
 async def open_trade(ws, symbol, direction):
-    global account_balance
+    global current_balance
 
     if trading_paused:
         return
 
-    # 🆕 BLOQUEIO POR SALDO
-    if account_balance < STAKE_AMOUNT:
-        log(f"{symbol} Saldo insuficiente para operar. Saldo: {account_balance}", "warning")
+    if current_balance < STAKE_AMOUNT:
+        log(f"{symbol} Saldo insuficiente para operar. Saldo: {current_balance}", "warning")
         return
+
+    if direction_already_open(symbol, direction):
+        return  # já existe trade nessa direção
 
     now = time.time()
     if now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
-        return
-    if len(open_trades[symbol]) >= MAX_OPEN_TRADES_PER_SYMBOL:
         return
 
     contract_type = "MULTUP" if direction == "UP" else "MULTDOWN"
@@ -218,7 +222,7 @@ async def open_trade(ws, symbol, direction):
         return
 
     cid = data["buy"]["contract_id"]
-    open_trades[symbol].append(cid)
+    open_trades[symbol].append((cid, direction))
     last_trade_time[symbol] = now
 
     await ws.send(json.dumps({
@@ -234,19 +238,15 @@ async def open_trade(ws, symbol, direction):
 # 🌐 WEBSOCKET
 # ============================================================
 async def ws_loop(symbol):
-    global daily_pnl, trading_paused, account_balance
+    global daily_pnl, trading_paused, current_balance
 
     while True:
         try:
-            async with websockets.connect(WS_URL) as ws:
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-                auth = json.loads(await ws.recv())
+                await ws.recv()
 
-                # 🆕 saldo inicial
-                account_balance = float(auth["authorize"]["balance"])
-                log(f"Saldo atualizado: {account_balance}")
-
-                # 🆕 assinar saldo em tempo real
+                # 🔹 Inscreve no saldo
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
 
                 await ws.send(json.dumps({
@@ -261,15 +261,14 @@ async def ws_loop(symbol):
                 async for raw in ws:
                     data = json.loads(raw)
 
-                    # 🆕 atualização de saldo
                     if "balance" in data:
-                        account_balance = float(data["balance"]["balance"])
+                        current_balance = float(data["balance"]["balance"])
+                        log(f"Saldo atualizado: {current_balance}")
                         continue
 
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
-
                         for col in ["open", "high", "low", "close"]:
                             df[col] = pd.to_numeric(df[col], errors="coerce")
                         df["volume"] = 1.0
@@ -310,9 +309,10 @@ async def ws_loop(symbol):
                             cid = poc["contract_id"]
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
+
                             for s in SYMBOLS:
-                                if cid in open_trades[s]:
-                                    open_trades[s].remove(cid)
+                                open_trades[s] = [(i, d) for i, d in open_trades[s] if i != cid]
+
                             log(f"Trade fechado {cid} | Resultado {profit} | PnL Diário {daily_pnl}")
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
@@ -324,7 +324,7 @@ async def ws_loop(symbol):
 
 
 # ============================================================
-# 🌍 FLASK
+# 🌍 FLASK (KEEP ALIVE)
 # ============================================================
 app = Flask(__name__)
 @app.route("/")
