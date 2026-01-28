@@ -46,7 +46,7 @@ BB_STD = 2.3
 
 ML_ENABLED = True and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = 300
-ML_CONF_THRESHOLD = 0.60
+ML_CONF_THRESHOLD = 0.60  # seu novo threshold
 
 TRADE_ENABLED = True
 STAKE_AMOUNT = 1.0
@@ -65,9 +65,8 @@ candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
 ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 
-# 🔥 AGORA GUARDA ID + DIREÇÃO
+# 🔥 AGORA GUARDA DIREÇÃO
 open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}
-
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
 daily_pnl = 0.0
@@ -121,11 +120,11 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 def build_ml_dataset(df):
     df = df.dropna().copy()
+
     if len(df) < 10:
         return None, None
 
     df["future"] = (df["close"].shift(-2) > df["close"]).astype(int)
-
     X = df.select_dtypes(include=["number"]).drop(columns=["future"], errors="ignore").iloc[:-2]
     y = df["future"].iloc[:-2]
 
@@ -170,9 +169,6 @@ def ml_predict(symbol, row):
         return None
 
     X = pd.DataFrame([values], columns=cols)
-    if X.shape[0] == 0:
-        return None
-
     return model.predict_proba(X)[0][1]
 
 
@@ -180,21 +176,17 @@ def ml_predict(symbol, row):
 # 💰 TRADING
 # ============================================================
 async def open_trade(ws, symbol, direction):
-    if trading_paused or not TRADE_ENABLED:
+    if trading_paused:
         return
 
     now = time.time()
-
     if now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
         return
 
-    # 🚫 BLOQUEIA MESMA DIREÇÃO
-    if any(t["direction"] == direction for t in open_trades[symbol]):
-        return
-
-    # máximo 1 BUY + 1 SELL = 2 trades
-    if len(open_trades[symbol]) >= 2:
-        return
+    # 🔒 NÃO PERMITIR MESMA DIREÇÃO DUPLICADA
+    for t in open_trades[symbol]:
+        if t["direction"] == direction:
+            return
 
     contract_type = "MULTUP" if direction == "UP" else "MULTDOWN"
 
@@ -221,8 +213,12 @@ async def open_trade(ws, symbol, direction):
 
     cid = data["buy"]["contract_id"]
 
-    # 🔥 SALVA DIREÇÃO JUNTO
-    open_trades[symbol].append({"id": cid, "direction": direction})
+    # 🔥 SALVA DIREÇÃO
+    open_trades[symbol].append({
+        "id": cid,
+        "direction": direction
+    })
+
     last_trade_time[symbol] = now
 
     await ws.send(json.dumps({
@@ -261,7 +257,6 @@ async def ws_loop(symbol):
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
-
                         for col in ["open", "high", "low", "close"]:
                             df[col] = pd.to_numeric(df[col], errors="coerce")
                         df["volume"] = 1.0
@@ -274,7 +269,6 @@ async def ws_loop(symbol):
                         c = data["ohlc"]
                         new_row = pd.DataFrame([c])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
-
                         for col in ["open", "high", "low", "close"]:
                             new_row[col] = pd.to_numeric(new_row[col], errors="coerce")
                         new_row["volume"] = 1.0
@@ -303,12 +297,11 @@ async def ws_loop(symbol):
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
 
-                            # 🔥 REMOVE PELO ID
+                            # 🔥 REMOVER PELO ID
                             for s in SYMBOLS:
                                 open_trades[s] = [t for t in open_trades[s] if t["id"] != cid]
 
                             log(f"Trade fechado {cid} | Resultado {profit} | PnL Diário {daily_pnl}")
-
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
                                 log("🚨 LIMITE DE PERDA DIÁRIA ATINGIDO — BOT PAUSADO")
