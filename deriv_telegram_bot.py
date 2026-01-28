@@ -53,7 +53,6 @@ STAKE_AMOUNT = 1.0
 MULTIPLIER = 100
 TAKE_PROFIT = 0.4
 STOP_LOSS = 0.2
-MAX_OPEN_TRADES_PER_SYMBOL = 3
 TRADE_COOLDOWN_SECONDS = 15
 DAILY_MAX_LOSS = 3.0
 
@@ -106,7 +105,6 @@ def log(msg, level="info"):
 # ============================================================
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -149,7 +147,6 @@ def build_ml_dataset(df):
 async def train_ml(symbol):
     if not ML_ENABLED:
         return
-
     df = candles[symbol]
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         return
@@ -169,7 +166,6 @@ async def train_ml(symbol):
 def ml_predict(symbol, row):
     if not ml_model_ready[symbol]:
         return None
-
     model, cols = ml_models[symbol]
 
     try:
@@ -228,6 +224,8 @@ async def open_trade(ws, symbol, direction):
     data = json.loads(await ws.recv())
 
     if "error" in data:
+        if data["error"].get("code") == "MarketClosed":
+            raise Exception("MarketClosed")
         log(f"{symbol} Erro trade: {data['error']}", "error")
         return
 
@@ -273,6 +271,9 @@ async def ws_loop(symbol):
                     if "balance" in data:
                         current_balance = float(data["balance"]["balance"])
                         continue
+
+                    if "error" in data and data["error"].get("code") == "MarketClosed":
+                        raise Exception("MarketClosed")
 
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
@@ -329,28 +330,9 @@ async def ws_loop(symbol):
                                 log("🚨 LIMITE DE PERDA DIÁRIA ATINGIDO — BOT PAUSADO")
 
         except Exception as e:
-            log(f"{symbol} WS erro {e}", "error")
-            await asyncio.sleep(5)
-
-
-# ============================================================
-# 🌍 FLASK (KEEP ALIVE)
-# ============================================================
-app = Flask(__name__)
-@app.route("/")
-def health():
-    return "OK", 200
-
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-
-
-# ============================================================
-# 🚀 MAIN
-# ============================================================
-async def main():
-    await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
-
-if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.run(main())
+            if "MarketClosed" in str(e):
+                log(f"{symbol} Mercado fechado — aguardando reabertura (30 min)", "warning")
+                await asyncio.sleep(1800)  # 30 minutos
+            else:
+                log(f"{symbol} WS erro {e}", "error")
+                await asyncio.sleep(5)
