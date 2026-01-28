@@ -46,7 +46,7 @@ BB_STD = 2.3
 
 ML_ENABLED = True and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = 300
-ML_CONF_THRESHOLD = 0.60  # você ajustou
+ML_CONF_THRESHOLD = 0.60
 
 TRADE_ENABLED = True
 STAKE_AMOUNT = 1.0
@@ -65,7 +65,6 @@ candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
 ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 
-# Agora guardamos (contract_id, direction)
 open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
@@ -73,6 +72,19 @@ daily_pnl = 0.0
 current_day = datetime.now(timezone.utc).date()
 trading_paused = False
 current_balance = 0.0
+
+
+# ============================================================
+# 🆕 RESET DIÁRIO AUTOMÁTICO
+# ============================================================
+def check_daily_reset():
+    global daily_pnl, trading_paused, current_day
+    today = datetime.now(timezone.utc).date()
+    if today != current_day:
+        current_day = today
+        daily_pnl = 0.0
+        trading_paused = False
+        log("🌅 Novo dia detectado — limites resetados, trading liberado")
 
 
 # ============================================================
@@ -121,12 +133,10 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 def build_ml_dataset(df):
     df = df.dropna().copy()
-
     if len(df) < 10:
         return None, None
 
     df["future"] = (df["close"].shift(-2) > df["close"]).astype(int)
-
     X = df.select_dtypes(include=["number"]).drop(columns=["future"], errors="ignore").iloc[:-2]
     y = df["future"].iloc[:-2]
 
@@ -192,7 +202,7 @@ async def open_trade(ws, symbol, direction):
         return
 
     if direction_already_open(symbol, direction):
-        return  # já existe trade nessa direção
+        return
 
     now = time.time()
     if now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
@@ -246,7 +256,6 @@ async def ws_loop(symbol):
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 await ws.recv()
 
-                # 🔹 Inscreve no saldo
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
 
                 await ws.send(json.dumps({
@@ -263,7 +272,6 @@ async def ws_loop(symbol):
 
                     if "balance" in data:
                         current_balance = float(data["balance"]["balance"])
-                        log(f"Saldo atualizado: {current_balance}")
                         continue
 
                     if "candles" in data:
@@ -309,6 +317,8 @@ async def ws_loop(symbol):
                             cid = poc["contract_id"]
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
+
+                            check_daily_reset()
 
                             for s in SYMBOLS:
                                 open_trades[s] = [(i, d) for i, d in open_trades[s] if i != cid]
