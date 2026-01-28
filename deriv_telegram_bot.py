@@ -34,8 +34,7 @@ APP_ID = os.getenv("DERIV_APP_ID", "111022")
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 SYMBOLS = ["frxEURUSD", "frxUSDJPY", "frxGBPUSD"]
-CANDLE_INTERVAL_MINUTES = 5
-GRANULARITY_SECONDS = CANDLE_INTERVAL_MINUTES * 60
+GRANULARITY_SECONDS = 300
 HISTORY_COUNT = 1200
 
 EMA_FAST, EMA_MID, EMA_SLOW = 9, 21, 55
@@ -49,7 +48,6 @@ ML_ENABLED = True and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = 300
 ML_CONF_THRESHOLD = 0.55
 
-# ===== TRADING =====
 TRADE_ENABLED = True
 STAKE_AMOUNT = 1.0
 MULTIPLIER = 20
@@ -57,9 +55,7 @@ TAKE_PROFIT = 0.5
 STOP_LOSS = 0.3
 MAX_OPEN_TRADES_PER_SYMBOL = 3
 TRADE_COOLDOWN_SECONDS = 15
-
-# 🛑 LIMITE DE PERDA DIÁRIA
-DAILY_MAX_LOSS = 3.0  # para o bot se perder 3 dólares no dia
+DAILY_MAX_LOSS = 3.0
 
 
 # ============================================================
@@ -72,7 +68,7 @@ open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
 daily_pnl = 0.0
-current_day = datetime.utcnow().date()
+current_day = datetime.now(timezone.utc).date()
 trading_paused = False
 
 
@@ -101,18 +97,15 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
-
     df["rsi"] = RSIIndicator(df["close"], RSI_PERIOD).rsi()
-    df["mfi"] = MFIIndicator(df["high"], df["low"], df["close"], df.get("volume", 1), MFI_PERIOD).money_flow_index()
+    df["mfi"] = MFIIndicator(df["high"], df["low"], df["close"], df["volume"], MFI_PERIOD).money_flow_index()
 
     bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
     df["bb_width"] = (bb.bollinger_hband() - bb.bollinger_lband()) / df["close"]
 
     adx = ADXIndicator(df["high"], df["low"], df["close"], ADX_PERIOD)
     df["adx"] = adx.adx()
-
     df["ret"] = df["close"].pct_change().fillna(0)
-
     return df
 
 
@@ -132,7 +125,6 @@ async def train_ml(symbol):
     df = candles[symbol]
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         return
-
     X, y = build_ml_dataset(df)
     model = RandomForestClassifier(n_estimators=80, max_depth=6)
     model.fit(X, y)
@@ -149,24 +141,9 @@ def ml_predict(symbol, row):
 
 
 # ============================================================
-# 🛑 CONTROLE DE PERDA DIÁRIA
-# ============================================================
-def check_daily_reset():
-    global daily_pnl, current_day, trading_paused
-    today = datetime.utcnow().date()
-    if today != current_day:
-        daily_pnl = 0.0
-        trading_paused = False
-        current_day = today
-        log("Novo dia iniciado, resetando limite diário")
-
-
-# ============================================================
 # 💰 TRADING
 # ============================================================
 async def open_trade(ws, symbol, direction):
-    global trading_paused
-
     if trading_paused:
         return
 
@@ -188,10 +165,7 @@ async def open_trade(ws, symbol, direction):
             "currency": "USD",
             "symbol": symbol,
             "multiplier": MULTIPLIER,
-            "limit_order": {
-                "take_profit": TAKE_PROFIT,
-                "stop_loss": STOP_LOSS
-            }
+            "limit_order": {"take_profit": TAKE_PROFIT, "stop_loss": STOP_LOSS}
         }
     }
 
@@ -205,11 +179,18 @@ async def open_trade(ws, symbol, direction):
     cid = data["buy"]["contract_id"]
     open_trades[symbol].append(cid)
     last_trade_time[symbol] = now
+
+    await ws.send(json.dumps({
+        "proposal_open_contract": 1,
+        "contract_id": cid,
+        "subscribe": 1
+    }))
+
     log(f"{symbol} TRADE {direction} aberto ID {cid}")
 
 
 # ============================================================
-# 🌐 WEBSOCKET (AJUSTADO para novo formato)
+# 🌐 WEBSOCKET
 # ============================================================
 async def ws_loop(symbol):
     global daily_pnl, trading_paused
@@ -223,41 +204,46 @@ async def ws_loop(symbol):
                 await ws.send(json.dumps({
                     "ticks_history": symbol,
                     "granularity": GRANULARITY_SECONDS,
-                    "end": "latest",
                     "count": HISTORY_COUNT,
-                    "style": "candles",  
+                    "end": "latest",
+                    "style": "candles",
                     "subscribe": 1
                 }))
-                
-                # Depois da subscribe, a API envia "history" em vez de "candles"
+
                 async for raw in ws:
                     data = json.loads(raw)
 
-                    # Reset diário
-                    check_daily_reset()
-
-                    # 👇 Lidando com dados de histórico
-                    if "history" in data:
-                        hist = data["history"]
-                        # Deriv devolve "prices" e "times"
-                        prices = hist.get("prices", [])
-                        times = hist.get("times", [])
-                        if prices and times:
-                            df = pd.DataFrame({
-                                "open": prices,
-                                "high": prices,
-                                "low": prices,
-                                "close": prices,
-                                "epoch": times
-                            })
-                            df["date"] = pd.to_datetime(df["epoch"], unit="s")
-                            candles[symbol] = calcular_indicadores(df)
-
-                            # Treina ML se possível
-                            await train_ml(symbol)
+                    # Histórico inicial
+                    if "candles" in data:
+                        df = pd.DataFrame(data["candles"])
+                        df["date"] = pd.to_datetime(df["epoch"], unit="s")
+                        candles[symbol] = calcular_indicadores(df)
+                        await train_ml(symbol)
                         continue
 
-                    # 👇 Fechamento de contrato
+                    # Nova vela fechada
+                    if "ohlc" in data:
+                        c = data["ohlc"]
+                        new_row = pd.DataFrame([c])
+                        new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
+                        candles[symbol] = pd.concat([candles[symbol], new_row]).tail(HISTORY_COUNT)
+                        candles[symbol] = calcular_indicadores(candles[symbol])
+                        await train_ml(symbol)
+
+                        row = candles[symbol].iloc[-1]
+                        prob = ml_predict(symbol, row)
+                        if prob is None:
+                            continue
+
+                        conf = max(prob, 1 - prob)
+                        if conf < ML_CONF_THRESHOLD:
+                            continue
+
+                        direction = "UP" if prob > 0.5 else "DOWN"
+                        await open_trade(ws, symbol, direction)
+                        continue
+
+                    # Fechamento de contrato
                     if "proposal_open_contract" in data:
                         poc = data["proposal_open_contract"]
                         if poc.get("is_sold"):
@@ -271,32 +257,6 @@ async def ws_loop(symbol):
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
                                 log("🚨 LIMITE DE PERDA DIÁRIA ATINGIDO — BOT PAUSADO")
-                        continue
-
-                    # 👇 Dados de ticks de atualização ou candles em tempo real
-                    if "tick" in data:
-                        # Não precisa manipular aqui
-                        continue
-
-                    # Se houver novo price bar em outro formato,
-                    # você pode adaptar conforme necessário
-
-                    # ⚠️ Não tente acessar data["candles"] diretamente,
-                    # pois a Deriv não retorna assim nesse endpoint
-
-                    # As análises e operações ficam aqui
-                    if symbol in candles and not candles[symbol].empty:
-                        row = candles[symbol].iloc[-1]
-                        prob = ml_predict(symbol, row)
-                        if prob is None:
-                            continue
-
-                        conf = max(prob, 1 - prob)
-                        if conf < ML_CONF_THRESHOLD:
-                            continue
-
-                        await open_trade(ws, symbol, "UP")
-                        await open_trade(ws, symbol, "DOWN")
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
@@ -304,7 +264,7 @@ async def ws_loop(symbol):
 
 
 # ============================================================
-# 🌍 FLASK (RENDER KEEP ALIVE)
+# 🌍 FLASK (KEEP ALIVE)
 # ============================================================
 app = Flask(__name__)
 @app.route("/")
@@ -319,8 +279,7 @@ def run_flask():
 # 🚀 MAIN
 # ============================================================
 async def main():
-    tasks = [ws_loop(s) for s in SYMBOLS]
-    await asyncio.gather(*tasks)
+    await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
