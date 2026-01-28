@@ -87,26 +87,14 @@ def log(msg, level="info"):
 
 
 # ============================================================
-# 📈 PREPARAÇÃO E INDICADORES
+# 📈 INDICADORES
 # ============================================================
-def preparar_df(df: pd.DataFrame) -> pd.DataFrame:
+def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Garantir preços numéricos
-    for col in ["open", "high", "low", "close"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Criar volume fake se não existir (Deriv não envia volume real)
-    if "volume" not in df.columns:
-        df["volume"] = 1.0
-
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1.0)
-    return df
-
-
-def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
-    df = preparar_df(df)
+    # Garantir tipos numéricos
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if len(df) < EMA_SLOW + 50:
         return df
@@ -123,7 +111,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     adx = ADXIndicator(df["high"], df["low"], df["close"], ADX_PERIOD)
     df["adx"] = adx.adx()
     df["ret"] = df["close"].pct_change().fillna(0)
-
     return df
 
 
@@ -132,11 +119,17 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 def build_ml_dataset(df):
     df = df.dropna().copy()
+
+    if len(df) < 10:
+        return None, None
+
     df["future"] = (df["close"].shift(-2) > df["close"]).astype(int)
 
-    # Manter apenas colunas numéricas (remove date/datetime)
     X = df.select_dtypes(include=["number"]).drop(columns=["future"], errors="ignore").iloc[:-2]
     y = df["future"].iloc[:-2]
+
+    if len(X) == 0:
+        return None, None
 
     return X.tail(1000), y.tail(1000)
 
@@ -144,12 +137,18 @@ def build_ml_dataset(df):
 async def train_ml(symbol):
     if not ML_ENABLED:
         return
+
     df = candles[symbol]
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         return
+
     X, y = build_ml_dataset(df)
+    if X is None or len(X) == 0:
+        return
+
     model = RandomForestClassifier(n_estimators=80, max_depth=6)
     model.fit(X, y)
+
     ml_models[symbol] = (model, X.columns.tolist())
     ml_model_ready[symbol] = True
     log(f"{symbol} ML treinado")
@@ -158,8 +157,21 @@ async def train_ml(symbol):
 def ml_predict(symbol, row):
     if not ml_model_ready[symbol]:
         return None
+
     model, cols = ml_models[symbol]
-    X = pd.DataFrame([[row[c] for c in cols]], columns=cols)
+
+    try:
+        values = [row[c] for c in cols]
+    except KeyError:
+        return None
+
+    if any(pd.isna(v) for v in values):
+        return None
+
+    X = pd.DataFrame([values], columns=cols)
+    if X.shape[0] == 0:
+        return None
+
     return model.predict_proba(X)[0][1]
 
 
@@ -167,8 +179,6 @@ def ml_predict(symbol, row):
 # 💰 TRADING
 # ============================================================
 async def open_trade(ws, symbol, direction):
-    global trading_paused
-
     if trading_paused:
         return
 
@@ -241,6 +251,12 @@ async def ws_loop(symbol):
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
+
+                        # Converter preços e criar volume fake
+                        for col in ["open", "high", "low", "close"]:
+                            df[col] = pd.to_numeric(df[col], errors="coerce")
+                        df["volume"] = 1.0
+
                         candles[symbol] = calcular_indicadores(df)
                         await train_ml(symbol)
                         continue
@@ -249,6 +265,11 @@ async def ws_loop(symbol):
                         c = data["ohlc"]
                         new_row = pd.DataFrame([c])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
+
+                        for col in ["open", "high", "low", "close"]:
+                            new_row[col] = pd.to_numeric(new_row[col], errors="coerce")
+                        new_row["volume"] = 1.0
+
                         candles[symbol] = pd.concat([candles[symbol], new_row]).tail(HISTORY_COUNT)
                         candles[symbol] = calcular_indicadores(candles[symbol])
                         await train_ml(symbol)
@@ -289,7 +310,6 @@ async def ws_loop(symbol):
 # 🌍 FLASK (KEEP ALIVE)
 # ============================================================
 app = Flask(__name__)
-
 @app.route("/")
 def health():
     return "OK", 200
