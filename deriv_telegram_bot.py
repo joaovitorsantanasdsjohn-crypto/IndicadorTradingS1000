@@ -209,7 +209,7 @@ async def open_trade(ws, symbol, direction):
 
 
 # ============================================================
-# 🌐 WEBSOCKET
+# 🌐 WEBSOCKET (AJUSTADO para novo formato)
 # ============================================================
 async def ws_loop(symbol):
     global daily_pnl, trading_paused
@@ -223,55 +223,70 @@ async def ws_loop(symbol):
                 await ws.send(json.dumps({
                     "ticks_history": symbol,
                     "granularity": GRANULARITY_SECONDS,
+                    "end": "latest",
                     "count": HISTORY_COUNT,
-                    "style": "candles"
-                }))
-                hist = json.loads(await ws.recv())
-                df = pd.DataFrame(hist["candles"])
-                candles[symbol] = calcular_indicadores(df)
-                await train_ml(symbol)
-
-                await ws.send(json.dumps({
-                    "ticks_history": symbol,
-                    "granularity": GRANULARITY_SECONDS,
-                    "subscribe": 1,
-                    "style": "candles"
-                }))
-
-                await ws.send(json.dumps({
-                    "proposal_open_contract": 1,
+                    "style": "candles",  
                     "subscribe": 1
                 }))
+                
+                # Depois da subscribe, a API envia "history" em vez de "candles"
+                async for raw in ws:
+                    data = json.loads(raw)
 
-                while True:
+                    # Reset diário
                     check_daily_reset()
-                    data = json.loads(await ws.recv())
 
+                    # 👇 Lidando com dados de histórico
+                    if "history" in data:
+                        hist = data["history"]
+                        # Deriv devolve "prices" e "times"
+                        prices = hist.get("prices", [])
+                        times = hist.get("times", [])
+                        if prices and times:
+                            df = pd.DataFrame({
+                                "open": prices,
+                                "high": prices,
+                                "low": prices,
+                                "close": prices,
+                                "epoch": times
+                            })
+                            df["date"] = pd.to_datetime(df["epoch"], unit="s")
+                            candles[symbol] = calcular_indicadores(df)
+
+                            # Treina ML se possível
+                            await train_ml(symbol)
+                        continue
+
+                    # 👇 Fechamento de contrato
                     if "proposal_open_contract" in data:
                         poc = data["proposal_open_contract"]
                         if poc.get("is_sold"):
                             cid = poc["contract_id"]
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
-
                             for s in SYMBOLS:
                                 if cid in open_trades[s]:
                                     open_trades[s].remove(cid)
-
                             log(f"Trade fechado {cid} | Resultado {profit} | PnL Diário {daily_pnl}")
-
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
                                 log("🚨 LIMITE DE PERDA DIÁRIA ATINGIDO — BOT PAUSADO")
+                        continue
 
-                    if "candles" in data:
-                        new = data["candles"][0]
-                        df = candles[symbol]
-                        df = pd.concat([df, pd.DataFrame([new])], ignore_index=True)
-                        df = calcular_indicadores(df).tail(1500)
-                        candles[symbol] = df
+                    # 👇 Dados de ticks de atualização ou candles em tempo real
+                    if "tick" in data:
+                        # Não precisa manipular aqui
+                        continue
 
-                        row = df.iloc[-1]
+                    # Se houver novo price bar em outro formato,
+                    # você pode adaptar conforme necessário
+
+                    # ⚠️ Não tente acessar data["candles"] diretamente,
+                    # pois a Deriv não retorna assim nesse endpoint
+
+                    # As análises e operações ficam aqui
+                    if symbol in candles and not candles[symbol].empty:
+                        row = candles[symbol].iloc[-1]
                         prob = ml_predict(symbol, row)
                         if prob is None:
                             continue
