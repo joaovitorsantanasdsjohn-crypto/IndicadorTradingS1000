@@ -87,20 +87,10 @@ def log(msg, level="info"):
 
 
 # ============================================================
-# 📈 INDICADORES (CORRIGIDO)
+# 📈 INDICADORES
 # ============================================================
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
-    # Garante colunas essenciais
-    for col in ["open", "high", "low", "close"]:
-        if col not in df.columns:
-            return df
-
-    # FOREX não tem volume real
-    if "volume" not in df.columns:
-        df["volume"] = 0.0
-
     if len(df) < EMA_SLOW + 50:
         return df
 
@@ -108,10 +98,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
     df["rsi"] = RSIIndicator(df["close"], RSI_PERIOD).rsi()
-
-    df["mfi"] = MFIIndicator(
-        df["high"], df["low"], df["close"], df["volume"], MFI_PERIOD
-    ).money_flow_index()
+    df["mfi"] = MFIIndicator(df["high"], df["low"], df["close"], df["volume"], MFI_PERIOD).money_flow_index()
 
     bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
     df["bb_width"] = (bb.bollinger_hband() - bb.bollinger_lband()) / df["close"]
@@ -119,7 +106,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     adx = ADXIndicator(df["high"], df["low"], df["close"], ADX_PERIOD)
     df["adx"] = adx.adx()
     df["ret"] = df["close"].pct_change().fillna(0)
-
     return df
 
 
@@ -128,10 +114,19 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 def build_ml_dataset(df):
     df = df.dropna().copy()
+
+    # 🎯 Alvo
     df["future"] = (df["close"].shift(-2) > df["close"]).astype(int)
-    X = df.drop(columns=["future", "epoch"], errors="ignore").iloc[:-2]
-    y = df["future"].iloc[:-2]
+
+    # ❌ Remove colunas não numéricas
+    df = df.drop(columns=["future", "epoch", "date"], errors="ignore")
+
+    # ✅ Mantém apenas números
+    X = df.select_dtypes(include=["float64", "int64"]).iloc[:-2]
+    y = (df["close"].shift(-2) > df["close"]).astype(int).iloc[:-2]
+
     return X.tail(1000), y.tail(1000)
+
 
 async def train_ml(symbol):
     if not ML_ENABLED:
@@ -146,6 +141,7 @@ async def train_ml(symbol):
     ml_model_ready[symbol] = True
     log(f"{symbol} ML treinado")
 
+
 def ml_predict(symbol, row):
     if not ml_model_ready[symbol]:
         return None
@@ -158,7 +154,7 @@ def ml_predict(symbol, row):
 # 💰 TRADING
 # ============================================================
 async def open_trade(ws, symbol, direction):
-    if trading_paused:
+    if trading_paused or not TRADE_ENABLED:
         return
 
     now = time.time()
@@ -204,7 +200,7 @@ async def open_trade(ws, symbol, direction):
 
 
 # ============================================================
-# 🌐 WEBSOCKET (CORRIGIDO)
+# 🌐 WEBSOCKET
 # ============================================================
 async def ws_loop(symbol):
     global daily_pnl, trading_paused
@@ -227,29 +223,17 @@ async def ws_loop(symbol):
                 async for raw in ws:
                     data = json.loads(raw)
 
-                    # Histórico
-                    if "candles" in data and isinstance(data["candles"], list):
+                    if "candles" in data:
                         df = pd.DataFrame(data["candles"])
-                        if "epoch" not in df.columns:
-                            continue
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
-                        if "volume" not in df.columns:
-                            df["volume"] = 0.0
                         candles[symbol] = calcular_indicadores(df)
                         await train_ml(symbol)
                         continue
 
-                    # Nova vela
                     if "ohlc" in data:
                         c = data["ohlc"]
-                        if "epoch" not in c or "close" not in c:
-                            continue
-                        if "volume" not in c:
-                            c["volume"] = 0.0
-
                         new_row = pd.DataFrame([c])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
-
                         candles[symbol] = pd.concat([candles[symbol], new_row]).tail(HISTORY_COUNT)
                         candles[symbol] = calcular_indicadores(candles[symbol])
                         await train_ml(symbol)
@@ -267,7 +251,6 @@ async def ws_loop(symbol):
                         await open_trade(ws, symbol, direction)
                         continue
 
-                    # Fechamento
                     if "proposal_open_contract" in data:
                         poc = data["proposal_open_contract"]
                         if poc.get("is_sold"):
@@ -291,9 +274,11 @@ async def ws_loop(symbol):
 # 🌍 FLASK (KEEP ALIVE)
 # ============================================================
 app = Flask(__name__)
+
 @app.route("/")
 def health():
     return "OK", 200
+
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
@@ -304,6 +289,7 @@ def run_flask():
 # ============================================================
 async def main():
     await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
+
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
