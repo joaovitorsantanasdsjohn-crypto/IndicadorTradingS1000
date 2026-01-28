@@ -67,6 +67,11 @@ ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
+# 👉 NOVO CONTROLE DE DIREÇÃO
+open_positions: Dict[str, Dict[str, int | None]] = {
+    s: {"UP": None, "DOWN": None} for s in SYMBOLS
+}
+
 daily_pnl = 0.0
 current_day = datetime.now(timezone.utc).date()
 trading_paused = False
@@ -92,7 +97,6 @@ def log(msg, level="info"):
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Garantir tipos numéricos
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -119,12 +123,10 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 def build_ml_dataset(df):
     df = df.dropna().copy()
-
     if len(df) < 10:
         return None, None
 
     df["future"] = (df["close"].shift(-2) > df["close"]).astype(int)
-
     X = df.select_dtypes(include=["number"]).drop(columns=["future"], errors="ignore").iloc[:-2]
     y = df["future"].iloc[:-2]
 
@@ -169,9 +171,6 @@ def ml_predict(symbol, row):
         return None
 
     X = pd.DataFrame([values], columns=cols)
-    if X.shape[0] == 0:
-        return None
-
     return model.predict_proba(X)[0][1]
 
 
@@ -180,6 +179,10 @@ def ml_predict(symbol, row):
 # ============================================================
 async def open_trade(ws, symbol, direction):
     if trading_paused:
+        return
+
+    # 🚫 NÃO ABRIR MESMA DIREÇÃO DUAS VEZES
+    if open_positions[symbol][direction] is not None:
         return
 
     now = time.time()
@@ -213,6 +216,7 @@ async def open_trade(ws, symbol, direction):
 
     cid = data["buy"]["contract_id"]
     open_trades[symbol].append(cid)
+    open_positions[symbol][direction] = cid  # 👈 SALVA DIREÇÃO
     last_trade_time[symbol] = now
 
     await ws.send(json.dumps({
@@ -251,8 +255,6 @@ async def ws_loop(symbol):
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
-
-                        # Converter preços e criar volume fake
                         for col in ["open", "high", "low", "close"]:
                             df[col] = pd.to_numeric(df[col], errors="coerce")
                         df["volume"] = 1.0
@@ -265,7 +267,6 @@ async def ws_loop(symbol):
                         c = data["ohlc"]
                         new_row = pd.DataFrame([c])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
-
                         for col in ["open", "high", "low", "close"]:
                             new_row[col] = pd.to_numeric(new_row[col], errors="coerce")
                         new_row["volume"] = 1.0
@@ -293,10 +294,18 @@ async def ws_loop(symbol):
                             cid = poc["contract_id"]
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
+
                             for s in SYMBOLS:
                                 if cid in open_trades[s]:
                                     open_trades[s].remove(cid)
+                                    # 👇 LIMPA DIREÇÃO QUANDO FECHA
+                                    if open_positions[s]["UP"] == cid:
+                                        open_positions[s]["UP"] = None
+                                    if open_positions[s]["DOWN"] == cid:
+                                        open_positions[s]["DOWN"] = None
+
                             log(f"Trade fechado {cid} | Resultado {profit} | PnL Diário {daily_pnl}")
+
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
                                 log("🚨 LIMITE DE PERDA DIÁRIA ATINGIDO — BOT PAUSADO")
@@ -307,7 +316,7 @@ async def ws_loop(symbol):
 
 
 # ============================================================
-# 🌍 FLASK (KEEP ALIVE)
+# 🌍 FLASK
 # ============================================================
 app = Flask(__name__)
 @app.route("/")
