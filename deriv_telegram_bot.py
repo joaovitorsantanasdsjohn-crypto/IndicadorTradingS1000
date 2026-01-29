@@ -53,12 +53,12 @@ STAKE_AMOUNT = 1.0
 MULTIPLIER = 50
 TAKE_PROFIT = 0.4
 STOP_LOSS = 0.2
-HEDGE_PROTECT_PROFIT = 0.15
 TRADE_COOLDOWN_SECONDS = 15
 DAILY_MAX_LOSS = 3.0
 
 MARKET_CLOSED_WAIT = 60 * 10
 LAST_TICK_TIME: Dict[str, float] = {s: time.time() for s in SYMBOLS}
+LAST_TRAINED_CANDLE: Dict[str, int] = {s: 0 for s in SYMBOLS}
 
 
 # ============================================================
@@ -96,7 +96,6 @@ def log(msg, level="info"):
 # ============================================================
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -119,7 +118,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# 🚦 FILTRO DE QUALIDADE DE MERCADO
+# 🚦 FILTRO DE QUALIDADE
 # ============================================================
 def market_is_good(symbol, direction):
     df = candles[symbol]
@@ -127,29 +126,14 @@ def market_is_good(symbol, direction):
         return False
 
     row = df.iloc[-1]
-
-    adx = row.get("adx", 0)
-    rsi = row.get("rsi", 50)
-    close = row.get("close", 0)
-    ema_fast = row.get("ema_fast", 0)
-    ema_mid = row.get("ema_mid", 0)
-    ema_slow = row.get("ema_slow", 0)
-    bb_width = row.get("bb_width", 0)
-
-    if adx < 20:
+    if row.get("adx", 0) < 20:
+        return False
+    if row.get("bb_width", 0) < 0.0015:
         return False
 
-    if bb_width < 0.0015:
+    if direction == "UP" and row.get("rsi", 50) > 68:
         return False
-
-    if direction == "UP" and rsi > 68:
-        return False
-    if direction == "DOWN" and rsi < 32:
-        return False
-
-    if direction == "UP" and not (ema_fast > ema_mid > ema_slow and close > ema_mid):
-        return False
-    if direction == "DOWN" and not (ema_fast < ema_mid < ema_slow and close < ema_mid):
+    if direction == "DOWN" and row.get("rsi", 50) < 32:
         return False
 
     return True
@@ -174,7 +158,6 @@ def build_ml_dataset(df):
 async def train_ml(symbol):
     if not ML_ENABLED:
         return
-
     df = candles[symbol]
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         return
@@ -185,7 +168,6 @@ async def train_ml(symbol):
 
     model = RandomForestClassifier(n_estimators=80, max_depth=6)
     model.fit(X, y)
-
     ml_models[symbol] = (model, X.columns.tolist())
     ml_model_ready[symbol] = True
     log(f"{symbol} ML treinado")
@@ -194,38 +176,28 @@ async def train_ml(symbol):
 def ml_predict(symbol, row):
     if not ml_model_ready[symbol]:
         return None
-
     model, cols = ml_models[symbol]
-    try:
-        values = [row[c] for c in cols]
-    except KeyError:
-        return None
+    values = [row.get(c) for c in cols]
     if any(pd.isna(v) for v in values):
         return None
-
     X = pd.DataFrame([values], columns=cols)
     return model.predict_proba(X)[0][1]
 
 
 # ============================================================
-# 💰 TRADING FUNCS
+# 💰 TRADING
 # ============================================================
 def trade_already_open(symbol):
-    return len(open_trades[symbol]) > 0
+    return len(open_trades[symbol]) > 0  # 🔴 apenas 1 trade por ativo
 
 
 async def open_trade(ws, symbol, direction):
     global current_balance
 
-    if trading_paused:
+    if trading_paused or current_balance < STAKE_AMOUNT:
         return
 
-    if current_balance < STAKE_AMOUNT:
-        return
-
-    # 🔒 APENAS 1 TRADE POR ATIVO
     if trade_already_open(symbol):
-        log(f"{symbol} já possui trade aberto — aguardando fechar", "info")
         return
 
     now = time.time()
@@ -252,11 +224,10 @@ async def open_trade(ws, symbol, direction):
     data = json.loads(await ws.recv())
 
     if "error" in data:
-        log(f"{symbol} Erro trade: {data['error']}", "error")
         return
 
     cid = data["buy"]["contract_id"]
-    open_trades[symbol].append((cid, direction))
+    open_trades[symbol].append(cid)
     last_trade_time[symbol] = now
 
     await ws.send(json.dumps({
@@ -264,8 +235,6 @@ async def open_trade(ws, symbol, direction):
         "contract_id": cid,
         "subscribe": 1
     }))
-
-    log(f"{symbol} TRADE {direction} aberto ID {cid}")
 
 
 # ============================================================
@@ -300,11 +269,6 @@ async def ws_loop(symbol):
                         trading_paused = False
                         log("➡️ Novo dia — limites resetados")
 
-                    if "error" in data and "Market is closed" in data["error"].get("message", ""):
-                        log(f"{symbol} Mercado fechado — aguardando reabertura")
-                        await asyncio.sleep(MARKET_CLOSED_WAIT)
-                        break
-
                     if "balance" in data:
                         current_balance = float(data["balance"]["balance"])
                         continue
@@ -329,7 +293,11 @@ async def ws_loop(symbol):
 
                         candles[symbol] = pd.concat([candles[symbol], new_row]).tail(HISTORY_COUNT)
                         candles[symbol] = calcular_indicadores(candles[symbol])
-                        await train_ml(symbol)
+
+                        candle_epoch = int(new_row["epoch"].iloc[0])
+                        if candle_epoch > LAST_TRAINED_CANDLE[symbol]:
+                            LAST_TRAINED_CANDLE[symbol] = candle_epoch
+                            await train_ml(symbol)
 
                         row = candles[symbol].iloc[-1]
                         prob = ml_predict(symbol, row)
@@ -354,12 +322,9 @@ async def ws_loop(symbol):
                             cid = poc["contract_id"]
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
-
-                            open_trades[symbol] = [(i,d) for i,d in open_trades[symbol] if i != cid]
-
+                            open_trades[symbol] = [i for i in open_trades[symbol] if i != cid]
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
-                                log("⛔ Stop loss diário atingido — bot pausado")
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
@@ -367,7 +332,7 @@ async def ws_loop(symbol):
 
 
 # ============================================================
-# 🌍 FLASK (KEEP ALIVE)
+# 🌍 FLASK
 # ============================================================
 app = Flask(__name__)
 @app.route("/")
