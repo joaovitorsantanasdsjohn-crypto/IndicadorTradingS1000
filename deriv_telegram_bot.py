@@ -51,9 +51,9 @@ ML_CONF_THRESHOLD = 0.60
 TRADE_ENABLED = True
 STAKE_AMOUNT = 1.0
 MULTIPLIER = 100
-TAKE_PROFIT = 0.2
-STOP_LOSS = 0.1
-MAX_OPEN_TRADES_PER_SYMBOL = 3
+TAKE_PROFIT = 0.4
+STOP_LOSS = 0.2
+HEDGE_PROTECT_PROFIT = 0.15  # 🔥 lucro que ativa proteção
 TRADE_COOLDOWN_SECONDS = 15
 DAILY_MAX_LOSS = 3.0
 
@@ -65,7 +65,7 @@ candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
 ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 
-open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}
+open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}  # (contract_id, direction)
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
 daily_pnl = 0.0
@@ -93,7 +93,6 @@ def log(msg, level="info"):
 # ============================================================
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -126,23 +125,18 @@ def build_ml_dataset(df):
     df["future"] = (df["close"].shift(-2) > df["close"]).astype(int)
     X = df.select_dtypes(include=["number"]).drop(columns=["future"], errors="ignore").iloc[:-2]
     y = df["future"].iloc[:-2]
-
-    if len(X) == 0:
-        return None, None
-
     return X.tail(1000), y.tail(1000)
 
 
 async def train_ml(symbol):
     if not ML_ENABLED:
         return
-
     df = candles[symbol]
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         return
 
     X, y = build_ml_dataset(df)
-    if X is None or len(X) == 0:
+    if X is None:
         return
 
     model = RandomForestClassifier(n_estimators=80, max_depth=6)
@@ -156,17 +150,10 @@ async def train_ml(symbol):
 def ml_predict(symbol, row):
     if not ml_model_ready[symbol]:
         return None
-
     model, cols = ml_models[symbol]
-
-    try:
-        values = [row[c] for c in cols]
-    except KeyError:
+    values = [row[c] for c in cols if c in row]
+    if len(values) != len(cols):
         return None
-
-    if any(pd.isna(v) for v in values):
-        return None
-
     X = pd.DataFrame([values], columns=cols)
     return model.predict_proba(X)[0][1]
 
@@ -178,12 +165,16 @@ def direction_already_open(symbol, direction):
     return any(d == direction for _, d in open_trades[symbol])
 
 
+async def close_contract(ws, contract_id):
+    await ws.send(json.dumps({"sell": contract_id, "price": 0}))
+    log(f"Contrato {contract_id} fechado manualmente para proteção")
+
+
 async def open_trade(ws, symbol, direction):
     global current_balance
 
     if trading_paused or current_balance < STAKE_AMOUNT:
         return
-
     if direction_already_open(symbol, direction):
         return
 
@@ -218,12 +209,7 @@ async def open_trade(ws, symbol, direction):
     open_trades[symbol].append((cid, direction))
     last_trade_time[symbol] = now
 
-    await ws.send(json.dumps({
-        "proposal_open_contract": 1,
-        "contract_id": cid,
-        "subscribe": 1
-    }))
-
+    await ws.send(json.dumps({"proposal_open_contract": 1, "contract_id": cid, "subscribe": 1}))
     log(f"{symbol} TRADE {direction} aberto ID {cid}")
 
 
@@ -239,9 +225,6 @@ async def ws_loop(symbol):
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 await ws.recv()
 
-                # 🔥 SINCRONIZA TRADES ABERTOS NA CORRETORA
-                await ws.send(json.dumps({"portfolio": 1}))
-
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
 
                 await ws.send(json.dumps({
@@ -256,62 +239,29 @@ async def ws_loop(symbol):
                 async for raw in ws:
                     data = json.loads(raw)
 
-                    # 🔥 Reconstrói memória de trades ao iniciar
-                    if "portfolio" in data:
-                        open_trades[symbol].clear()
-                        for contract in data["portfolio"]["contracts"]:
-                            if contract["symbol"] == symbol:
-                                cid = contract["contract_id"]
-                                ctype = contract["contract_type"]
-                                direction = "UP" if "MULTUP" in ctype else "DOWN"
-                                open_trades[symbol].append((cid, direction))
-                        log(f"{symbol} Trades sincronizados com a corretora")
-                        continue
-
                     if "balance" in data:
                         current_balance = float(data["balance"]["balance"])
                         continue
 
-                    if "candles" in data:
-                        df = pd.DataFrame(data["candles"])
-                        df["date"] = pd.to_datetime(df["epoch"], unit="s")
-                        df["volume"] = 1.0
-                        candles[symbol] = calcular_indicadores(df)
-                        await train_ml(symbol)
-                        continue
-
-                    if "ohlc" in data:
-                        c = data["ohlc"]
-                        new_row = pd.DataFrame([c])
-                        new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
-                        new_row["volume"] = 1.0
-
-                        candles[symbol] = pd.concat([candles[symbol], new_row]).tail(HISTORY_COUNT)
-                        candles[symbol] = calcular_indicadores(candles[symbol])
-                        await train_ml(symbol)
-
-                        row = candles[symbol].iloc[-1]
-                        prob = ml_predict(symbol, row)
-                        if prob is None:
-                            continue
-
-                        conf = max(prob, 1 - prob)
-                        if conf < ML_CONF_THRESHOLD:
-                            continue
-
-                        direction = "UP" if prob > 0.5 else "DOWN"
-                        await open_trade(ws, symbol, direction)
-                        continue
-
                     if "proposal_open_contract" in data:
                         poc = data["proposal_open_contract"]
+                        cid = poc["contract_id"]
+
+                        # 🔥 HEDGE INTELIGENTE
+                        if not poc.get("is_sold"):
+                            profit = float(poc.get("profit", 0))
+                            symbol_trades = open_trades[symbol]
+
+                            if len(symbol_trades) == 2 and profit >= HEDGE_PROTECT_PROFIT:
+                                for other_id, _ in symbol_trades:
+                                    if other_id != cid:
+                                        await close_contract(ws, other_id)
+
                         if poc.get("is_sold"):
-                            cid = poc["contract_id"]
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
-
-                            for s in SYMBOLS:
-                                open_trades[s] = [(i, d) for i, d in open_trades[s] if i != cid]
+                            open_trades[symbol] = [(i, d) for i, d in open_trades[symbol] if i != cid]
+                            log(f"Trade fechado {cid} | Resultado {profit} | PnL Diário {daily_pnl}")
 
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
@@ -319,7 +269,7 @@ async def ws_loop(symbol):
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
-            await asyncio.sleep(5)
+            await asyncio.sleep(30)
 
 
 # ============================================================
