@@ -57,7 +57,7 @@ HEDGE_PROTECT_PROFIT = 0.15
 TRADE_COOLDOWN_SECONDS = 15
 DAILY_MAX_LOSS = 3.0
 
-MARKET_CLOSED_WAIT = 60 * 10  # 10 minutos quando detecta mercado fechado
+MARKET_CLOSED_WAIT = 60 * 10
 LAST_TICK_TIME: Dict[str, float] = {s: time.time() for s in SYMBOLS}
 
 
@@ -210,8 +210,8 @@ def ml_predict(symbol, row):
 # ============================================================
 # 💰 TRADING FUNCS
 # ============================================================
-def direction_already_open(symbol, direction):
-    return any(d == direction for _, d in open_trades[symbol])
+def trade_already_open(symbol):
+    return len(open_trades[symbol]) > 0
 
 
 async def open_trade(ws, symbol, direction):
@@ -223,7 +223,9 @@ async def open_trade(ws, symbol, direction):
     if current_balance < STAKE_AMOUNT:
         return
 
-    if direction_already_open(symbol, direction):
+    # 🔒 APENAS 1 TRADE POR ATIVO
+    if trade_already_open(symbol):
+        log(f"{symbol} já possui trade aberto — aguardando fechar", "info")
         return
 
     now = time.time()
@@ -276,8 +278,7 @@ async def ws_loop(symbol):
         try:
             async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-                auth_resp = await ws.recv()
-                last_tick = time.time()
+                await ws.recv()
 
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
                 await ws.send(json.dumps({
@@ -292,7 +293,6 @@ async def ws_loop(symbol):
                 async for raw in ws:
                     data = json.loads(raw)
 
-                    # reset diário automático
                     today = datetime.now(timezone.utc).date()
                     if today != current_day:
                         current_day = today
@@ -300,7 +300,6 @@ async def ws_loop(symbol):
                         trading_paused = False
                         log("➡️ Novo dia — limites resetados")
 
-                    # detecta mercado fechado
                     if "error" in data and "Market is closed" in data["error"].get("message", ""):
                         log(f"{symbol} Mercado fechado — aguardando reabertura")
                         await asyncio.sleep(MARKET_CLOSED_WAIT)
@@ -313,17 +312,14 @@ async def ws_loop(symbol):
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
-                        for col in ["open", "high", "low", "close"]:
+                        for col in ["open","high","low","close"]:
                             df[col] = pd.to_numeric(df[col], errors="coerce")
                         df["volume"] = 1.0
-
                         candles[symbol] = calcular_indicadores(df)
                         await train_ml(symbol)
                         continue
 
                     if "ohlc" in data:
-                        LAST_TICK_TIME[symbol] = time.time()
-
                         c = data["ohlc"]
                         new_row = pd.DataFrame([c])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
