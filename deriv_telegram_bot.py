@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, ADXIndicator
-from ta.volatility import BollingerBands, AverageTrueRange
+from ta.volatility import BollingerBands
 from ta.volume import MFIIndicator
 
 try:
@@ -43,7 +43,6 @@ MFI_PERIOD = 14
 ADX_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.3
-ATR_PERIOD = 14
 
 ML_ENABLED = True and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = 300
@@ -52,11 +51,11 @@ ML_CONF_THRESHOLD = 0.60
 TRADE_ENABLED = True
 STAKE_AMOUNT = 1.0
 MULTIPLIER = 100
-TAKE_PROFIT = 0.4
-STOP_LOSS = 0.2
+TAKE_PROFIT = 0.2
+STOP_LOSS = 0.1
+MAX_OPEN_TRADES_PER_SYMBOL = 3
 TRADE_COOLDOWN_SECONDS = 15
 DAILY_MAX_LOSS = 3.0
-MAX_CONSECUTIVE_LOSSES = 3
 
 
 # ============================================================
@@ -66,14 +65,13 @@ candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
 ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 
-open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}  # (id, direction)
+open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
 daily_pnl = 0.0
 current_day = datetime.now(timezone.utc).date()
 trading_paused = False
 current_balance = 0.0
-consecutive_losses = 0
 
 
 # ============================================================
@@ -113,10 +111,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     adx = ADXIndicator(df["high"], df["low"], df["close"], ADX_PERIOD)
     df["adx"] = adx.adx()
-
-    atr = AverageTrueRange(df["high"], df["low"], df["close"], ATR_PERIOD)
-    df["atr"] = atr.average_true_range()
-
     df["ret"] = df["close"].pct_change().fillna(0)
     return df
 
@@ -126,7 +120,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 def build_ml_dataset(df):
     df = df.dropna().copy()
-    if len(df) < 50:
+    if len(df) < 10:
         return None, None
 
     df["future"] = (df["close"].shift(-2) > df["close"]).astype(int)
@@ -148,10 +142,10 @@ async def train_ml(symbol):
         return
 
     X, y = build_ml_dataset(df)
-    if X is None:
+    if X is None or len(X) == 0:
         return
 
-    model = RandomForestClassifier(n_estimators=120, max_depth=8)
+    model = RandomForestClassifier(n_estimators=80, max_depth=6)
     model.fit(X, y)
 
     ml_models[symbol] = (model, X.columns.tolist())
@@ -178,23 +172,6 @@ def ml_predict(symbol, row):
 
 
 # ============================================================
-# 🧠 FILTROS INTELIGENTES (AJUDAM O ML)
-# ============================================================
-def market_is_trending(row):
-    return row["adx"] > 18
-
-def volatility_ok(row):
-    return row["atr"] > row["close"] * 0.0004
-
-def trend_direction(row):
-    if row["ema_fast"] > row["ema_slow"]:
-        return "UP"
-    elif row["ema_fast"] < row["ema_slow"]:
-        return "DOWN"
-    return None
-
-
-# ============================================================
 # 💰 TRADING
 # ============================================================
 def direction_already_open(symbol, direction):
@@ -210,7 +187,8 @@ async def open_trade(ws, symbol, direction):
     if direction_already_open(symbol, direction):
         return
 
-    if time.time() - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
+    now = time.time()
+    if now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
         return
 
     contract_type = "MULTUP" if direction == "UP" else "MULTDOWN"
@@ -238,9 +216,14 @@ async def open_trade(ws, symbol, direction):
 
     cid = data["buy"]["contract_id"]
     open_trades[symbol].append((cid, direction))
-    last_trade_time[symbol] = time.time()
+    last_trade_time[symbol] = now
 
-    await ws.send(json.dumps({"proposal_open_contract": 1, "contract_id": cid, "subscribe": 1}))
+    await ws.send(json.dumps({
+        "proposal_open_contract": 1,
+        "contract_id": cid,
+        "subscribe": 1
+    }))
+
     log(f"{symbol} TRADE {direction} aberto ID {cid}")
 
 
@@ -248,7 +231,7 @@ async def open_trade(ws, symbol, direction):
 # 🌐 WEBSOCKET
 # ============================================================
 async def ws_loop(symbol):
-    global daily_pnl, trading_paused, current_balance, current_day, consecutive_losses
+    global daily_pnl, trading_paused, current_balance
 
     while True:
         try:
@@ -256,7 +239,11 @@ async def ws_loop(symbol):
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 await ws.recv()
 
+                # 🔥 SINCRONIZA TRADES ABERTOS NA CORRETORA
+                await ws.send(json.dumps({"portfolio": 1}))
+
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+
                 await ws.send(json.dumps({
                     "ticks_history": symbol,
                     "granularity": GRANULARITY_SECONDS,
@@ -269,14 +256,17 @@ async def ws_loop(symbol):
                 async for raw in ws:
                     data = json.loads(raw)
 
-                    # Reset diário automático
-                    today = datetime.now(timezone.utc).date()
-                    if today != current_day:
-                        current_day = today
-                        daily_pnl = 0
-                        consecutive_losses = 0
-                        trading_paused = False
-                        log("🔄 Novo dia detectado — limites resetados")
+                    # 🔥 Reconstrói memória de trades ao iniciar
+                    if "portfolio" in data:
+                        open_trades[symbol].clear()
+                        for contract in data["portfolio"]["contracts"]:
+                            if contract["symbol"] == symbol:
+                                cid = contract["contract_id"]
+                                ctype = contract["contract_type"]
+                                direction = "UP" if "MULTUP" in ctype else "DOWN"
+                                open_trades[symbol].append((cid, direction))
+                        log(f"{symbol} Trades sincronizados com a corretora")
+                        continue
 
                     if "balance" in data:
                         current_balance = float(data["balance"]["balance"])
@@ -301,10 +291,6 @@ async def ws_loop(symbol):
                         await train_ml(symbol)
 
                         row = candles[symbol].iloc[-1]
-
-                        if not market_is_trending(row) or not volatility_ok(row):
-                            continue
-
                         prob = ml_predict(symbol, row)
                         if prob is None:
                             continue
@@ -313,13 +299,8 @@ async def ws_loop(symbol):
                         if conf < ML_CONF_THRESHOLD:
                             continue
 
-                        ml_dir = "UP" if prob > 0.5 else "DOWN"
-                        trend_dir = trend_direction(row)
-
-                        if ml_dir != trend_dir:
-                            continue
-
-                        await open_trade(ws, symbol, ml_dir)
+                        direction = "UP" if prob > 0.5 else "DOWN"
+                        await open_trade(ws, symbol, direction)
                         continue
 
                     if "proposal_open_contract" in data:
@@ -329,29 +310,20 @@ async def ws_loop(symbol):
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
 
-                            if profit < 0:
-                                consecutive_losses += 1
-                            else:
-                                consecutive_losses = 0
-
-                            if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-                                trading_paused = True
-                                log("⛔ Muitas perdas seguidas — bot pausado")
-
                             for s in SYMBOLS:
                                 open_trades[s] = [(i, d) for i, d in open_trades[s] if i != cid]
 
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
-                                log("🚨 LIMITE DE PERDA DIÁRIA ATINGIDO")
+                                log("🚨 LIMITE DE PERDA DIÁRIA ATINGIDO — BOT PAUSADO")
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
-            await asyncio.sleep(1800)  # tenta reconectar a cada 30 min (fim de semana)
+            await asyncio.sleep(5)
 
 
 # ============================================================
-# 🌍 FLASK (KEEP ALIVE)
+# 🌍 FLASK
 # ============================================================
 app = Flask(__name__)
 @app.route("/")
