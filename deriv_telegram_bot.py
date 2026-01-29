@@ -53,7 +53,7 @@ STAKE_AMOUNT = 1.0
 MULTIPLIER = 100
 TAKE_PROFIT = 0.7
 STOP_LOSS = 0.4
-HEDGE_PROTECT_PROFIT = 0.15  # 🔥 lucro que ativa proteção
+HEDGE_PROTECT_PROFIT = 0.15
 TRADE_COOLDOWN_SECONDS = 15
 DAILY_MAX_LOSS = 3.0
 
@@ -65,7 +65,7 @@ candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
 ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 
-open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}  # (contract_id, direction)
+open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
 daily_pnl = 0.0
@@ -93,6 +93,7 @@ def log(msg, level="info"):
 # ============================================================
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -115,6 +116,43 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
+# 🚦 FILTRO DE QUALIDADE DE MERCADO (NÃO DECIDE DIREÇÃO)
+# ============================================================
+def market_is_good(symbol, direction):
+    df = candles[symbol]
+    if len(df) < 60:
+        return False
+
+    row = df.iloc[-1]
+
+    adx = row.get("adx", 0)
+    rsi = row.get("rsi", 50)
+    close = row.get("close", 0)
+    ema_fast = row.get("ema_fast", 0)
+    ema_mid = row.get("ema_mid", 0)
+    ema_slow = row.get("ema_slow", 0)
+    bb_width = row.get("bb_width", 0)
+
+    if adx < 20:
+        return False
+
+    if bb_width < 0.0015:
+        return False
+
+    if direction == "UP" and rsi > 68:
+        return False
+    if direction == "DOWN" and rsi < 32:
+        return False
+
+    if direction == "UP" and not (ema_fast > ema_mid > ema_slow and close > ema_mid):
+        return False
+    if direction == "DOWN" and not (ema_fast < ema_mid < ema_slow and close < ema_mid):
+        return False
+
+    return True
+
+
+# ============================================================
 # 🤖 MACHINE LEARNING
 # ============================================================
 def build_ml_dataset(df):
@@ -123,20 +161,26 @@ def build_ml_dataset(df):
         return None, None
 
     df["future"] = (df["close"].shift(-2) > df["close"]).astype(int)
+
     X = df.select_dtypes(include=["number"]).drop(columns=["future"], errors="ignore").iloc[:-2]
     y = df["future"].iloc[:-2]
+
+    if len(X) == 0:
+        return None, None
+
     return X.tail(1000), y.tail(1000)
 
 
 async def train_ml(symbol):
     if not ML_ENABLED:
         return
+
     df = candles[symbol]
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         return
 
     X, y = build_ml_dataset(df)
-    if X is None:
+    if X is None or len(X) == 0:
         return
 
     model = RandomForestClassifier(n_estimators=80, max_depth=6)
@@ -150,10 +194,17 @@ async def train_ml(symbol):
 def ml_predict(symbol, row):
     if not ml_model_ready[symbol]:
         return None
+
     model, cols = ml_models[symbol]
-    values = [row[c] for c in cols if c in row]
-    if len(values) != len(cols):
+
+    try:
+        values = [row[c] for c in cols]
+    except KeyError:
         return None
+
+    if any(pd.isna(v) for v in values):
+        return None
+
     X = pd.DataFrame([values], columns=cols)
     return model.predict_proba(X)[0][1]
 
@@ -165,16 +216,15 @@ def direction_already_open(symbol, direction):
     return any(d == direction for _, d in open_trades[symbol])
 
 
-async def close_contract(ws, contract_id):
-    await ws.send(json.dumps({"sell": contract_id, "price": 0}))
-    log(f"Contrato {contract_id} fechado manualmente para proteção")
-
-
 async def open_trade(ws, symbol, direction):
     global current_balance
 
-    if trading_paused or current_balance < STAKE_AMOUNT:
+    if trading_paused:
         return
+
+    if current_balance < STAKE_AMOUNT:
+        return
+
     if direction_already_open(symbol, direction):
         return
 
@@ -209,7 +259,12 @@ async def open_trade(ws, symbol, direction):
     open_trades[symbol].append((cid, direction))
     last_trade_time[symbol] = now
 
-    await ws.send(json.dumps({"proposal_open_contract": 1, "contract_id": cid, "subscribe": 1}))
+    await ws.send(json.dumps({
+        "proposal_open_contract": 1,
+        "contract_id": cid,
+        "subscribe": 1
+    }))
+
     log(f"{symbol} TRADE {direction} aberto ID {cid}")
 
 
@@ -243,37 +298,68 @@ async def ws_loop(symbol):
                         current_balance = float(data["balance"]["balance"])
                         continue
 
+                    if "candles" in data:
+                        df = pd.DataFrame(data["candles"])
+                        df["date"] = pd.to_datetime(df["epoch"], unit="s")
+                        for col in ["open", "high", "low", "close"]:
+                            df[col] = pd.to_numeric(df[col], errors="coerce")
+                        df["volume"] = 1.0
+
+                        candles[symbol] = calcular_indicadores(df)
+                        await train_ml(symbol)
+                        continue
+
+                    if "ohlc" in data:
+                        c = data["ohlc"]
+                        new_row = pd.DataFrame([c])
+                        new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
+
+                        for col in ["open", "high", "low", "close"]:
+                            new_row[col] = pd.to_numeric(new_row[col], errors="coerce")
+                        new_row["volume"] = 1.0
+
+                        candles[symbol] = pd.concat([candles[symbol], new_row]).tail(HISTORY_COUNT)
+                        candles[symbol] = calcular_indicadores(candles[symbol])
+                        await train_ml(symbol)
+
+                        row = candles[symbol].iloc[-1]
+                        prob = ml_predict(symbol, row)
+                        if prob is None:
+                            continue
+
+                        conf = max(prob, 1 - prob)
+                        if conf < ML_CONF_THRESHOLD:
+                            continue
+
+                        direction = "UP" if prob > 0.5 else "DOWN"
+
+                        # 🔥 FILTRO DE MERCADO AQUI
+                        if not market_is_good(symbol, direction):
+                            continue
+
+                        await open_trade(ws, symbol, direction)
+                        continue
+
                     if "proposal_open_contract" in data:
                         poc = data["proposal_open_contract"]
-                        cid = poc["contract_id"]
-
-                        # 🔥 HEDGE INTELIGENTE
-                        if not poc.get("is_sold"):
-                            profit = float(poc.get("profit", 0))
-                            symbol_trades = open_trades[symbol]
-
-                            if len(symbol_trades) == 2 and profit >= HEDGE_PROTECT_PROFIT:
-                                for other_id, _ in symbol_trades:
-                                    if other_id != cid:
-                                        await close_contract(ws, other_id)
-
                         if poc.get("is_sold"):
+                            cid = poc["contract_id"]
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
-                            open_trades[symbol] = [(i, d) for i, d in open_trades[symbol] if i != cid]
-                            log(f"Trade fechado {cid} | Resultado {profit} | PnL Diário {daily_pnl}")
+
+                            for s in SYMBOLS:
+                                open_trades[s] = [(i, d) for i, d in open_trades[s] if i != cid]
 
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
-                                log("🚨 LIMITE DE PERDA DIÁRIA ATINGIDO — BOT PAUSADO")
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
 
 
 # ============================================================
-# 🌍 FLASK
+# 🌍 FLASK KEEP ALIVE
 # ============================================================
 app = Flask(__name__)
 @app.route("/")
