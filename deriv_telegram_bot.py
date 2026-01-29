@@ -4,7 +4,7 @@ import os
 import time
 import threading
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
 
 import pandas as pd
@@ -50,12 +50,15 @@ ML_CONF_THRESHOLD = 0.60
 
 TRADE_ENABLED = True
 STAKE_AMOUNT = 1.0
-MULTIPLIER = 50
-TAKE_PROFIT = 0.4
-STOP_LOSS = 0.2
+MULTIPLIER = 100
+TAKE_PROFIT = 0.7
+STOP_LOSS = 0.4
 HEDGE_PROTECT_PROFIT = 0.15
 TRADE_COOLDOWN_SECONDS = 15
 DAILY_MAX_LOSS = 3.0
+
+MARKET_CLOSED_WAIT = 60 * 10  # 10 minutos quando detecta mercado fechado
+LAST_TICK_TIME: Dict[str, float] = {s: time.time() for s in SYMBOLS}
 
 
 # ============================================================
@@ -116,7 +119,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# 🚦 FILTRO DE QUALIDADE DE MERCADO (NÃO DECIDE DIREÇÃO)
+# 🚦 FILTRO DE QUALIDADE DE MERCADO
 # ============================================================
 def market_is_good(symbol, direction):
     df = candles[symbol]
@@ -161,13 +164,10 @@ def build_ml_dataset(df):
         return None, None
 
     df["future"] = (df["close"].shift(-2) > df["close"]).astype(int)
-
     X = df.select_dtypes(include=["number"]).drop(columns=["future"], errors="ignore").iloc[:-2]
     y = df["future"].iloc[:-2]
-
     if len(X) == 0:
         return None, None
-
     return X.tail(1000), y.tail(1000)
 
 
@@ -180,7 +180,7 @@ async def train_ml(symbol):
         return
 
     X, y = build_ml_dataset(df)
-    if X is None or len(X) == 0:
+    if X is None:
         return
 
     model = RandomForestClassifier(n_estimators=80, max_depth=6)
@@ -196,12 +196,10 @@ def ml_predict(symbol, row):
         return None
 
     model, cols = ml_models[symbol]
-
     try:
         values = [row[c] for c in cols]
     except KeyError:
         return None
-
     if any(pd.isna(v) for v in values):
         return None
 
@@ -210,7 +208,7 @@ def ml_predict(symbol, row):
 
 
 # ============================================================
-# 💰 TRADING
+# 💰 TRADING FUNCS
 # ============================================================
 def direction_already_open(symbol, direction):
     return any(d == direction for _, d in open_trades[symbol])
@@ -269,19 +267,19 @@ async def open_trade(ws, symbol, direction):
 
 
 # ============================================================
-# 🌐 WEBSOCKET
+# 🌐 WEBSOCKET LOOP
 # ============================================================
 async def ws_loop(symbol):
-    global daily_pnl, trading_paused, current_balance
+    global daily_pnl, trading_paused, current_balance, current_day
 
     while True:
         try:
             async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-                await ws.recv()
+                auth_resp = await ws.recv()
+                last_tick = time.time()
 
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
-
                 await ws.send(json.dumps({
                     "ticks_history": symbol,
                     "granularity": GRANULARITY_SECONDS,
@@ -293,6 +291,20 @@ async def ws_loop(symbol):
 
                 async for raw in ws:
                     data = json.loads(raw)
+
+                    # reset diário automático
+                    today = datetime.now(timezone.utc).date()
+                    if today != current_day:
+                        current_day = today
+                        daily_pnl = 0
+                        trading_paused = False
+                        log("➡️ Novo dia — limites resetados")
+
+                    # detecta mercado fechado
+                    if "error" in data and "Market is closed" in data["error"].get("message", ""):
+                        log(f"{symbol} Mercado fechado — aguardando reabertura")
+                        await asyncio.sleep(MARKET_CLOSED_WAIT)
+                        break
 
                     if "balance" in data:
                         current_balance = float(data["balance"]["balance"])
@@ -310,11 +322,12 @@ async def ws_loop(symbol):
                         continue
 
                     if "ohlc" in data:
+                        LAST_TICK_TIME[symbol] = time.time()
+
                         c = data["ohlc"]
                         new_row = pd.DataFrame([c])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
-
-                        for col in ["open", "high", "low", "close"]:
+                        for col in ["open","high","low","close"]:
                             new_row[col] = pd.to_numeric(new_row[col], errors="coerce")
                         new_row["volume"] = 1.0
 
@@ -333,7 +346,6 @@ async def ws_loop(symbol):
 
                         direction = "UP" if prob > 0.5 else "DOWN"
 
-                        # 🔥 FILTRO DE MERCADO AQUI
                         if not market_is_good(symbol, direction):
                             continue
 
@@ -347,19 +359,19 @@ async def ws_loop(symbol):
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
 
-                            for s in SYMBOLS:
-                                open_trades[s] = [(i, d) for i, d in open_trades[s] if i != cid]
+                            open_trades[symbol] = [(i,d) for i,d in open_trades[symbol] if i != cid]
 
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
+                                log("⛔ Stop loss diário atingido — bot pausado")
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
 
 # ============================================================
-# 🌍 FLASK KEEP ALIVE
+# 🌍 FLASK (KEEP ALIVE)
 # ============================================================
 app = Flask(__name__)
 @app.route("/")
