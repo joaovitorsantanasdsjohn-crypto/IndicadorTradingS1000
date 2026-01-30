@@ -127,10 +127,10 @@ def market_is_good(symbol, direction):
 
     row = df.iloc[-1]
 
-    if row.get("adx", 0) < 20:
+    if row.get("adx", 0) < 25:
         return False
 
-    if row.get("bb_width", 0) < 0.0015:
+    if row.get("bb_width", 0) < 0.0020:
         return False
 
     return True
