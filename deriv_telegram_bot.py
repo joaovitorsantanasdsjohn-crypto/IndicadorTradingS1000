@@ -4,7 +4,7 @@ import os
 import time
 import threading
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Dict, Tuple
 
 import pandas as pd
@@ -53,13 +53,11 @@ STAKE_AMOUNT = 1.0
 MULTIPLIER = 50
 TAKE_PROFIT = 0.4
 STOP_LOSS = 0.2
-HEDGE_PROTECT_PROFIT = 0.15
 TRADE_COOLDOWN_SECONDS = 15
 DAILY_MAX_LOSS = 3.0
 
 MARKET_CLOSED_WAIT = 60 * 10
 LAST_TICK_TIME: Dict[str, float] = {s: time.time() for s in SYMBOLS}
-LAST_TRAINED_CANDLE: Dict[str, int] = {s: 0 for s in SYMBOLS}  # 🆕 controla treino ML
 
 
 # ============================================================
@@ -120,7 +118,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# 🚦 FILTRO DE QUALIDADE DE MERCADO
+# 🚦 FILTRO DE MERCADO
 # ============================================================
 def market_is_good(symbol, direction):
     df = candles[symbol]
@@ -129,21 +127,10 @@ def market_is_good(symbol, direction):
 
     row = df.iloc[-1]
 
-    adx = row.get("adx", 0)
-    rsi = row.get("rsi", 50)
-    close = row.get("close", 0)
-    ema_fast = row.get("ema_fast", 0)
-    ema_mid = row.get("ema_mid", 0)
-    ema_slow = row.get("ema_slow", 0)
-    bb_width = row.get("bb_width", 0)
-
-    if adx < 20 or bb_width < 0.0015:
+    if row.get("adx", 0) < 20:
         return False
 
-    if direction == "UP" and (rsi > 68 or not (ema_fast > ema_mid > ema_slow and close > ema_mid)):
-        return False
-
-    if direction == "DOWN" and (rsi < 32 or not (ema_fast < ema_mid < ema_slow and close < ema_mid)):
+    if row.get("bb_width", 0) < 0.0015:
         return False
 
     return True
@@ -182,7 +169,6 @@ async def train_ml(symbol):
 
     ml_models[symbol] = (model, X.columns.tolist())
     ml_model_ready[symbol] = True
-    log(f"{symbol} ML treinado")
 
 
 def ml_predict(symbol, row):
@@ -194,6 +180,7 @@ def ml_predict(symbol, row):
         values = [row[c] for c in cols]
     except KeyError:
         return None
+
     if any(pd.isna(v) for v in values):
         return None
 
@@ -202,10 +189,11 @@ def ml_predict(symbol, row):
 
 
 # ============================================================
-# 💰 TRADING FUNCS
+# 💰 TRADING
 # ============================================================
 def trade_already_open(symbol):
-    return len(open_trades[symbol]) > 0  # 🆕 bloqueia qualquer direção se já houver trade
+    """🚫 Garante apenas 1 trade por ativo"""
+    return len(open_trades[symbol]) > 0
 
 
 async def open_trade(ws, symbol, direction):
@@ -214,6 +202,7 @@ async def open_trade(ws, symbol, direction):
     if trading_paused or current_balance < STAKE_AMOUNT:
         return
 
+    # 🔒 BLOQUEIO PRINCIPAL
     if trade_already_open(symbol):
         return
 
@@ -287,12 +276,7 @@ async def ws_loop(symbol):
                         current_day = today
                         daily_pnl = 0
                         trading_paused = False
-                        log("➡️ Novo dia — limites resetados")
-
-                    if "error" in data and "Market is closed" in data["error"].get("message", ""):
-                        log(f"{symbol} Mercado fechado — aguardando reabertura")
-                        await asyncio.sleep(MARKET_CLOSED_WAIT)
-                        break
+                        log("Novo dia — limites resetados")
 
                     if "balance" in data:
                         current_balance = float(data["balance"]["balance"])
@@ -301,10 +285,7 @@ async def ws_loop(symbol):
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
-                        for col in ["open", "high", "low", "close"]:
-                            df[col] = pd.to_numeric(df[col], errors="coerce")
                         df["volume"] = 1.0
-
                         candles[symbol] = calcular_indicadores(df)
                         await train_ml(symbol)
                         continue
@@ -313,17 +294,11 @@ async def ws_loop(symbol):
                         c = data["ohlc"]
                         new_row = pd.DataFrame([c])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
-                        for col in ["open","high","low","close"]:
-                            new_row[col] = pd.to_numeric(new_row[col], errors="coerce")
                         new_row["volume"] = 1.0
 
                         candles[symbol] = pd.concat([candles[symbol], new_row]).tail(HISTORY_COUNT)
                         candles[symbol] = calcular_indicadores(candles[symbol])
-
-                        candle_epoch = int(new_row["epoch"].iloc[0])
-                        if candle_epoch > LAST_TRAINED_CANDLE[symbol]:
-                            LAST_TRAINED_CANDLE[symbol] = candle_epoch
-                            await train_ml(symbol)
+                        await train_ml(symbol)
 
                         row = candles[symbol].iloc[-1]
                         prob = ml_predict(symbol, row)
@@ -340,7 +315,6 @@ async def ws_loop(symbol):
                             continue
 
                         await open_trade(ws, symbol, direction)
-                        continue
 
                     if "proposal_open_contract" in data:
                         poc = data["proposal_open_contract"]
@@ -353,7 +327,7 @@ async def ws_loop(symbol):
 
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
-                                log("⛔ Stop loss diário atingido — bot pausado")
+                                log("Stop loss diário atingido — bot pausado")
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
@@ -361,9 +335,10 @@ async def ws_loop(symbol):
 
 
 # ============================================================
-# 🌍 FLASK (KEEP ALIVE)
+# 🌍 FLASK KEEP ALIVE
 # ============================================================
 app = Flask(__name__)
+
 @app.route("/")
 def health():
     return "OK", 200
