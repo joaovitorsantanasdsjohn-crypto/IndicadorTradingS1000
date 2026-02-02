@@ -168,7 +168,7 @@ def build_ml_dataset(df):
 
     targets = []
 
-    for i in range(len(df) - 10):
+    for i in range(len(df) - 6):
         entry = df.iloc[i]["close"]
         future = df.iloc[i+1:i+6]
 
