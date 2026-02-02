@@ -137,9 +137,9 @@ def market_is_good(symbol, direction):
 
     row = df.iloc[-1]
 
-    if row.get("adx", 0) < 22:
+    if row.get("adx", 0) < 18:
         return False
-    if row.get("bb_width", 0) < 0.0020:
+    if row.get("bb_width", 0) < 0.0016:
         return False
     if direction == "UP" and row.get("rsi", 50) > 68:
         return False
