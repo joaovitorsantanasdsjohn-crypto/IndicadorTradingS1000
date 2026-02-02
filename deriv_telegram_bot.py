@@ -4,7 +4,7 @@ import os
 import time
 import threading
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Dict, Tuple
 
 import pandas as pd
@@ -53,14 +53,10 @@ STAKE_AMOUNT = 1.0
 MULTIPLIER = 50
 TAKE_PROFIT = 0.4
 STOP_LOSS = 0.2
-HEDGE_PROTECT_PROFIT = 0.15
 TRADE_COOLDOWN_SECONDS = 15
 DAILY_MAX_LOSS = 2.0
 
-MARKET_CLOSED_WAIT = 60 * 10
 LAST_TICK_TIME: Dict[str, float] = {s: time.time() for s in SYMBOLS}
-
-# 🛡 WATCHDOG
 WATCHDOG_TIMEOUT = GRANULARITY_SECONDS * 3
 
 
@@ -95,7 +91,7 @@ def log(msg, level="info"):
 
 
 # ============================================================
-# 📈 INDICADORES + FEATURES DE MANIPULAÇÃO
+# 📈 INDICADORES
 # ============================================================
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -132,7 +128,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# 🚦 FILTRO DE QUALIDADE DE MERCADO
+# 🚦 FILTRO
 # ============================================================
 def market_is_good(symbol, direction):
     df = candles[symbol]
@@ -143,10 +139,8 @@ def market_is_good(symbol, direction):
 
     if row.get("adx", 0) < 22:
         return False
-
     if row.get("bb_width", 0) < 0.0020:
         return False
-
     if direction == "UP" and row.get("rsi", 50) > 68:
         return False
     if direction == "DOWN" and row.get("rsi", 50) < 32:
@@ -156,7 +150,7 @@ def market_is_good(symbol, direction):
 
 
 # ============================================================
-# 🤖 MACHINE LEARNING (TP vs SL REAL)
+# 🤖 ML
 # ============================================================
 def build_ml_dataset(df):
     df = df.dropna().copy()
@@ -185,6 +179,9 @@ def build_ml_dataset(df):
     df = df.iloc[:len(targets)]
     df["future"] = targets
     df = df.dropna()
+
+    if df["future"].nunique() < 2:
+        return None, None
 
     X = df.select_dtypes(include=["number"]).drop(columns=["future"], errors="ignore")
     y = df["future"]
@@ -216,19 +213,26 @@ def ml_predict(symbol, row):
         return None
 
     model, cols = ml_models[symbol]
+
     try:
         values = [row[c] for c in cols]
     except KeyError:
         return None
+
     if any(pd.isna(v) for v in values):
         return None
 
     X = pd.DataFrame([values], columns=cols)
-    return model.predict_proba(X)[0][1]
+    probs = model.predict_proba(X)[0]
+
+    if len(probs) < 2:
+        return None
+
+    return probs[1]
 
 
 # ============================================================
-# 💰 TRADING FUNCS
+# 💰 TRADES
 # ============================================================
 def trade_already_open(symbol):
     return len(open_trades[symbol]) > 0
@@ -237,13 +241,7 @@ def trade_already_open(symbol):
 async def open_trade(ws, symbol, direction):
     global current_balance
 
-    if trading_paused:
-        return
-
-    if current_balance < STAKE_AMOUNT:
-        return
-
-    if trade_already_open(symbol):
+    if trading_paused or current_balance < STAKE_AMOUNT or trade_already_open(symbol):
         return
 
     now = time.time()
@@ -273,7 +271,13 @@ async def open_trade(ws, symbol, direction):
         log(f"{symbol} Erro trade: {data['error']}", "error")
         return
 
-    cid = data["buy"]["contract_id"]
+    buy_data = data.get("buy") or data.get("proposal_open_contract") or {}
+    cid = buy_data.get("contract_id")
+
+    if not cid:
+        log(f"{symbol} Resposta inesperada ao abrir trade: {data}", "error")
+        return
+
     open_trades[symbol].append((cid, direction))
     last_trade_time[symbol] = now
 
@@ -309,7 +313,6 @@ async def ws_loop(symbol):
                 LAST_TICK_TIME[symbol] = time.time()
 
                 async for raw in ws:
-                    # 🛡 WATCHDOG CHECK
                     if time.time() - LAST_TICK_TIME[symbol] > WATCHDOG_TIMEOUT:
                         log(f"{symbol} Watchdog acionado — reconectando...", "warning")
                         break
@@ -331,8 +334,6 @@ async def ws_loop(symbol):
 
                         df = pd.DataFrame(data["candles"])
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
-                        for col in ["open", "high", "low", "close"]:
-                            df[col] = pd.to_numeric(df[col], errors="coerce")
                         df["volume"] = 1.0
 
                         candles[symbol] = calcular_indicadores(df)
@@ -342,11 +343,8 @@ async def ws_loop(symbol):
                     if "ohlc" in data:
                         LAST_TICK_TIME[symbol] = time.time()
 
-                        c = data["ohlc"]
-                        new_row = pd.DataFrame([c])
+                        new_row = pd.DataFrame([data["ohlc"]])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
-                        for col in ["open","high","low","close"]:
-                            new_row[col] = pd.to_numeric(new_row[col], errors="coerce")
                         new_row["volume"] = 1.0
 
                         candles[symbol] = pd.concat([candles[symbol], new_row]).tail(HISTORY_COUNT)
@@ -377,7 +375,7 @@ async def ws_loop(symbol):
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
 
-                            open_trades[symbol] = [(i,d) for i,d in open_trades[symbol] if i != cid]
+                            open_trades[symbol] = [(i, d) for i, d in open_trades[symbol] if i != cid]
 
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
@@ -388,9 +386,10 @@ async def ws_loop(symbol):
 
 
 # ============================================================
-# 🌍 FLASK (KEEP ALIVE)
+# 🌍 FLASK
 # ============================================================
 app = Flask(__name__)
+
 @app.route("/")
 def health():
     return "OK", 200
