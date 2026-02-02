@@ -60,6 +60,9 @@ DAILY_MAX_LOSS = 2.0
 MARKET_CLOSED_WAIT = 60 * 10
 LAST_TICK_TIME: Dict[str, float] = {s: time.time() for s in SYMBOLS}
 
+# 🛡 WATCHDOG
+WATCHDOG_TIMEOUT = GRANULARITY_SECONDS * 3
+
 
 # ============================================================
 # 📊 ESTADO GLOBAL
@@ -116,7 +119,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["adx"] = adx.adx()
     df["ret"] = df["close"].pct_change().fillna(0)
 
-    # 🔥 FEATURES DE MANIPULAÇÃO INSTITUCIONAL
     df["range"] = df["high"] - df["low"]
     df["body"] = abs(df["close"] - df["open"])
     df["upper_wick"] = df["high"] - df[["close", "open"]].max(axis=1)
@@ -304,7 +306,14 @@ async def ws_loop(symbol):
                     "subscribe": 1
                 }))
 
+                LAST_TICK_TIME[symbol] = time.time()
+
                 async for raw in ws:
+                    # 🛡 WATCHDOG CHECK
+                    if time.time() - LAST_TICK_TIME[symbol] > WATCHDOG_TIMEOUT:
+                        log(f"{symbol} Watchdog acionado — reconectando...", "warning")
+                        break
+
                     data = json.loads(raw)
 
                     today = datetime.now(timezone.utc).date()
@@ -318,6 +327,8 @@ async def ws_loop(symbol):
                         continue
 
                     if "candles" in data:
+                        LAST_TICK_TIME[symbol] = time.time()
+
                         df = pd.DataFrame(data["candles"])
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
                         for col in ["open", "high", "low", "close"]:
@@ -329,6 +340,8 @@ async def ws_loop(symbol):
                         continue
 
                     if "ohlc" in data:
+                        LAST_TICK_TIME[symbol] = time.time()
+
                         c = data["ohlc"]
                         new_row = pd.DataFrame([c])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
