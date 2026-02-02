@@ -170,7 +170,7 @@ def build_ml_dataset(df):
 
     for i in range(len(df) - 10):
         entry = df.iloc[i]["close"]
-        future = df.iloc[i+1:i+10]
+        future = df.iloc[i+1:i+6]
 
         hit_tp = (future["high"] >= entry * (1 + tp_pct)).any()
         hit_sl = (future["low"] <= entry * (1 - sl_pct)).any()
