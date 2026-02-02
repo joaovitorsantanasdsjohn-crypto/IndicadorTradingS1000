@@ -35,7 +35,7 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 SYMBOLS = ["frxEURUSD", "frxUSDJPY", "frxGBPUSD", "frxAUDUSD"]
 GRANULARITY_SECONDS = 300
-HISTORY_COUNT = 1200
+HISTORY_COUNT = 2000
 
 EMA_FAST, EMA_MID, EMA_SLOW = 9, 21, 55
 RSI_PERIOD = 14
