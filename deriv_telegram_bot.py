@@ -56,7 +56,6 @@ STOP_LOSS = 0.2
 TRADE_COOLDOWN_SECONDS = 15
 DAILY_MAX_LOSS = 2.0
 
-LAST_TICK_TIME: Dict[str, float] = {s: time.time() for s in SYMBOLS}
 WATCHDOG_TIMEOUT = GRANULARITY_SECONDS * 3
 
 
@@ -91,7 +90,7 @@ def log(msg, level="info"):
 
 
 # ============================================================
-# 📈 INDICADORES
+# 📈 INDICADORES + MANIPULAÇÃO INSTITUCIONAL
 # ============================================================
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -115,6 +114,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["adx"] = adx.adx()
     df["ret"] = df["close"].pct_change().fillna(0)
 
+    # 🔥 MANIPULAÇÃO INSTITUCIONAL
     df["range"] = df["high"] - df["low"]
     df["body"] = abs(df["close"] - df["open"])
     df["upper_wick"] = df["high"] - df[["close", "open"]].max(axis=1)
@@ -139,11 +139,13 @@ def market_is_good(symbol, direction):
 
     if row.get("adx", 0) < 18:
         return False
+
     if row.get("bb_width", 0) < 0.0016:
         return False
-    if direction == "UP" and row.get("rsi", 50) > 68:
+
+    if direction == "UP" and row.get("rsi", 50) > 70:
         return False
-    if direction == "DOWN" and row.get("rsi", 50) < 32:
+    if direction == "DOWN" and row.get("rsi", 50) < 30:
         return False
 
     return True
@@ -180,9 +182,6 @@ def build_ml_dataset(df):
     df["future"] = targets
     df = df.dropna()
 
-    if df["future"].nunique() < 2:
-        return None, None
-
     X = df.select_dtypes(include=["number"]).drop(columns=["future"], errors="ignore")
     y = df["future"]
 
@@ -213,35 +212,27 @@ def ml_predict(symbol, row):
         return None
 
     model, cols = ml_models[symbol]
-
-    try:
-        values = [row[c] for c in cols]
-    except KeyError:
-        return None
-
+    values = [row.get(c) for c in cols]
     if any(pd.isna(v) for v in values):
         return None
 
     X = pd.DataFrame([values], columns=cols)
-    probs = model.predict_proba(X)[0]
-
-    if len(probs) < 2:
-        return None
-
-    return probs[1]
+    return model.predict_proba(X)[0][1]
 
 
 # ============================================================
-# 💰 TRADES
+# 💰 TRADING
 # ============================================================
 def trade_already_open(symbol):
     return len(open_trades[symbol]) > 0
 
 
-async def open_trade(ws, symbol, direction):
-    global current_balance
+def same_direction_open(symbol, direction):
+    return any(d == direction for _, d in open_trades[symbol])
 
-    if trading_paused or current_balance < STAKE_AMOUNT or trade_already_open(symbol):
+
+async def open_trade(ws, symbol, direction):
+    if trading_paused or trade_already_open(symbol) or same_direction_open(symbol, direction):
         return
 
     now = time.time()
@@ -271,34 +262,30 @@ async def open_trade(ws, symbol, direction):
         log(f"{symbol} Erro trade: {data['error']}", "error")
         return
 
-    buy_data = data.get("buy") or data.get("proposal_open_contract") or {}
-    cid = buy_data.get("contract_id")
-
-    if not cid:
-        log(f"{symbol} Resposta inesperada ao abrir trade: {data}", "error")
-        return
-
+    cid = data["buy"]["contract_id"]
     open_trades[symbol].append((cid, direction))
     last_trade_time[symbol] = now
 
-    await ws.send(json.dumps({
-        "proposal_open_contract": 1,
-        "contract_id": cid,
-        "subscribe": 1
-    }))
-
 
 # ============================================================
-# 🌐 WEBSOCKET LOOP
+# 🌐 WEBSOCKET
 # ============================================================
 async def ws_loop(symbol):
-    global daily_pnl, trading_paused, current_balance, current_day
+    global current_balance
 
     while True:
         try:
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+            async with websockets.connect(WS_URL) as ws:
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 await ws.recv()
+
+                # 🔄 SINCRONIZA OPERAÇÕES JÁ ABERTAS
+                await ws.send(json.dumps({"portfolio": 1}))
+                portfolio = json.loads(await ws.recv())
+                for c in portfolio.get("portfolio", {}).get("contracts", []):
+                    if c["symbol"] == symbol and not c["is_sold"]:
+                        direction = "UP" if "MULTUP" in c["contract_type"] else "DOWN"
+                        open_trades[symbol].append((c["contract_id"], direction))
 
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
                 await ws.send(json.dumps({
@@ -310,39 +297,22 @@ async def ws_loop(symbol):
                     "subscribe": 1
                 }))
 
-                LAST_TICK_TIME[symbol] = time.time()
-
                 async for raw in ws:
-                    if time.time() - LAST_TICK_TIME[symbol] > WATCHDOG_TIMEOUT:
-                        log(f"{symbol} Watchdog acionado — reconectando...", "warning")
-                        break
-
                     data = json.loads(raw)
-
-                    today = datetime.now(timezone.utc).date()
-                    if today != current_day:
-                        current_day = today
-                        daily_pnl = 0
-                        trading_paused = False
 
                     if "balance" in data:
                         current_balance = float(data["balance"]["balance"])
                         continue
 
                     if "candles" in data:
-                        LAST_TICK_TIME[symbol] = time.time()
-
                         df = pd.DataFrame(data["candles"])
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
                         df["volume"] = 1.0
-
                         candles[symbol] = calcular_indicadores(df)
                         await train_ml(symbol)
                         continue
 
                     if "ohlc" in data:
-                        LAST_TICK_TIME[symbol] = time.time()
-
                         new_row = pd.DataFrame([data["ohlc"]])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
                         new_row["volume"] = 1.0
@@ -356,40 +326,26 @@ async def ws_loop(symbol):
                         if prob is None:
                             continue
 
+                        direction = "UP" if prob > 0.5 else "DOWN"
                         conf = max(prob, 1 - prob)
+
                         if conf < ML_CONF_THRESHOLD:
                             continue
-
-                        direction = "UP" if prob > 0.5 else "DOWN"
 
                         if not market_is_good(symbol, direction):
                             continue
 
                         await open_trade(ws, symbol, direction)
-                        continue
-
-                    if "proposal_open_contract" in data:
-                        poc = data["proposal_open_contract"]
-                        if poc.get("is_sold"):
-                            cid = poc["contract_id"]
-                            profit = float(poc.get("profit", 0))
-                            daily_pnl += profit
-
-                            open_trades[symbol] = [(i, d) for i, d in open_trades[symbol] if i != cid]
-
-                            if daily_pnl <= -DAILY_MAX_LOSS:
-                                trading_paused = True
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
 
 # ============================================================
-# 🌍 FLASK
+# 🌍 FLASK KEEP ALIVE
 # ============================================================
 app = Flask(__name__)
-
 @app.route("/")
 def health():
     return "OK", 200
