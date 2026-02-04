@@ -114,12 +114,12 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["adx"] = adx.adx()
     df["ret"] = df["close"].pct_change().fillna(0)
 
-    # 🔥 MANIPULAÇÃO INSTITUCIONAL
+    # ===== MANIPULAÇÃO / ESTRUTURA =====
     df["range"] = df["high"] - df["low"]
     df["body"] = abs(df["close"] - df["open"])
     df["upper_wick"] = df["high"] - df[["close", "open"]].max(axis=1)
     df["lower_wick"] = df[["close", "open"]].min(axis=1) - df["low"]
-    df["wick_ratio"] = (df["upper_wick"] + df["lower_wick"]) / df["range"]
+    df["wick_ratio"] = (df["upper_wick"] + df["lower_wick"]) / df["range"].replace(0, 1e-9)
 
     df["range_expansion"] = df["range"] / df["range"].rolling(20).mean()
     df["volatility_squeeze"] = df["bb_width"] / df["bb_width"].rolling(20).mean()
@@ -128,7 +128,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# 🚦 FILTRO
+# 🚦 FILTRO DE MERCADO
 # ============================================================
 def market_is_good(symbol, direction):
     df = candles[symbol]
@@ -163,7 +163,6 @@ def build_ml_dataset(df):
     sl_pct = STOP_LOSS / (STAKE_AMOUNT * MULTIPLIER)
 
     targets = []
-
     for i in range(len(df) - 6):
         entry = df.iloc[i]["close"]
         future = df.iloc[i+1:i+6]
@@ -197,7 +196,11 @@ async def train_ml(symbol):
         return
 
     X, y = build_ml_dataset(df)
-    if X is None or len(X) == 0:
+    if X is None or len(X) < 50:
+        return
+
+    # 🔧 evita erro de 1 classe só
+    if len(set(y)) < 2:
         return
 
     model = RandomForestClassifier(n_estimators=120, max_depth=8)
@@ -212,7 +215,15 @@ def ml_predict(symbol, row):
         return None
 
     model, cols = ml_models[symbol]
-    values = [row.get(c) for c in cols]
+
+    # 🔧 evita index error quando só existe 1 classe treinada
+    if len(model.classes_) < 2:
+        return None
+
+    try:
+        values = [row[c] for c in cols]
+    except KeyError:
+        return None
     if any(pd.isna(v) for v in values):
         return None
 
@@ -221,18 +232,19 @@ def ml_predict(symbol, row):
 
 
 # ============================================================
-# 💰 TRADING
+# 💰 TRADES
 # ============================================================
 def trade_already_open(symbol):
     return len(open_trades[symbol]) > 0
 
 
-def same_direction_open(symbol, direction):
-    return any(d == direction for _, d in open_trades[symbol])
-
-
 async def open_trade(ws, symbol, direction):
-    if trading_paused or trade_already_open(symbol) or same_direction_open(symbol, direction):
+    global current_balance
+
+    if trading_paused or current_balance < STAKE_AMOUNT:
+        return
+
+    if trade_already_open(symbol):
         return
 
     now = time.time()
@@ -266,26 +278,24 @@ async def open_trade(ws, symbol, direction):
     open_trades[symbol].append((cid, direction))
     last_trade_time[symbol] = now
 
+    await ws.send(json.dumps({
+        "proposal_open_contract": 1,
+        "contract_id": cid,
+        "subscribe": 1
+    }))
+
 
 # ============================================================
-# 🌐 WEBSOCKET
+# 🌐 LOOP WS
 # ============================================================
 async def ws_loop(symbol):
-    global current_balance
+    global daily_pnl, trading_paused, current_balance, current_day
 
     while True:
         try:
-            async with websockets.connect(WS_URL) as ws:
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 await ws.recv()
-
-                # 🔄 SINCRONIZA OPERAÇÕES JÁ ABERTAS
-                await ws.send(json.dumps({"portfolio": 1}))
-                portfolio = json.loads(await ws.recv())
-                for c in portfolio.get("portfolio", {}).get("contracts", []):
-                    if c["symbol"] == symbol and not c["is_sold"]:
-                        direction = "UP" if "MULTUP" in c["contract_type"] else "DOWN"
-                        open_trades[symbol].append((c["contract_id"], direction))
 
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
                 await ws.send(json.dumps({
@@ -297,14 +307,27 @@ async def ws_loop(symbol):
                     "subscribe": 1
                 }))
 
+                last_tick = time.time()
+
                 async for raw in ws:
+                    if time.time() - last_tick > WATCHDOG_TIMEOUT:
+                        log(f"{symbol} Watchdog reconectando...", "warning")
+                        break
+
                     data = json.loads(raw)
+
+                    today = datetime.now(timezone.utc).date()
+                    if today != current_day:
+                        current_day = today
+                        daily_pnl = 0
+                        trading_paused = False
 
                     if "balance" in data:
                         current_balance = float(data["balance"]["balance"])
                         continue
 
                     if "candles" in data:
+                        last_tick = time.time()
                         df = pd.DataFrame(data["candles"])
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
                         df["volume"] = 1.0
@@ -313,7 +336,9 @@ async def ws_loop(symbol):
                         continue
 
                     if "ohlc" in data:
-                        new_row = pd.DataFrame([data["ohlc"]])
+                        last_tick = time.time()
+                        c = data["ohlc"]
+                        new_row = pd.DataFrame([c])
                         new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
                         new_row["volume"] = 1.0
 
@@ -326,20 +351,33 @@ async def ws_loop(symbol):
                         if prob is None:
                             continue
 
-                        direction = "UP" if prob > 0.5 else "DOWN"
                         conf = max(prob, 1 - prob)
-
                         if conf < ML_CONF_THRESHOLD:
                             continue
+
+                        direction = "UP" if prob > 0.5 else "DOWN"
 
                         if not market_is_good(symbol, direction):
                             continue
 
                         await open_trade(ws, symbol, direction)
+                        continue
+
+                    if "proposal_open_contract" in data:
+                        poc = data["proposal_open_contract"]
+                        if poc.get("is_sold"):
+                            cid = poc["contract_id"]
+                            profit = float(poc.get("profit", 0))
+                            daily_pnl += profit
+
+                            open_trades[symbol] = [(i,d) for i,d in open_trades[symbol] if i != cid]
+
+                            if daily_pnl <= -DAILY_MAX_LOSS:
+                                trading_paused = True
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
 
 # ============================================================
