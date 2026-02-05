@@ -53,7 +53,7 @@ STAKE_AMOUNT = 1.0
 MULTIPLIER = 100
 TAKE_PROFIT = 0.4
 STOP_LOSS = 0.2
-TRADE_COOLDOWN_SECONDS = 5
+TRADE_COOLDOWN_SECONDS = 15
 DAILY_MAX_LOSS = 2.0
 
 WATCHDOG_TIMEOUT = GRANULARITY_SECONDS * 3
@@ -66,13 +66,16 @@ candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
 ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 
-open_trades: Dict[str, Dict[str, int]] = {s: {} for s in SYMBOLS}
+open_trades: Dict[str, Dict] = {s: {} for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
 daily_pnl = 0.0
 current_day = datetime.now(timezone.utc).date()
 trading_paused = False
 current_balance = 0.0
+
+pending_proposals: Dict[int, dict] = {}
+REQ_ID_SEQ = 1
 
 
 # ============================================================
@@ -214,6 +217,7 @@ def ml_predict(symbol, row):
         return None
 
     model, cols = ml_models[symbol]
+
     if len(model.classes_) < 2:
         return None
 
@@ -230,24 +234,25 @@ def ml_predict(symbol, row):
 
 
 # ============================================================
-# 💰 TRADES (PROPOSAL → BUY)
+# 💰 TRADES – PROPOSAL → BUY (REQ_ID)
 # ============================================================
-async def open_trade(ws, symbol, direction):
-    global current_balance
-
-    if trading_paused or current_balance < STAKE_AMOUNT:
-        return
+async def send_proposal(ws, symbol, direction):
+    global REQ_ID_SEQ
 
     if open_trades[symbol]:
         return
 
-    now = time.time()
-    if now - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
-        return
-
     contract_type = "MULTUP" if direction == "UP" else "MULTDOWN"
 
-    proposal = {
+    req_id = REQ_ID_SEQ
+    REQ_ID_SEQ += 1
+
+    pending_proposals[req_id] = {
+        "symbol": symbol,
+        "direction": direction
+    }
+
+    await ws.send(json.dumps({
         "proposal": 1,
         "amount": STAKE_AMOUNT,
         "basis": "stake",
@@ -258,33 +263,22 @@ async def open_trade(ws, symbol, direction):
         "limit_order": {
             "take_profit": TAKE_PROFIT,
             "stop_loss": STOP_LOSS
-        }
-    }
+        },
+        "req_id": req_id
+    }))
 
-    await ws.send(json.dumps(proposal))
-    data = json.loads(await ws.recv())
 
-    if "error" in data:
-        log(f"{symbol} Erro proposal: {data['error']}", "error")
+async def handle_proposal(ws, data):
+    req_id = data.get("req_id")
+    if req_id not in pending_proposals:
         return
 
-    pid = data["proposal"]["id"]
-
-    await ws.send(json.dumps({"buy": pid, "price": STAKE_AMOUNT}))
-    data = json.loads(await ws.recv())
-
-    if "error" in data:
-        log(f"{symbol} Erro buy: {data['error']}", "error")
-        return
-
-    cid = data["buy"]["contract_id"]
-    open_trades[symbol][cid] = True
-    last_trade_time[symbol] = now
+    info = pending_proposals.pop(req_id)
+    symbol = info["symbol"]
 
     await ws.send(json.dumps({
-        "proposal_open_contract": 1,
-        "contract_id": cid,
-        "subscribe": 1
+        "buy": data["proposal"]["id"],
+        "price": STAKE_AMOUNT
     }))
 
 
@@ -319,34 +313,38 @@ async def ws_loop(symbol):
 
                     data = json.loads(raw)
 
-                    today = datetime.now(timezone.utc).date()
-                    if today != current_day:
-                        current_day = today
-                        daily_pnl = 0
-                        trading_paused = False
-
                     if "balance" in data:
                         current_balance = float(data["balance"]["balance"])
                         continue
 
-                    if "candles" in data:
-                        last_tick = time.time()
-                        df = pd.DataFrame(data["candles"])
-                        df["date"] = pd.to_datetime(df["epoch"], unit="s")
-                        df["volume"] = 1.0
-                        candles[symbol] = calcular_indicadores(df)
-                        await train_ml(symbol)
+                    if "proposal" in data:
+                        await handle_proposal(ws, data)
+                        continue
+
+                    if "buy" in data:
+                        cid = data["buy"]["contract_id"]
+                        open_trades[symbol][cid] = True
+                        continue
+
+                    if "proposal_open_contract" in data:
+                        poc = data["proposal_open_contract"]
+                        if poc.get("is_sold"):
+                            cid = poc["contract_id"]
+                            profit = float(poc.get("profit", 0))
+                            daily_pnl += profit
+                            open_trades[symbol].pop(cid, None)
+
+                            if daily_pnl <= -DAILY_MAX_LOSS:
+                                trading_paused = True
                         continue
 
                     if "ohlc" in data:
                         last_tick = time.time()
                         c = data["ohlc"]
-                        new_row = pd.DataFrame([c])
-                        new_row["date"] = pd.to_datetime(new_row["epoch"], unit="s")
-                        new_row["volume"] = 1.0
-
-                        candles[symbol] = pd.concat([candles[symbol], new_row]).tail(HISTORY_COUNT)
-                        candles[symbol] = calcular_indicadores(candles[symbol])
+                        df = candles[symbol]
+                        df = pd.concat([df, pd.DataFrame([c])]).tail(HISTORY_COUNT)
+                        df["volume"] = 1.0
+                        candles[symbol] = calcular_indicadores(df)
                         await train_ml(symbol)
 
                         row = candles[symbol].iloc[-1]
@@ -363,31 +361,20 @@ async def ws_loop(symbol):
                         if not market_is_good(symbol, direction):
                             continue
 
-                        await open_trade(ws, symbol, direction)
-                        continue
+                        if trading_paused:
+                            continue
 
-                    if "proposal_open_contract" in data:
-                        poc = data["proposal_open_contract"]
-                        if poc.get("is_sold"):
-                            cid = poc["contract_id"]
-                            profit = float(poc.get("profit", 0))
-                            daily_pnl += profit
-
-                            open_trades[symbol].pop(cid, None)
-
-                            if daily_pnl <= -DAILY_MAX_LOSS:
-                                trading_paused = True
+                        await send_proposal(ws, symbol, direction)
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)
 
 
 # ============================================================
 # 🌍 FLASK KEEP ALIVE
 # ============================================================
 app = Flask(__name__)
-
 @app.route("/")
 def health():
     return "OK", 200
