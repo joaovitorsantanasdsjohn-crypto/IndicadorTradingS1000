@@ -53,7 +53,7 @@ STAKE_AMOUNT = 1.0
 MULTIPLIER = 100
 TAKE_PROFIT = 0.4
 STOP_LOSS = 0.2
-TRADE_COOLDOWN_SECONDS = 15
+TRADE_COOLDOWN_SECONDS = 5
 DAILY_MAX_LOSS = 2.0
 
 WATCHDOG_TIMEOUT = GRANULARITY_SECONDS * 3
@@ -66,7 +66,7 @@ candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
 ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
 ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 
-open_trades: Dict[str, list] = {s: [] for s in SYMBOLS}
+open_trades: Dict[str, Dict[str, int]] = {s: {} for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
 daily_pnl = 0.0
@@ -199,7 +199,6 @@ async def train_ml(symbol):
     if X is None or len(X) < 50:
         return
 
-    # 🔧 evita erro de 1 classe só
     if len(set(y)) < 2:
         return
 
@@ -215,8 +214,6 @@ def ml_predict(symbol, row):
         return None
 
     model, cols = ml_models[symbol]
-
-    # 🔧 evita index error quando só existe 1 classe treinada
     if len(model.classes_) < 2:
         return None
 
@@ -224,6 +221,7 @@ def ml_predict(symbol, row):
         values = [row[c] for c in cols]
     except KeyError:
         return None
+
     if any(pd.isna(v) for v in values):
         return None
 
@@ -232,19 +230,15 @@ def ml_predict(symbol, row):
 
 
 # ============================================================
-# 💰 TRADES
+# 💰 TRADES (PROPOSAL → BUY)
 # ============================================================
-def trade_already_open(symbol):
-    return len(open_trades[symbol]) > 0
-
-
 async def open_trade(ws, symbol, direction):
     global current_balance
 
     if trading_paused or current_balance < STAKE_AMOUNT:
         return
 
-    if trade_already_open(symbol):
+    if open_trades[symbol]:
         return
 
     now = time.time()
@@ -253,29 +247,38 @@ async def open_trade(ws, symbol, direction):
 
     contract_type = "MULTUP" if direction == "UP" else "MULTDOWN"
 
-    req = {
-        "buy": 1,
-        "price": STAKE_AMOUNT,
-        "parameters": {
-            "amount": STAKE_AMOUNT,
-            "basis": "stake",
-            "contract_type": contract_type,
-            "currency": "USD",
-            "symbol": symbol,
-            "multiplier": MULTIPLIER,
-            "limit_order": {"take_profit": TAKE_PROFIT, "stop_loss": STOP_LOSS}
+    proposal = {
+        "proposal": 1,
+        "amount": STAKE_AMOUNT,
+        "basis": "stake",
+        "contract_type": contract_type,
+        "currency": "USD",
+        "symbol": symbol,
+        "multiplier": MULTIPLIER,
+        "limit_order": {
+            "take_profit": TAKE_PROFIT,
+            "stop_loss": STOP_LOSS
         }
     }
 
-    await ws.send(json.dumps(req))
+    await ws.send(json.dumps(proposal))
     data = json.loads(await ws.recv())
 
     if "error" in data:
-        log(f"{symbol} Erro trade: {data['error']}", "error")
+        log(f"{symbol} Erro proposal: {data['error']}", "error")
+        return
+
+    pid = data["proposal"]["id"]
+
+    await ws.send(json.dumps({"buy": pid, "price": STAKE_AMOUNT}))
+    data = json.loads(await ws.recv())
+
+    if "error" in data:
+        log(f"{symbol} Erro buy: {data['error']}", "error")
         return
 
     cid = data["buy"]["contract_id"]
-    open_trades[symbol].append((cid, direction))
+    open_trades[symbol][cid] = True
     last_trade_time[symbol] = now
 
     await ws.send(json.dumps({
@@ -370,7 +373,7 @@ async def ws_loop(symbol):
                             profit = float(poc.get("profit", 0))
                             daily_pnl += profit
 
-                            open_trades[symbol] = [(i,d) for i,d in open_trades[symbol] if i != cid]
+                            open_trades[symbol].pop(cid, None)
 
                             if daily_pnl <= -DAILY_MAX_LOSS:
                                 trading_paused = True
@@ -384,6 +387,7 @@ async def ws_loop(symbol):
 # 🌍 FLASK KEEP ALIVE
 # ============================================================
 app = Flask(__name__)
+
 @app.route("/")
 def health():
     return "OK", 200
