@@ -69,7 +69,7 @@ ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 open_trades: Dict[str, Dict] = {s: {} for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
-# 🔒 trava real contra duplicação
+# 🔒 LOCK REAL POR PAR (evita proposal duplicada)
 proposal_lock: Dict[str, bool] = {s: False for s in SYMBOLS}
 
 daily_pnl = 0.0
@@ -236,15 +236,12 @@ def ml_predict(symbol, row):
 
 
 # ============================================================
-# 💰 TRADES – PROPOSAL → BUY
+# 💰 TRADES – PROPOSAL → BUY (REQ_ID)
 # ============================================================
 async def send_proposal(ws, symbol, direction):
     global REQ_ID_SEQ
 
-    if open_trades[symbol]:
-        return
-
-    if proposal_lock[symbol]:
+    if open_trades[symbol] or proposal_lock[symbol]:
         return
 
     proposal_lock[symbol] = True
@@ -314,9 +311,32 @@ async def ws_loop(symbol):
                 async for raw in ws:
                     data = json.loads(raw)
 
+                    if "candles" in data:
+                        df = pd.DataFrame(data["candles"])
+                        df["date"] = pd.to_datetime(df["epoch"], unit="s")
+                        df["volume"] = 1.0
+                        candles[symbol] = calcular_indicadores(df)
+                        await train_ml(symbol)
+                        continue
+
+                    if "balance" in data:
+                        current_balance = float(data["balance"]["balance"])
+                        continue
+
+                    if "proposal" in data:
+                        await handle_proposal(ws, data)
+                        continue
+
                     if "buy" in data:
                         cid = data["buy"]["contract_id"]
                         open_trades[symbol][cid] = True
+                        proposal_lock[symbol] = False
+
+                        await ws.send(json.dumps({
+                            "proposal_open_contract": 1,
+                            "contract_id": cid,
+                            "subscribe": 1
+                        }))
                         continue
 
                     if "proposal_open_contract" in data:
@@ -327,15 +347,15 @@ async def ws_loop(symbol):
                             daily_pnl += profit
                             open_trades[symbol].pop(cid, None)
                             proposal_lock[symbol] = False
-                        continue
 
-                    if "proposal" in data:
-                        await handle_proposal(ws, data)
+                            if daily_pnl <= -DAILY_MAX_LOSS:
+                                trading_paused = True
                         continue
 
                     if "ohlc" in data:
+                        c = data["ohlc"]
                         df = candles[symbol]
-                        df = pd.concat([df, pd.DataFrame([data["ohlc"]])]).tail(HISTORY_COUNT)
+                        df = pd.concat([df, pd.DataFrame([c])]).tail(HISTORY_COUNT)
                         df["volume"] = 1.0
                         candles[symbol] = calcular_indicadores(df)
                         await train_ml(symbol)
@@ -360,7 +380,6 @@ async def ws_loop(symbol):
                         await send_proposal(ws, symbol, direction)
 
         except Exception as e:
-            proposal_lock[symbol] = False
             log(f"{symbol} WS erro {e}", "error")
             await asyncio.sleep(5)
 
