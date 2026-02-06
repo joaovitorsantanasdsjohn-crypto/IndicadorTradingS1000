@@ -117,7 +117,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["adx"] = adx.adx()
     df["ret"] = df["close"].pct_change().fillna(0)
 
-    # ===== MANIPULAÇÃO / ESTRUTURA =====
     df["range"] = df["high"] - df["low"]
     df["body"] = abs(df["close"] - df["open"])
     df["upper_wick"] = df["high"] - df[["close", "open"]].max(axis=1)
@@ -307,11 +306,16 @@ async def ws_loop(symbol):
                 last_tick = time.time()
 
                 async for raw in ws:
-                    if time.time() - last_tick > WATCHDOG_TIMEOUT:
-                        log(f"{symbol} Watchdog reconectando...", "warning")
-                        break
 
-                    data = json.loads(raw)
+                    if "candles" in (data := json.loads(raw)):
+                        last_tick = time.time()
+                        df = pd.DataFrame(data["candles"])
+                        df["date"] = pd.to_datetime(df["epoch"], unit="s")
+                        df["volume"] = 1.0
+                        candles[symbol] = calcular_indicadores(df)
+                        await train_ml(symbol)
+                        log(f"{symbol} histórico carregado: {len(df)} velas")
+                        continue
 
                     if "balance" in data:
                         current_balance = float(data["balance"]["balance"])
@@ -324,6 +328,12 @@ async def ws_loop(symbol):
                     if "buy" in data:
                         cid = data["buy"]["contract_id"]
                         open_trades[symbol][cid] = True
+
+                        await ws.send(json.dumps({
+                            "proposal_open_contract": 1,
+                            "contract_id": cid,
+                            "subscribe": 1
+                        }))
                         continue
 
                     if "proposal_open_contract" in data:
