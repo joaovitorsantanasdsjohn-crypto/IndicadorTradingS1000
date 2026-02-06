@@ -60,6 +60,18 @@ WATCHDOG_TIMEOUT = GRANULARITY_SECONDS * 3
 
 
 # ============================================================
+# 🕒 RECONEXÃO INTELIGENTE (NOVO BLOCO)
+# ============================================================
+def get_reconnect_delay():
+    now = datetime.now(timezone.utc)
+    weekday = now.weekday()  # 0=segunda, 6=domingo
+
+    if weekday >= 5:  # sábado ou domingo
+        return 1800  # 30 minutos
+    return 3  # dias úteis
+
+
+# ============================================================
 # 📊 ESTADO GLOBAL
 # ============================================================
 candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
@@ -392,7 +404,9 @@ async def ws_loop(symbol):
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
             proposal_lock[symbol] = False
-            await asyncio.sleep(3)
+            delay = get_reconnect_delay()
+            log(f"{symbol} aguardando {delay} segundos para reconectar...")
+            await asyncio.sleep(delay)
 
 
 # ============================================================
