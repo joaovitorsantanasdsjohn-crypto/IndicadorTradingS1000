@@ -69,7 +69,6 @@ ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 open_trades: Dict[str, Dict] = {s: {} for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
-# 🔒 LOCK REAL POR PAR (evita proposal duplicada)
 proposal_lock: Dict[str, bool] = {s: False for s in SYMBOLS}
 
 daily_pnl = 0.0
@@ -96,7 +95,7 @@ def log(msg, level="info"):
 
 
 # ============================================================
-# 📈 INDICADORES + MANIPULAÇÃO INSTITUCIONAL
+# 📈 INDICADORES
 # ============================================================
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -133,7 +132,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# 🚦 FILTRO DE MERCADO
+# 🚦 FILTRO
 # ============================================================
 def market_is_good(symbol, direction):
     df = candles[symbol]
@@ -220,12 +219,9 @@ def ml_predict(symbol, row):
 
     model, cols = ml_models[symbol]
 
-    if len(model.classes_) < 2:
-        return None
-
     try:
         values = [row[c] for c in cols]
-    except KeyError:
+    except:
         return None
 
     if any(pd.isna(v) for v in values):
@@ -236,7 +232,7 @@ def ml_predict(symbol, row):
 
 
 # ============================================================
-# 💰 TRADES – PROPOSAL → BUY (REQ_ID)
+# 💰 PROPOSAL → BUY
 # ============================================================
 async def send_proposal(ws, symbol, direction):
     global REQ_ID_SEQ
@@ -287,14 +283,21 @@ async def handle_proposal(ws, data):
 
 
 # ============================================================
-# 🌐 LOOP WS
+# 🌐 LOOP WS (BLINDADO)
 # ============================================================
 async def ws_loop(symbol):
-    global daily_pnl, trading_paused, current_balance, current_day
+    global daily_pnl, trading_paused, current_balance
 
     while True:
         try:
-            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+            async with websockets.connect(
+                WS_URL,
+                ping_interval=30,
+                ping_timeout=60,
+                close_timeout=10,
+                max_queue=None
+            ) as ws:
+
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 await ws.recv()
 
@@ -308,8 +311,15 @@ async def ws_loop(symbol):
                     "subscribe": 1
                 }))
 
+                last_message_time = time.time()
+
                 async for raw in ws:
                     data = json.loads(raw)
+                    last_message_time = time.time()
+
+                    if time.time() - last_message_time > 120:
+                        log(f"{symbol} silêncio detectado, reconectando...", "warning")
+                        break
 
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
@@ -381,16 +391,19 @@ async def ws_loop(symbol):
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
-            await asyncio.sleep(5)
+            proposal_lock[symbol] = False
+            await asyncio.sleep(3)
 
 
 # ============================================================
-# 🌍 FLASK KEEP ALIVE
+# 🌍 FLASK
 # ============================================================
 app = Flask(__name__)
+
 @app.route("/")
 def health():
     return "OK", 200
+
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
@@ -401,6 +414,7 @@ def run_flask():
 # ============================================================
 async def main():
     await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
+
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
