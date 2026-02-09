@@ -82,7 +82,7 @@ last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
 proposal_lock: Dict[str, bool] = {s: False for s in SYMBOLS}
 
-# 🔒 LOCK REAL ANTIRACE POR PAR (NOVO)
+# 🔒 LOCK REAL ANTI DUPLICAÇÃO
 symbol_locks: Dict[str, asyncio.Lock] = {s: asyncio.Lock() for s in SYMBOLS}
 
 daily_pnl = 0.0
@@ -246,7 +246,7 @@ def ml_predict(symbol, row):
 
 
 # ============================================================
-# 💰 PROPOSAL → BUY (COM LOCK ANTIDUPLICAÇÃO)
+# 💰 PROPOSAL → BUY
 # ============================================================
 async def send_proposal(ws, symbol, direction):
     global REQ_ID_SEQ
@@ -282,3 +282,151 @@ async def send_proposal(ws, symbol, direction):
             },
             "req_id": req_id
         }))
+
+
+async def handle_proposal(ws, data):
+    req_id = data.get("req_id")
+    if req_id not in pending_proposals:
+        return
+
+    info = pending_proposals.pop(req_id)
+    symbol = info["symbol"]
+
+    await ws.send(json.dumps({
+        "buy": data["proposal"]["id"],
+        "price": STAKE_AMOUNT
+    }))
+
+
+# ============================================================
+# 🌐 LOOP WS
+# ============================================================
+async def ws_loop(symbol):
+    global daily_pnl, trading_paused, current_balance
+
+    while True:
+        try:
+            async with websockets.connect(
+                WS_URL,
+                ping_interval=30,
+                ping_timeout=60,
+                close_timeout=10,
+                max_queue=None
+            ) as ws:
+
+                await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+                await ws.recv()
+
+                await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+                await ws.send(json.dumps({
+                    "ticks_history": symbol,
+                    "granularity": GRANULARITY_SECONDS,
+                    "count": HISTORY_COUNT,
+                    "end": "latest",
+                    "style": "candles",
+                    "subscribe": 1
+                }))
+
+                async for raw in ws:
+                    data = json.loads(raw)
+
+                    if "candles" in data:
+                        df = pd.DataFrame(data["candles"])
+                        df["date"] = pd.to_datetime(df["epoch"], unit="s")
+                        df["volume"] = 1.0
+                        candles[symbol] = calcular_indicadores(df)
+                        await train_ml(symbol)
+                        continue
+
+                    if "balance" in data:
+                        current_balance = float(data["balance"]["balance"])
+                        continue
+
+                    if "proposal" in data:
+                        await handle_proposal(ws, data)
+                        continue
+
+                    if "buy" in data:
+                        cid = data["buy"]["contract_id"]
+                        open_trades[symbol][cid] = True
+                        proposal_lock[symbol] = False
+
+                        await ws.send(json.dumps({
+                            "proposal_open_contract": 1,
+                            "contract_id": cid,
+                            "subscribe": 1
+                        }))
+                        continue
+
+                    if "proposal_open_contract" in data:
+                        poc = data["proposal_open_contract"]
+                        if poc.get("is_sold"):
+                            cid = poc["contract_id"]
+                            profit = float(poc.get("profit", 0))
+                            daily_pnl += profit
+                            open_trades[symbol].pop(cid, None)
+                            proposal_lock[symbol] = False
+
+                            if daily_pnl <= -DAILY_MAX_LOSS:
+                                trading_paused = True
+                        continue
+
+                    if "ohlc" in data:
+                        c = data["ohlc"]
+                        df = candles[symbol]
+                        df = pd.concat([df, pd.DataFrame([c])]).tail(HISTORY_COUNT)
+                        df["volume"] = 1.0
+                        candles[symbol] = calcular_indicadores(df)
+                        await train_ml(symbol)
+
+                        row = candles[symbol].iloc[-1]
+                        prob = ml_predict(symbol, row)
+                        if prob is None:
+                            continue
+
+                        conf = max(prob, 1 - prob)
+                        if conf < ML_CONF_THRESHOLD:
+                            continue
+
+                        direction = "UP" if prob > 0.5 else "DOWN"
+
+                        if not market_is_good(symbol, direction):
+                            continue
+
+                        if trading_paused:
+                            continue
+
+                        await send_proposal(ws, symbol, direction)
+
+        except Exception as e:
+            log(f"{symbol} WS erro {e}", "error")
+            proposal_lock[symbol] = False
+            delay = get_reconnect_delay()
+            log(f"{symbol} aguardando {delay}s para reconectar...")
+            await asyncio.sleep(delay)
+
+
+# ============================================================
+# 🌍 FLASK
+# ============================================================
+app = Flask(__name__)
+
+@app.route("/")
+def health():
+    return "OK", 200
+
+
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+
+
+# ============================================================
+# 🚀 MAIN
+# ============================================================
+async def main():
+    await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
+
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask, daemon=True).start()
+    asyncio.run(main())
