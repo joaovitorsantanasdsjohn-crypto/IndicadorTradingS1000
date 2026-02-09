@@ -60,15 +60,14 @@ WATCHDOG_TIMEOUT = GRANULARITY_SECONDS * 3
 
 
 # ============================================================
-# 🕒 RECONEXÃO INTELIGENTE (NOVO BLOCO)
+# 🕒 RECONEXÃO INTELIGENTE
 # ============================================================
 def get_reconnect_delay():
     now = datetime.now(timezone.utc)
-    weekday = now.weekday()  # 0=segunda, 6=domingo
-
-    if weekday >= 5:  # sábado ou domingo
-        return 1800  # 30 minutos
-    return 3  # dias úteis
+    weekday = now.weekday()
+    if weekday >= 5:
+        return 1800
+    return 3
 
 
 # ============================================================
@@ -80,7 +79,6 @@ ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 
 open_trades: Dict[str, Dict] = {s: {} for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
-
 proposal_lock: Dict[str, bool] = {s: False for s in SYMBOLS}
 
 daily_pnl = 0.0
@@ -286,8 +284,6 @@ async def handle_proposal(ws, data):
         return
 
     info = pending_proposals.pop(req_id)
-    symbol = info["symbol"]
-
     await ws.send(json.dumps({
         "buy": data["proposal"]["id"],
         "price": STAKE_AMOUNT
@@ -295,7 +291,7 @@ async def handle_proposal(ws, data):
 
 
 # ============================================================
-# 🌐 LOOP WS (BLINDADO)
+# 🌐 LOOP WS (COM TIMEOUT REAL)
 # ============================================================
 async def ws_loop(symbol):
     global daily_pnl, trading_paused, current_balance
@@ -323,15 +319,14 @@ async def ws_loop(symbol):
                     "subscribe": 1
                 }))
 
-                last_message_time = time.time()
-
-                async for raw in ws:
-                    data = json.loads(raw)
-                    last_message_time = time.time()
-
-                    if time.time() - last_message_time > 120:
-                        log(f"{symbol} silêncio detectado, reconectando...", "warning")
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=120)
+                    except asyncio.TimeoutError:
+                        log(f"{symbol} timeout real detectado, reconectando...", "warning")
                         break
+
+                    data = json.loads(raw)
 
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
