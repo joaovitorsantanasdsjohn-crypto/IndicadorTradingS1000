@@ -65,9 +65,8 @@ WATCHDOG_TIMEOUT = GRANULARITY_SECONDS * 3
 def get_reconnect_delay():
     now = datetime.now(timezone.utc)
     weekday = now.weekday()
-
     if weekday >= 5:
-        return 1800  # 30 minutos no fim de semana
+        return 1800
     return 3
 
 
@@ -79,9 +78,15 @@ ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
 ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 
 open_trades: Dict[str, Dict] = {s: {} for s in SYMBOLS}
+last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
+
 proposal_lock: Dict[str, bool] = {s: False for s in SYMBOLS}
 
+# 🔒 LOCK REAL ANTIRACE POR PAR (NOVO)
+symbol_locks: Dict[str, asyncio.Lock] = {s: asyncio.Lock() for s in SYMBOLS}
+
 daily_pnl = 0.0
+current_day = datetime.now(timezone.utc).date()
 trading_paused = False
 current_balance = 0.0
 
@@ -101,27 +106,6 @@ logger.addHandler(handler)
 
 def log(msg, level="info"):
     getattr(logger, level)(msg)
-
-
-# ============================================================
-# 🔄 SINCRONIZAÇÃO REAL DE CONTRATOS
-# ============================================================
-async def sync_open_contracts(ws, symbol):
-    global open_trades, proposal_lock
-
-    await ws.send(json.dumps({"portfolio": 1}))
-    response = json.loads(await ws.recv())
-
-    open_trades[symbol].clear()
-
-    if "portfolio" in response and "contracts" in response["portfolio"]:
-        for contract in response["portfolio"]["contracts"]:
-            if contract.get("is_sold") == 0 and contract.get("symbol") == symbol:
-                cid = contract["contract_id"]
-                open_trades[symbol][cid] = True
-
-    if not open_trades[symbol]:
-        proposal_lock[symbol] = False
 
 
 # ============================================================
@@ -147,6 +131,16 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     adx = ADXIndicator(df["high"], df["low"], df["close"], ADX_PERIOD)
     df["adx"] = adx.adx()
+    df["ret"] = df["close"].pct_change().fillna(0)
+
+    df["range"] = df["high"] - df["low"]
+    df["body"] = abs(df["close"] - df["open"])
+    df["upper_wick"] = df["high"] - df[["close", "open"]].max(axis=1)
+    df["lower_wick"] = df[["close", "open"]].min(axis=1) - df["low"]
+    df["wick_ratio"] = (df["upper_wick"] + df["lower_wick"]) / df["range"].replace(0, 1e-9)
+
+    df["range_expansion"] = df["range"] / df["range"].rolling(20).mean()
+    df["volatility_squeeze"] = df["bb_width"] / df["bb_width"].rolling(20).mean()
 
     return df
 
@@ -252,179 +246,39 @@ def ml_predict(symbol, row):
 
 
 # ============================================================
-# 💰 PROPOSAL → BUY
+# 💰 PROPOSAL → BUY (COM LOCK ANTIDUPLICAÇÃO)
 # ============================================================
 async def send_proposal(ws, symbol, direction):
     global REQ_ID_SEQ
 
-    if open_trades[symbol] or proposal_lock[symbol]:
-        return
+    async with symbol_locks[symbol]:
 
-    proposal_lock[symbol] = True
+        if open_trades[symbol] or proposal_lock[symbol]:
+            return
 
-    contract_type = "MULTUP" if direction == "UP" else "MULTDOWN"
+        proposal_lock[symbol] = True
 
-    req_id = REQ_ID_SEQ
-    REQ_ID_SEQ += 1
+        contract_type = "MULTUP" if direction == "UP" else "MULTDOWN"
 
-    pending_proposals[req_id] = {
-        "symbol": symbol,
-        "direction": direction
-    }
+        req_id = REQ_ID_SEQ
+        REQ_ID_SEQ += 1
 
-    await ws.send(json.dumps({
-        "proposal": 1,
-        "amount": STAKE_AMOUNT,
-        "basis": "stake",
-        "contract_type": contract_type,
-        "currency": "USD",
-        "symbol": symbol,
-        "multiplier": MULTIPLIER,
-        "limit_order": {
-            "take_profit": TAKE_PROFIT,
-            "stop_loss": STOP_LOSS
-        },
-        "req_id": req_id
-    }))
+        pending_proposals[req_id] = {
+            "symbol": symbol,
+            "direction": direction
+        }
 
-
-async def handle_proposal(ws, data):
-    req_id = data.get("req_id")
-    if req_id not in pending_proposals:
-        return
-
-    info = pending_proposals.pop(req_id)
-    symbol = info["symbol"]
-
-    await ws.send(json.dumps({
-        "buy": data["proposal"]["id"],
-        "price": STAKE_AMOUNT
-    }))
-
-
-# ============================================================
-# 🌐 LOOP WS
-# ============================================================
-async def ws_loop(symbol):
-    global daily_pnl, trading_paused, current_balance
-
-    while True:
-        try:
-            async with websockets.connect(
-                WS_URL,
-                ping_interval=30,
-                ping_timeout=60,
-                close_timeout=10,
-                max_queue=None
-            ) as ws:
-
-                await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
-                await ws.recv()
-
-                await sync_open_contracts(ws, symbol)
-
-                await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
-                await ws.send(json.dumps({
-                    "ticks_history": symbol,
-                    "granularity": GRANULARITY_SECONDS,
-                    "count": HISTORY_COUNT,
-                    "end": "latest",
-                    "style": "candles",
-                    "subscribe": 1
-                }))
-
-                async for raw in ws:
-                    data = json.loads(raw)
-
-                    if "candles" in data:
-                        df = pd.DataFrame(data["candles"])
-                        df["volume"] = 1.0
-                        candles[symbol] = calcular_indicadores(df)
-                        await train_ml(symbol)
-                        continue
-
-                    if "proposal" in data:
-                        await handle_proposal(ws, data)
-                        continue
-
-                    if "buy" in data:
-                        cid = data["buy"]["contract_id"]
-                        open_trades[symbol][cid] = True
-                        proposal_lock[symbol] = False
-
-                        await ws.send(json.dumps({
-                            "proposal_open_contract": 1,
-                            "contract_id": cid,
-                            "subscribe": 1
-                        }))
-                        continue
-
-                    if "proposal_open_contract" in data:
-                        poc = data["proposal_open_contract"]
-                        if poc.get("is_sold"):
-                            cid = poc["contract_id"]
-                            profit = float(poc.get("profit", 0))
-                            daily_pnl += profit
-                            open_trades[symbol].pop(cid, None)
-                            proposal_lock[symbol] = False
-                        continue
-
-                    if "ohlc" in data:
-                        c = data["ohlc"]
-                        df = candles[symbol]
-                        df = pd.concat([df, pd.DataFrame([c])]).tail(HISTORY_COUNT)
-                        df["volume"] = 1.0
-                        candles[symbol] = calcular_indicadores(df)
-                        await train_ml(symbol)
-
-                        row = candles[symbol].iloc[-1]
-                        prob = ml_predict(symbol, row)
-                        if prob is None:
-                            continue
-
-                        conf = max(prob, 1 - prob)
-                        if conf < ML_CONF_THRESHOLD:
-                            continue
-
-                        direction = "UP" if prob > 0.5 else "DOWN"
-
-                        if not market_is_good(symbol, direction):
-                            continue
-
-                        if trading_paused:
-                            continue
-
-                        await send_proposal(ws, symbol, direction)
-
-        except Exception as e:
-            log(f"{symbol} WS erro {e}", "error")
-            proposal_lock[symbol] = False
-            delay = get_reconnect_delay()
-            log(f"{symbol} aguardando {delay} segundos para reconectar...")
-            await asyncio.sleep(delay)
-
-
-# ============================================================
-# 🌍 FLASK
-# ============================================================
-app = Flask(__name__)
-
-@app.route("/")
-def health():
-    return "OK", 200
-
-
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
-
-
-# ============================================================
-# 🚀 MAIN
-# ============================================================
-async def main():
-    await asyncio.gather(*(ws_loop(s) for s in SYMBOLS))
-
-
-if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.run(main())
+        await ws.send(json.dumps({
+            "proposal": 1,
+            "amount": STAKE_AMOUNT,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": "USD",
+            "symbol": symbol,
+            "multiplier": MULTIPLIER,
+            "limit_order": {
+                "take_profit": TAKE_PROFIT,
+                "stop_loss": STOP_LOSS
+            },
+            "req_id": req_id
+        }))
