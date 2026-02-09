@@ -81,8 +81,6 @@ open_trades: Dict[str, Dict] = {s: {} for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
 proposal_lock: Dict[str, bool] = {s: False for s in SYMBOLS}
-
-# 🔒 LOCK REAL ANTI DUPLICAÇÃO
 symbol_locks: Dict[str, asyncio.Lock] = {s: asyncio.Lock() for s in SYMBOLS}
 
 daily_pnl = 0.0
@@ -92,6 +90,29 @@ current_balance = 0.0
 
 pending_proposals: Dict[int, dict] = {}
 REQ_ID_SEQ = 1
+
+
+# ============================================================
+# 🆕 SINCRONIZAÇÃO REAL DE PORTFÓLIO (BLINDAGEM TOTAL)
+# ============================================================
+async def sync_open_contracts(ws):
+    await ws.send(json.dumps({"portfolio": 1}))
+    response = json.loads(await ws.recv())
+
+    # limpa estado local
+    for s in SYMBOLS:
+        open_trades[s].clear()
+
+    if "portfolio" not in response:
+        return
+
+    for contract in response["portfolio"].get("contracts", []):
+        if contract.get("is_sold"):
+            continue
+        symbol = contract.get("symbol")
+        cid = contract.get("contract_id")
+        if symbol in open_trades:
+            open_trades[symbol][cid] = True
 
 
 # ============================================================
@@ -316,6 +337,9 @@ async def ws_loop(symbol):
 
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 await ws.recv()
+
+                # 🔒 sincroniza contratos ativos após qualquer conexão
+                await sync_open_contracts(ws)
 
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
                 await ws.send(json.dumps({
