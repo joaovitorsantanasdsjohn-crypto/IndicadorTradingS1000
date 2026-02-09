@@ -65,8 +65,9 @@ WATCHDOG_TIMEOUT = GRANULARITY_SECONDS * 3
 def get_reconnect_delay():
     now = datetime.now(timezone.utc)
     weekday = now.weekday()
+
     if weekday >= 5:
-        return 1800
+        return 1800  # 30 minutos no fim de semana
     return 3
 
 
@@ -78,11 +79,9 @@ ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
 ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 
 open_trades: Dict[str, Dict] = {s: {} for s in SYMBOLS}
-last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 proposal_lock: Dict[str, bool] = {s: False for s in SYMBOLS}
 
 daily_pnl = 0.0
-current_day = datetime.now(timezone.utc).date()
 trading_paused = False
 current_balance = 0.0
 
@@ -102,6 +101,27 @@ logger.addHandler(handler)
 
 def log(msg, level="info"):
     getattr(logger, level)(msg)
+
+
+# ============================================================
+# 🔄 SINCRONIZAÇÃO REAL DE CONTRATOS
+# ============================================================
+async def sync_open_contracts(ws, symbol):
+    global open_trades, proposal_lock
+
+    await ws.send(json.dumps({"portfolio": 1}))
+    response = json.loads(await ws.recv())
+
+    open_trades[symbol].clear()
+
+    if "portfolio" in response and "contracts" in response["portfolio"]:
+        for contract in response["portfolio"]["contracts"]:
+            if contract.get("is_sold") == 0 and contract.get("symbol") == symbol:
+                cid = contract["contract_id"]
+                open_trades[symbol][cid] = True
+
+    if not open_trades[symbol]:
+        proposal_lock[symbol] = False
 
 
 # ============================================================
@@ -127,16 +147,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     adx = ADXIndicator(df["high"], df["low"], df["close"], ADX_PERIOD)
     df["adx"] = adx.adx()
-    df["ret"] = df["close"].pct_change().fillna(0)
-
-    df["range"] = df["high"] - df["low"]
-    df["body"] = abs(df["close"] - df["open"])
-    df["upper_wick"] = df["high"] - df[["close", "open"]].max(axis=1)
-    df["lower_wick"] = df[["close", "open"]].min(axis=1) - df["low"]
-    df["wick_ratio"] = (df["upper_wick"] + df["lower_wick"]) / df["range"].replace(0, 1e-9)
-
-    df["range_expansion"] = df["range"] / df["range"].rolling(20).mean()
-    df["volatility_squeeze"] = df["bb_width"] / df["bb_width"].rolling(20).mean()
 
     return df
 
@@ -284,6 +294,8 @@ async def handle_proposal(ws, data):
         return
 
     info = pending_proposals.pop(req_id)
+    symbol = info["symbol"]
+
     await ws.send(json.dumps({
         "buy": data["proposal"]["id"],
         "price": STAKE_AMOUNT
@@ -291,7 +303,7 @@ async def handle_proposal(ws, data):
 
 
 # ============================================================
-# 🌐 LOOP WS (COM TIMEOUT REAL)
+# 🌐 LOOP WS
 # ============================================================
 async def ws_loop(symbol):
     global daily_pnl, trading_paused, current_balance
@@ -309,6 +321,8 @@ async def ws_loop(symbol):
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 await ws.recv()
 
+                await sync_open_contracts(ws, symbol)
+
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
                 await ws.send(json.dumps({
                     "ticks_history": symbol,
@@ -319,25 +333,14 @@ async def ws_loop(symbol):
                     "subscribe": 1
                 }))
 
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=120)
-                    except asyncio.TimeoutError:
-                        log(f"{symbol} timeout real detectado, reconectando...", "warning")
-                        break
-
+                async for raw in ws:
                     data = json.loads(raw)
 
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
-                        df["date"] = pd.to_datetime(df["epoch"], unit="s")
                         df["volume"] = 1.0
                         candles[symbol] = calcular_indicadores(df)
                         await train_ml(symbol)
-                        continue
-
-                    if "balance" in data:
-                        current_balance = float(data["balance"]["balance"])
                         continue
 
                     if "proposal" in data:
@@ -364,9 +367,6 @@ async def ws_loop(symbol):
                             daily_pnl += profit
                             open_trades[symbol].pop(cid, None)
                             proposal_lock[symbol] = False
-
-                            if daily_pnl <= -DAILY_MAX_LOSS:
-                                trading_paused = True
                         continue
 
                     if "ohlc" in data:
