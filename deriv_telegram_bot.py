@@ -202,9 +202,9 @@ def build_ml_dataset(df):
     sl_pct = STOP_LOSS / (STAKE_AMOUNT * MULTIPLIER)
 
     targets = []
-    for i in range(len(df) - 6):
+    for i in range(len(df) - 10):
         entry = df.iloc[i]["close"]
-        future = df.iloc[i+1:i+6]
+        future = df.iloc[i+1:i+10]
 
         hit_tp = (future["high"] >= entry * (1 + tp_pct)).any()
         hit_sl = (future["low"] <= entry * (1 - sl_pct)).any()
