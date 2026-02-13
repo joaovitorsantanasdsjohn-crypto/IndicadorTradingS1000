@@ -56,18 +56,7 @@ STOP_LOSS = 0.2
 TRADE_COOLDOWN_SECONDS = 25
 DAILY_MAX_LOSS = 2.0
 
-WATCHDOG_TIMEOUT = GRANULARITY_SECONDS * 3
-
-
-# ============================================================
-# 🕒 RECONEXÃO INTELIGENTE
-# ============================================================
-def get_reconnect_delay():
-    now = datetime.now(timezone.utc)
-    weekday = now.weekday()
-    if weekday >= 5:
-        return 1800
-    return 3
+WATCHDOG_TIMEOUT = 1200  # 20 minutos
 
 
 # ============================================================
@@ -79,6 +68,7 @@ ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 
 open_trades: Dict[str, Dict] = {s: {} for s in SYMBOLS}
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
+last_activity_time: Dict[str, float] = {s: time.time() for s in SYMBOLS}
 
 proposal_lock: Dict[str, bool] = {s: False for s in SYMBOLS}
 symbol_locks: Dict[str, asyncio.Lock] = {s: asyncio.Lock() for s in SYMBOLS}
@@ -93,13 +83,39 @@ REQ_ID_SEQ = 1
 
 
 # ============================================================
-# 🆕 SINCRONIZAÇÃO REAL DE PORTFÓLIO (BLINDAGEM TOTAL)
+# 📝 LOG
+# ============================================================
+logger = logging.getLogger("DerivBot")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.handlers.clear()
+logger.addHandler(handler)
+
+def log(msg, level="info"):
+    getattr(logger, level)(msg)
+
+
+# ============================================================
+# 🔄 RESET DIÁRIO
+# ============================================================
+def check_daily_reset():
+    global current_day, daily_pnl, trading_paused
+    today = datetime.now(timezone.utc).date()
+    if today != current_day:
+        log("🔄 Reset diário executado")
+        current_day = today
+        daily_pnl = 0.0
+        trading_paused = False
+
+
+# ============================================================
+# 🆕 SINCRONIZAÇÃO PORTFÓLIO
 # ============================================================
 async def sync_open_contracts(ws):
     await ws.send(json.dumps({"portfolio": 1}))
     response = json.loads(await ws.recv())
 
-    # limpa estado local
     for s in SYMBOLS:
         open_trades[s].clear()
 
@@ -113,20 +129,6 @@ async def sync_open_contracts(ws):
         cid = contract.get("contract_id")
         if symbol in open_trades:
             open_trades[symbol][cid] = True
-
-
-# ============================================================
-# 📝 LOG
-# ============================================================
-logger = logging.getLogger("DerivBot")
-logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-logger.handlers.clear()
-logger.addHandler(handler)
-
-def log(msg, level="info"):
-    getattr(logger, level)(msg)
 
 
 # ============================================================
@@ -167,7 +169,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# 🚦 FILTRO
+# 🚦 FILTRO DE MERCADO
 # ============================================================
 def market_is_good(symbol, direction):
     df = candles[symbol]
@@ -274,7 +276,13 @@ async def send_proposal(ws, symbol, direction):
 
     async with symbol_locks[symbol]:
 
+        if not TRADE_ENABLED:
+            return
+
         if open_trades[symbol] or proposal_lock[symbol]:
+            return
+
+        if time.time() - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
             return
 
         proposal_lock[symbol] = True
@@ -329,16 +337,15 @@ async def ws_loop(symbol):
         try:
             async with websockets.connect(
                 WS_URL,
-                ping_interval=30,
-                ping_timeout=60,
-                close_timeout=10,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5,
                 max_queue=None
             ) as ws:
 
                 await ws.send(json.dumps({"authorize": DERIV_TOKEN}))
                 await ws.recv()
 
-                # 🔒 sincroniza contratos ativos após qualquer conexão
                 await sync_open_contracts(ws)
 
                 await ws.send(json.dumps({"balance": 1, "subscribe": 1}))
@@ -352,6 +359,9 @@ async def ws_loop(symbol):
                 }))
 
                 async for raw in ws:
+                    last_activity_time[symbol] = time.time()
+                    check_daily_reset()
+
                     data = json.loads(raw)
 
                     if "candles" in data:
@@ -374,6 +384,7 @@ async def ws_loop(symbol):
                         cid = data["buy"]["contract_id"]
                         open_trades[symbol][cid] = True
                         proposal_lock[symbol] = False
+                        last_trade_time[symbol] = time.time()
 
                         await ws.send(json.dumps({
                             "proposal_open_contract": 1,
@@ -425,9 +436,7 @@ async def ws_loop(symbol):
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
             proposal_lock[symbol] = False
-            delay = get_reconnect_delay()
-            log(f"{symbol} aguardando {delay}s para reconectar...")
-            await asyncio.sleep(delay)
+            await asyncio.sleep(3)
 
 
 # ============================================================
