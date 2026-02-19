@@ -146,44 +146,62 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
+
     df["rsi"] = RSIIndicator(df["close"], RSI_PERIOD).rsi()
-    df["mfi"] = MFIIndicator(df["high"], df["low"], df["close"], df["volume"], MFI_PERIOD).money_flow_index()
+    df["mfi"] = MFIIndicator(
+        df["high"], df["low"], df["close"], df["volume"], MFI_PERIOD
+    ).money_flow_index()
 
     bb = BollingerBands(df["close"], BB_PERIOD, BB_STD)
-    df["bb_width"] = (bb.bollinger_hband() - bb.bollinger_lband()) / df["close"]
+    df["bb_width"] = (
+        bb.bollinger_hband() - bb.bollinger_lband()
+    ) / df["close"]
 
     adx = ADXIndicator(df["high"], df["low"], df["close"], ADX_PERIOD)
     df["adx"] = adx.adx()
+
     df["ret"] = df["close"].pct_change().fillna(0)
 
     df["range"] = df["high"] - df["low"]
     df["body"] = abs(df["close"] - df["open"])
-    df["upper_wick"] = df["high"] - df[["close", "open"]].max(axis=1)
-    df["lower_wick"] = df[["close", "open"]].min(axis=1) - df["low"]
-    df["wick_ratio"] = (df["upper_wick"] + df["lower_wick"]) / df["range"].replace(0, 1e-9)
 
-    df["range_expansion"] = df["range"] / df["range"].rolling(20).mean()
-    df["volatility_squeeze"] = df["bb_width"] / df["bb_width"].rolling(20).mean()
+    df["upper_wick"] = df["high"] - df[["close","open"]].max(axis=1)
+    df["lower_wick"] = df[["close","open"]].min(axis=1) - df["low"]
 
-# =============================
-# 🔵 FEATURES DE ESTRUTURA
-# =============================
+    df["wick_ratio"] = (
+        df["upper_wick"] + df["lower_wick"]
+    ) / df["range"].replace(0, 1e-9)
 
-# Distância percentual até EMA lenta (regime)
-df["dist_ema_slow"] = (df["close"] - df["ema_slow"]) / df["ema_slow"]
+    df["range_expansion"] = (
+        df["range"] / df["range"].rolling(20).mean()
+    )
 
-# Inclinação da EMA lenta (força estrutural)
-df["ema_slow_slope"] = df["ema_slow"].diff()
+    df["volatility_squeeze"] = (
+        df["bb_width"] / df["bb_width"].rolling(20).mean()
+    )
 
-# Distância até topo/fundo recente (micro estrutura)
-df["rolling_high_20"] = df["high"].rolling(20).max()
-df["rolling_low_20"] = df["low"].rolling(20).min()
+    # =====================================
+    # ✅ FEATURES DE ESTRUTURA (CORRETO)
+    # =====================================
 
-df["dist_top"] = (df["rolling_high_20"] - df["close"]) / df["close"]
-df["dist_bottom"] = (df["close"] - df["rolling_low_20"]) / df["close"]
+    df["dist_ema_slow"] = (
+        df["close"] - df["ema_slow"]
+    ) / df["ema_slow"]
+
+    df["ema_slow_slope"] = df["ema_slow"].diff()
+
+    df["rolling_high_20"] = df["high"].rolling(20).max()
+    df["rolling_low_20"] = df["low"].rolling(20).min()
+
+    df["dist_top"] = (
+        df["rolling_high_20"] - df["close"]
+    ) / df["close"]
+
+    df["dist_bottom"] = (
+        df["close"] - df["rolling_low_20"]
+    ) / df["close"]
 
     return df
-
 
 # ============================================================
 # 🚦 FILTRO DE MERCADO
