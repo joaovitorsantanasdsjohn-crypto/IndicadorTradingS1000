@@ -46,7 +46,7 @@ BB_STD = 2.3
 
 ML_ENABLED = True and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = 500
-ML_CONF_THRESHOLD = 0.65
+ML_CONF_THRESHOLD = 0.70
 
 TRADE_ENABLED = True
 STAKE_AMOUNT = 1.0
@@ -164,6 +164,23 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     df["range_expansion"] = df["range"] / df["range"].rolling(20).mean()
     df["volatility_squeeze"] = df["bb_width"] / df["bb_width"].rolling(20).mean()
+
+    # =============================
+# 🔵 FEATURES DE ESTRUTURA
+# =============================
+
+# Distância percentual até EMA lenta (regime)
+df["dist_ema_slow"] = (df["close"] - df["ema_slow"]) / df["ema_slow"]
+
+# Inclinação da EMA lenta (força estrutural)
+df["ema_slow_slope"] = df["ema_slow"].diff()
+
+# Distância até topo/fundo recente (micro estrutura)
+df["rolling_high_20"] = df["high"].rolling(20).max()
+df["rolling_low_20"] = df["low"].rolling(20).min()
+
+df["dist_top"] = (df["rolling_high_20"] - df["close"]) / df["close"]
+df["dist_bottom"] = (df["close"] - df["rolling_low_20"]) / df["close"]
 
     return df
 
