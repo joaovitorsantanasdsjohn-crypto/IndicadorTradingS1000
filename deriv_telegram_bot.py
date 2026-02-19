@@ -165,7 +165,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["range_expansion"] = df["range"] / df["range"].rolling(20).mean()
     df["volatility_squeeze"] = df["bb_width"] / df["bb_width"].rolling(20).mean()
 
-    # =============================
+# =============================
 # 🔵 FEATURES DE ESTRUTURA
 # =============================
 
