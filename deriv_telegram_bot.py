@@ -225,6 +225,23 @@ def market_is_good(symbol, direction):
         return False
 
     return True
+    def market_is_exploding(symbol):
+    df = candles[symbol]
+
+    if len(df) < 30:
+        return False
+
+    row = df.iloc[-1]
+
+    # candle muito maior que média recente
+    if row.get("range_expansion", 1) > 2.2:
+        return True
+
+    # banda abrindo rápido demais
+    if row.get("volatility_squeeze", 1) > 1.8:
+        return True
+
+    return False
 
 
 # ============================================================
@@ -319,6 +336,8 @@ async def send_proposal(ws, symbol, direction):
 
         if time.time() - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
             return
+            if market_is_exploding(symbol):
+    return
 
         proposal_lock[symbol] = True
 
