@@ -338,7 +338,8 @@ async def send_proposal(ws, symbol, direction):
         if time.time() - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
             return
             
-        if market_is_exploding(symbol): return
+        if market_is_exploding(symbol): 
+            return
 
         proposal_lock[symbol] = True
 
