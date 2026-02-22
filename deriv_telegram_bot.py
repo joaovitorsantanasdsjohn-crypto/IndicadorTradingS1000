@@ -226,7 +226,7 @@ def market_is_good(symbol, direction):
 
     return True
     
-    def market_is_exploding(symbol):
+def market_is_exploding(symbol):
     
     df = candles[symbol]
 
