@@ -343,6 +343,7 @@ async def send_proposal(ws, symbol, direction):
             return
 
         proposal_lock[symbol] = True
+        proposal_lock_time[symbol] = time.time()
 
         contract_type = "MULTUP" if direction == "UP" else "MULTDOWN"
 
