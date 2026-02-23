@@ -147,6 +147,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_fast"] = EMAIndicator(df["close"], EMA_FAST).ema_indicator()
     df["ema_mid"] = EMAIndicator(df["close"], EMA_MID).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], EMA_SLOW).ema_indicator()
+    df["ema_200"] = EMAIndicator(df["close"], 200).ema_indicator()
 
     df["rsi"] = RSIIndicator(df["close"], RSI_PERIOD).rsi()
     df["mfi"] = MFIIndicator(
