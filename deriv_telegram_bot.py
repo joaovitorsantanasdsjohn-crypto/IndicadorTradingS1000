@@ -191,7 +191,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     ) / df["ema_slow"]
     
     df["dist_ema_200"] = (
-    df["close"] - df["ema_200"]
+        df["close"] - df["ema_200"]
     ) / df["ema_200"]
     
     df["ema_200_slope"] = df["ema_200"].diff()
