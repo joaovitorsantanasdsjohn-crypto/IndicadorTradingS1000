@@ -420,7 +420,7 @@ async def ws_loop(symbol):
                 async for raw in ws:
                     
                     last_activity_time[symbol] = time.time()
-    check_daily_reset()
+                    check_daily_reset()
 
                     # 🔓 auto reset proposal lock travado
                     if proposal_lock[symbol]:
