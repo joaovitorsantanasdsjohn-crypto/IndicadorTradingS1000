@@ -419,16 +419,16 @@ async def ws_loop(symbol):
 
                 async for raw in ws:
 
-                last_activity_time[symbol] = time.time()
-                check_daily_reset()
+    last_activity_time[symbol] = time.time()
+    check_daily_reset()
 
     # 🔓 auto reset proposal lock travado
-                    if proposal_lock[symbol]:
-                    if time.time() - proposal_lock_time.get(symbol, 0) > 60:
-                    proposal_lock[symbol] = False
-                    log(f"{symbol} proposal lock reset automático")
+    if proposal_lock[symbol]:
+        if time.time() - proposal_lock_time.get(symbol, 0) > 60:
+            proposal_lock[symbol] = False
+            log(f"{symbol} proposal lock reset automático")
 
-                    data = json.loads(raw)
+    data = json.loads(raw)
 
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
