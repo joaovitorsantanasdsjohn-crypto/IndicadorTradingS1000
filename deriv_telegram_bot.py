@@ -417,6 +417,7 @@ async def ws_loop(symbol):
                 }))
 
                 async for raw in ws:
+
     last_activity_time[symbol] = time.time()
     check_daily_reset()
 
