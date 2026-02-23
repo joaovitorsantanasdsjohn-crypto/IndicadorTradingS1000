@@ -425,7 +425,7 @@ async def ws_loop(symbol):
                     # 🔓 auto reset proposal lock travado
                     if proposal_lock[symbol]:
                         if time.time() - proposal_lock_time.get(symbol, 0) > 60:
-                       proposal_lock[symbol] = False
+                         proposal_lock[symbol] = False
                          log(f"{symbol} proposal lock reset automático")
 
                     data = json.loads(raw)
