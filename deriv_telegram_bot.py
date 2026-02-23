@@ -71,6 +71,7 @@ last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 last_activity_time: Dict[str, float] = {s: time.time() for s in SYMBOLS}
 
 proposal_lock: Dict[str, bool] = {s: False for s in SYMBOLS}
+proposal_lock_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 symbol_locks: Dict[str, asyncio.Lock] = {s: asyncio.Lock() for s in SYMBOLS}
 
 daily_pnl = 0.0
