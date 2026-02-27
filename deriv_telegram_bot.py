@@ -402,6 +402,9 @@ async def handle_proposal(ws, data):
     if req_id not in pending_proposals:
         return
 
+    # 🔥 REMOVE IMEDIATAMENTE PARA EVITAR DUPLICAÇÃO
+    pending_proposals.pop(req_id, None)
+
     await ws.send(json.dumps({
         "buy": data["proposal"]["id"],
         "price": STAKE_AMOUNT
