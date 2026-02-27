@@ -427,7 +427,6 @@ async def handle_proposal(ws,data):
         "price":STAKE_AMOUNT
     }))
 
-
 # ============================================================
 # 🌐 LOOP WS
 # ============================================================
@@ -515,7 +514,24 @@ async def ws_loop(symbol):
 
                         conf=max(prob,1-prob)
 
-                        if conf<0.65:
+                        # ===================================================
+                        # ✅ CONFIANÇA DINÂMICA BASEADA EM REGIME
+                        # ===================================================
+
+                        if row["adx"] >= 30:
+                            dynamic_threshold = 0.58   # tendência forte
+                        elif row["adx"] >= 24:
+                            dynamic_threshold = 0.63   # tendência saudável
+                        elif row["adx"] >= 18:
+                            dynamic_threshold = 0.68   # mercado neutro
+                        else:
+                            dynamic_threshold = 0.72   # lateral perigoso
+
+                        # volatilidade extrema → exige mais confiança
+                        if row["range_expansion"] > 1.6:
+                            dynamic_threshold += 0.03
+
+                        if conf < dynamic_threshold:
                             continue
 
                         trend_up=row["ema_fast"]>row["ema_slow"]>row["ema200"]
@@ -587,8 +603,8 @@ async def ws_loop(symbol):
             proposal_lock[symbol]=False
 
             await asyncio.sleep(3)
-
-
+                        
+                            
 # ============================================================
 # 🌍 FLASK
 # ============================================================
