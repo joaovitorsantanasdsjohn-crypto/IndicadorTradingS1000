@@ -417,6 +417,7 @@ async def ws_loop(symbol):
 
                 async for raw in ws:
 
+                    # ================= WATCHDOG =================
                     if time.time() - last_activity_time[symbol] > WATCHDOG_TIMEOUT:
                         log(f"{symbol} watchdog reiniciando conexão")
                         raise Exception("Watchdog timeout")
@@ -424,17 +425,14 @@ async def ws_loop(symbol):
                     last_activity_time[symbol] = time.time()
                     check_daily_reset()
 
-                    if proposal_lock[symbol]:
-                        if time.time() - proposal_lock_time.get(symbol, 0) > 60:
-                            proposal_lock[symbol] = False
-                            log(f"{symbol} proposal lock reset automático")
-
                     data = json.loads(raw)
 
+                    # ================= HISTÓRICO =================
                     if "candles" in data:
                         df = pd.DataFrame(data["candles"])
                         df["date"] = pd.to_datetime(df["epoch"], unit="s")
                         df["volume"] = 1.0
+
                         candles[symbol] = calcular_indicadores(df)
 
                         asyncio.create_task(
@@ -442,14 +440,19 @@ async def ws_loop(symbol):
                         )
                         continue
 
+                    # ================= BALANCE =================
                     if "balance" in data:
-                        current_balance = float(data["balance"]["balance"])
+                        current_balance = float(
+                            data["balance"]["balance"]
+                        )
                         continue
 
+                    # ================= PROPOSAL =================
                     if "proposal" in data:
                         await handle_proposal(ws, data)
                         continue
 
+                    # ================= BUY CONFIRM =================
                     if "buy" in data:
                         cid = data["buy"]["contract_id"]
 
@@ -464,6 +467,7 @@ async def ws_loop(symbol):
                         }))
                         continue
 
+                    # ================= CONTRACT UPDATE =================
                     if "proposal_open_contract" in data:
 
                         poc = data["proposal_open_contract"]
@@ -471,10 +475,14 @@ async def ws_loop(symbol):
                         if poc.get("is_sold"):
                             cid = poc["contract_id"]
 
-                            profit = float(poc.get("profit", 0))
+                            profit = float(
+                                poc.get("profit", 0)
+                            )
+
                             daily_pnl += profit
 
                             open_trades[symbol].pop(cid, None)
+
                             proposal_lock[symbol] = False
 
                             if daily_pnl <= -DAILY_MAX_LOSS:
@@ -482,12 +490,16 @@ async def ws_loop(symbol):
 
                         continue
 
+                    # ================= NOVA VELA =================
                     if "ohlc" in data:
 
                         c = data["ohlc"]
 
                         df = candles[symbol]
-                        df = pd.concat([df, pd.DataFrame([c])]).tail(HISTORY_COUNT)
+                        df = pd.concat(
+                            [df, pd.DataFrame([c])]
+                        ).tail(HISTORY_COUNT)
+
                         df["volume"] = 1.0
 
                         candles[symbol] = calcular_indicadores(df)
@@ -495,6 +507,7 @@ async def ws_loop(symbol):
                         row = candles[symbol].iloc[-1]
 
                         prob = ml_predict(symbol, row)
+
                         if prob is None:
                             continue
 
@@ -503,19 +516,26 @@ async def ws_loop(symbol):
                         if conf < ML_CONF_THRESHOLD:
                             continue
 
-                        direction = "UP" if prob > 0.5 else "DOWN"
-
                         if trading_paused:
                             continue
 
-                        await send_proposal(ws, symbol, direction)
+                        direction = (
+                            "UP" if prob > 0.5 else "DOWN"
+                        )
+
+                        await send_proposal(
+                            ws,
+                            symbol,
+                            direction
+                        )
 
         except Exception as e:
             log(f"{symbol} WS erro {e}", "error")
+
             proposal_lock[symbol] = False
+
             await asyncio.sleep(3)
-
-
+            
 # ============================================================
 # 🌍 FLASK
 # ============================================================
