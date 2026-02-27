@@ -397,9 +397,9 @@ async def ws_loop(symbol):
         try:
             async with websockets.connect(
                 WS_URL,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=5,
+                ping_interval=60,
+                ping_timeout=60,
+                close_timeout=10,
                 max_queue=None
             ) as ws:
 
