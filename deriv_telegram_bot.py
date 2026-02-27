@@ -129,23 +129,39 @@ def check_daily_reset():
 # ============================================================
 
 async def sync_open_contracts(ws):
+
     await ws.send(json.dumps({"portfolio": 1}))
     response = json.loads(await ws.recv())
 
+    # limpa estado local
     for s in SYMBOLS:
         open_trades[s].clear()
 
     if "portfolio" not in response:
+        # se não veio portfolio, libera trava
+        for s in SYMBOLS:
+            pending_buy_symbol[s] = False
+            proposal_lock[s] = False
         return
+
+    active_symbols = set()
 
     for contract in response["portfolio"].get("contracts", []):
         if contract.get("is_sold"):
             continue
+
         symbol = contract.get("symbol")
         cid = contract.get("contract_id")
+
         if symbol in open_trades:
             open_trades[symbol][cid] = True
+            active_symbols.add(symbol)
 
+    # 🔐 sincroniza estado corretamente
+    for s in SYMBOLS:
+        if s not in active_symbols:
+            pending_buy_symbol[s] = False
+            proposal_lock[s] = False
 
 # ============================================================
 # 📈 INDICADORES
