@@ -182,10 +182,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         df["bb_width"] / df["bb_width"].rolling(20).mean()
     )
 
-    # =====================================
-    # ✅ FEATURES DE ESTRUTURA (CORRETO)
-    # =====================================
-
     df["dist_ema_slow"] = (
         df["close"] - df["ema_slow"]
     ) / df["ema_slow"]
@@ -195,7 +191,6 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     ) / df["ema_200"]
     
     df["ema_200_slope"] = df["ema_200"].diff()
-
     df["ema_slow_slope"] = df["ema_slow"].diff()
 
     df["rolling_high_20"] = df["high"].rolling(20).max()
@@ -210,6 +205,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     ) / df["close"]
 
     return df
+
 
 # ============================================================
 # 🚦 FILTRO DE MERCADO
@@ -234,8 +230,8 @@ def market_is_good(symbol, direction):
 
     return True
     
+
 def market_is_exploding(symbol):
-    
     df = candles[symbol]
 
     if len(df) < 30:
@@ -243,11 +239,9 @@ def market_is_exploding(symbol):
 
     row = df.iloc[-1]
 
-    # candle muito maior que média recente
     if row.get("range_expansion", 1) > 2.2:
         return True
 
-    # banda abrindo rápido demais
     if row.get("volatility_squeeze", 1) > 1.8:
         return True
 
@@ -425,15 +419,20 @@ async def ws_loop(symbol):
                 }))
 
                 async for raw in ws:
-                    
+
+                    # WATCHDOG ADICIONADO (única alteração)
+                    if time.time() - last_activity_time[symbol] > WATCHDOG_TIMEOUT:
+                        log(f"{symbol} watchdog reiniciando conexão")
+                        raise Exception("Watchdog timeout")
+
                     last_activity_time[symbol] = time.time()
                     check_daily_reset()
 
                     # 🔓 auto reset proposal lock travado
                     if proposal_lock[symbol]:
                         if time.time() - proposal_lock_time.get(symbol, 0) > 60:
-                              proposal_lock[symbol] = False
-                              log(f"{symbol} proposal lock reset automático")
+                            proposal_lock[symbol] = False
+                            log(f"{symbol} proposal lock reset automático")
 
                     data = json.loads(raw)
 
