@@ -334,21 +334,24 @@ async def send_proposal(ws, symbol, direction):
         if not TRADE_ENABLED:
             return
 
-        # BLOQUEIO ESTRUTURAL FORTE — impede duplicação
-        # Não permite nova ordem se já houver contrato aberto
+        # 🚫 já existe trade OU compra pendente
         if len(open_trades[symbol]) > 0:
             return
 
-        # Não permite nova ordem se já houver proposal pendente
+        if pending_buy_symbol[symbol]:
+            return
+
         if proposal_lock[symbol]:
             return
 
-        # Cooldown entre trades
         if time.time() - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
             return
 
         proposal_lock[symbol] = True
         proposal_lock_time[symbol] = time.time()
+
+        # 🔒 trava estrutural
+        pending_buy_symbol[symbol] = True
 
         contract_type = "MULTUP" if direction == "UP" else "MULTDOWN"
 
@@ -377,13 +380,11 @@ async def send_proposal(ws, symbol, direction):
 
 
 async def handle_proposal(ws, data):
+
     req_id = data.get("req_id")
 
     if req_id not in pending_proposals:
         return
-
-    info = pending_proposals.pop(req_id)
-    symbol = info["symbol"]
 
     await ws.send(json.dumps({
         "buy": data["proposal"]["id"],
