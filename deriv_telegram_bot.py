@@ -65,17 +65,27 @@ WATCHDOG_TIMEOUT = 1200  # 20 minutos
 # ============================================================
 
 candles: Dict[str, pd.DataFrame] = {s: pd.DataFrame() for s in SYMBOLS}
+
 ml_models: Dict[str, Tuple["RandomForestClassifier", list]] = {}
 ml_model_ready: Dict[str, bool] = {s: False for s in SYMBOLS}
 last_ml_train: Dict[str, float] = {s: 0 for s in SYMBOLS}
 
 open_trades: Dict[str, Dict] = {s: {} for s in SYMBOLS}
+
+# 🔒 impede duplicação estrutural
+pending_buy_symbol: Dict[str, bool] = {
+    s: False for s in SYMBOLS
+}
+
 last_trade_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
 last_activity_time: Dict[str, float] = {s: time.time() for s in SYMBOLS}
 
 proposal_lock: Dict[str, bool] = {s: False for s in SYMBOLS}
 proposal_lock_time: Dict[str, float] = {s: 0 for s in SYMBOLS}
-symbol_locks: Dict[str, asyncio.Lock] = {s: asyncio.Lock() for s in SYMBOLS}
+
+symbol_locks: Dict[str, asyncio.Lock] = {
+    s: asyncio.Lock() for s in SYMBOLS
+}
 
 daily_pnl = 0.0
 current_day = datetime.now(timezone.utc).date()
@@ -84,7 +94,6 @@ current_balance = 0.0
 
 pending_proposals: Dict[int, dict] = {}
 REQ_ID_SEQ = 1
-
 
 # ============================================================
 # 📝 LOG
