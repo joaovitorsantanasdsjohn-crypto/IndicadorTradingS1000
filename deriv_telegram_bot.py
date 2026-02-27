@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, ADXIndicator
 from ta.volatility import BollingerBands
+from ta.volume import MFIIndicator
 
 try:
     from sklearn.ensemble import RandomForestClassifier
@@ -32,7 +33,6 @@ load_dotenv()
 
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
-
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 SYMBOLS = ["frxEURUSD","frxUSDJPY","frxGBPUSD","frxAUDUSD"]
@@ -40,11 +40,8 @@ SYMBOLS = ["frxEURUSD","frxUSDJPY","frxGBPUSD","frxAUDUSD"]
 GRANULARITY_SECONDS = 900
 HISTORY_COUNT = 2000
 
-EMA_FAST = 9
-EMA_SLOW = 55
-
 ML_ENABLED = True and SKLEARN_AVAILABLE
-ML_MIN_TRAINED_SAMPLES = 700
+ML_MIN_TRAINED_SAMPLES = 800
 
 STAKE_AMOUNT = 1.0
 MULTIPLIER = 100
@@ -86,6 +83,7 @@ REQ_ID_SEQ=1
 
 daily_pnl=0
 trading_paused=False
+current_day = datetime.now(timezone.utc).date()
 
 
 # ============================================================
@@ -96,15 +94,75 @@ logger=logging.getLogger("BOT")
 logger.setLevel(logging.INFO)
 
 handler=logging.StreamHandler()
-handler.setFormatter(
-logging.Formatter("%(asctime)s | %(message)s")
-)
+handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
 
 logger.handlers.clear()
 logger.addHandler(handler)
 
 def log(msg):
     logger.info(msg)
+
+
+# ============================================================
+# 🔄 RESET DIÁRIO
+# ============================================================
+
+def check_daily_reset():
+
+    global current_day, daily_pnl, trading_paused
+
+    today = datetime.now(timezone.utc).date()
+
+    if today != current_day:
+
+        log("RESET DIARIO")
+
+        current_day = today
+        daily_pnl = 0
+        trading_paused = False
+
+        for s in SYMBOLS:
+            loss_streak[s] = 0
+            loss_pause_until[s] = 0
+
+
+# ============================================================
+# 🔁 SINCRONIZAÇÃO PORTFOLIO
+# ============================================================
+
+async def sync_open_contracts(ws):
+
+    await ws.send(json.dumps({"portfolio":1}))
+    response=json.loads(await ws.recv())
+
+    for s in SYMBOLS:
+        open_trades[s].clear()
+
+    if "portfolio" not in response:
+
+        for s in SYMBOLS:
+            pending_buy_symbol[s]=False
+            proposal_lock[s]=False
+        return
+
+    active=set()
+
+    for c in response["portfolio"].get("contracts",[]):
+
+        if c.get("is_sold"):
+            continue
+
+        symbol=c.get("symbol")
+        cid=c.get("contract_id")
+
+        if symbol in open_trades:
+            open_trades[symbol][cid]=True
+            active.add(symbol)
+
+    for s in SYMBOLS:
+        if s not in active:
+            pending_buy_symbol[s]=False
+            proposal_lock[s]=False
 
 
 # ============================================================
@@ -121,20 +179,13 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     if len(df) < 250:
         return df
 
-    # =========================
-    # 📊 EMAs
-    # =========================
     df["ema_fast"] = EMAIndicator(df["close"], 9).ema_indicator()
     df["ema_mid"]  = EMAIndicator(df["close"], 21).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], 55).ema_indicator()
     df["ema200"]   = EMAIndicator(df["close"], 200).ema_indicator()
 
     df["ema200_slope"] = df["ema200"].diff()
-    df["ema_slow_slope"] = df["ema_slow"].diff()
 
-    # =========================
-    # 📊 RSI + MFI
-    # =========================
     df["rsi"] = RSIIndicator(df["close"], 14).rsi()
 
     df["mfi"] = MFIIndicator(
@@ -145,76 +196,17 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         14
     ).money_flow_index()
 
-    # =========================
-    # 📊 ADX
-    # =========================
     adx = ADXIndicator(df["high"], df["low"], df["close"], 14)
     df["adx"] = adx.adx()
 
-    # =========================
-    # 📊 Bollinger
-    # =========================
     bb = BollingerBands(df["close"], 20, 2.2)
-
     df["bb_width"] = (
         bb.bollinger_hband() -
         bb.bollinger_lband()
     ) / df["close"]
 
-    # =========================
-    # 🕯 Estrutura de Vela
-    # =========================
     df["range"] = df["high"] - df["low"]
     df["body"]  = abs(df["close"] - df["open"])
-
-    df["upper_wick"] = df["high"] - df[["close","open"]].max(axis=1)
-    df["lower_wick"] = df[["close","open"]].min(axis=1) - df["low"]
-
-    df["wick_ratio"] = (
-        df["upper_wick"] + df["lower_wick"]
-    ) / df["range"].replace(0,1e-9)
-
-    df["body_ratio"] = df["body"] / df["range"].replace(0,1e-9)
-
-    # =========================
-    # 🏦 Manipulação Institucional
-    # (Stop Hunt / Liquidez)
-    # =========================
-
-    df["rolling_high_20"] = df["high"].rolling(20).max()
-    df["rolling_low_20"]  = df["low"].rolling(20).min()
-
-    df["liquidity_sweep_high"] = (
-        (df["high"] > df["rolling_high_20"].shift(1)) &
-        (df["close"] < df["rolling_high_20"].shift(1))
-    ).astype(int)
-
-    df["liquidity_sweep_low"] = (
-        (df["low"] < df["rolling_low_20"].shift(1)) &
-        (df["close"] > df["rolling_low_20"].shift(1))
-    ).astype(int)
-
-    # =========================
-    # 📈 Estrutura de Mercado
-    # =========================
-
-    df["higher_high"] = (
-        df["high"] > df["high"].shift(1)
-    ).astype(int)
-
-    df["lower_low"] = (
-        df["low"] < df["low"].shift(1)
-    ).astype(int)
-
-    df["market_structure_bias"] = (
-        df["higher_high"] - df["lower_low"]
-    )
-
-    # =========================
-    # 📊 Volatilidade
-    # =========================
-
-    df["volatility"] = df["close"].rolling(20).std()
 
     df["range_expansion"] = (
         df["range"] /
@@ -226,29 +218,51 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         df["bb_width"].rolling(20).mean()
     )
 
-    # =========================
-    # 📍 Distância de Estrutura
-    # =========================
-
-    df["dist_ema_slow"] = (
-        df["close"] - df["ema_slow"]
-    ) / df["ema_slow"]
-
-    df["dist_ema200"] = (
-        df["close"] - df["ema200"]
-    ) / df["ema200"]
-
     return df
-    
+
+
 # ============================================================
-# 🤖 ML DATASET FOREX
+# 🧠 MARKET FILTERS
+# ============================================================
+
+def forex_session_ok():
+    utc_hour=datetime.utcnow().hour
+    return 7 <= utc_hour <= 17
+
+
+def market_is_good(row):
+
+    if row["adx"] < 18:
+        return False
+
+    if row["bb_width"] < 0.0012:
+        return False
+
+    if abs(row["ema200_slope"]) < 1e-6:
+        return False
+
+    return True
+
+
+def market_exploding(row):
+
+    if row["range_expansion"] > 1.4:
+        return True
+
+    if row["volatility_squeeze"] > 1.3:
+        return True
+
+    return False
+
+# ============================================================
+# 🤖 ML
 # ============================================================
 
 def build_ml_dataset(df):
 
     df=df.dropna().copy()
 
-    if len(df)<150:
+    if len(df)<200:
         return None,None
 
     tp=TAKE_PROFIT/(STAKE_AMOUNT*MULTIPLIER)
@@ -310,8 +324,8 @@ def train_ml(symbol):
         return
 
     model=RandomForestClassifier(
-        n_estimators=300,
-        max_depth=14,
+        n_estimators=350,
+        max_depth=16,
         min_samples_leaf=6,
         n_jobs=-1,
         random_state=42
@@ -359,6 +373,9 @@ async def send_proposal(ws,symbol,direction):
 
     async with symbol_locks[symbol]:
 
+        if trading_paused:
+            return
+
         if pending_buy_symbol[symbol]:
             return
 
@@ -371,8 +388,8 @@ async def send_proposal(ws,symbol,direction):
         if time.time()-last_trade_time[symbol]<TRADE_COOLDOWN_SECONDS:
             return
 
-        proposal_lock[symbol]=True
         pending_buy_symbol[symbol]=True
+        proposal_lock[symbol]=True
 
         req=REQ_ID_SEQ
         REQ_ID_SEQ+=1
@@ -410,6 +427,7 @@ async def handle_proposal(ws,data):
         "price":STAKE_AMOUNT
     }))
 
+
 # ============================================================
 # 🌐 LOOP WS
 # ============================================================
@@ -432,6 +450,8 @@ async def ws_loop(symbol):
                 await ws.send(json.dumps({"authorize":DERIV_TOKEN}))
                 await ws.recv()
 
+                await sync_open_contracts(ws)
+
                 await ws.send(json.dumps({
                     "ticks_history":symbol,
                     "granularity":GRANULARITY_SECONDS,
@@ -443,11 +463,10 @@ async def ws_loop(symbol):
 
                 async for raw in ws:
 
-                    last_activity_time[symbol]=time.time()
+                    check_daily_reset()
 
                     data=json.loads(raw)
 
-                    # ================= HIST =================
                     if "candles" in data:
 
                         df=pd.DataFrame(data["candles"])
@@ -461,7 +480,6 @@ async def ws_loop(symbol):
                         continue
 
 
-                    # ================= NOVA VELA =================
                     if "ohlc" in data:
 
                         epoch=data["ohlc"]["epoch"]
@@ -481,14 +499,13 @@ async def ws_loop(symbol):
 
                         row=df.iloc[-1]
 
-                        # ===== REGIME FOREX =====
-                        if row["adx"]<16:
+                        if not forex_session_ok():
                             continue
 
-                        if row["bb_width"]<0.001:
+                        if not market_is_good(row):
                             continue
 
-                        if abs(row["ema200_slope"])<1e-6:
+                        if not market_exploding(row):
                             continue
 
                         prob=ml_predict(symbol,row)
@@ -497,9 +514,8 @@ async def ws_loop(symbol):
                             continue
 
                         conf=max(prob,1-prob)
-                        threshold=0.60 if row["adx"]>25 else 0.68
 
-                        if conf<threshold:
+                        if conf<0.65:
                             continue
 
                         trend_up=row["ema_fast"]>row["ema_slow"]>row["ema200"]
@@ -516,13 +532,11 @@ async def ws_loop(symbol):
                         continue
 
 
-                    # ================= PROPOSAL =================
                     if "proposal" in data:
                         await handle_proposal(ws,data)
                         continue
 
 
-                    # ================= BUY =================
                     if "buy" in data:
 
                         cid=data["buy"]["contract_id"]
@@ -538,7 +552,6 @@ async def ws_loop(symbol):
                         continue
 
 
-                    # ================= CLOSE =================
                     if "proposal_open_contract" in data:
 
                         poc=data["proposal_open_contract"]
@@ -577,7 +590,7 @@ async def ws_loop(symbol):
 
 
 # ============================================================
-# 🌍 FLASK (Health Check Render)
+# 🌍 FLASK
 # ============================================================
 
 app = Flask(__name__)
