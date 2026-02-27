@@ -427,11 +427,6 @@ async def ws_loop(symbol):
 
                 async for raw in ws:
 
-                    # ================= WATCHDOG =================
-                    if time.time() - last_activity_time[symbol] > WATCHDOG_TIMEOUT:
-                        log(f"{symbol} watchdog reiniciando conexão")
-                        raise Exception("Watchdog timeout")
-
                     last_activity_time[symbol] = time.time()
                     check_daily_reset()
 
@@ -462,12 +457,12 @@ async def ws_loop(symbol):
                         await handle_proposal(ws, data)
                         continue
 
-                    # ================= BUY CONFIRM =================
+                    # ================= BUY =================
                     if "buy" in data:
+
                         cid = data["buy"]["contract_id"]
 
                         open_trades[symbol][cid] = True
-                        proposal_lock[symbol] = False
                         last_trade_time[symbol] = time.time()
 
                         await ws.send(json.dumps({
@@ -477,12 +472,13 @@ async def ws_loop(symbol):
                         }))
                         continue
 
-                    # ================= CONTRACT UPDATE =================
+                    # ================= CONTRACT =================
                     if "proposal_open_contract" in data:
 
                         poc = data["proposal_open_contract"]
 
                         if poc.get("is_sold"):
+
                             cid = poc["contract_id"]
 
                             profit = float(
@@ -493,6 +489,8 @@ async def ws_loop(symbol):
 
                             open_trades[symbol].pop(cid, None)
 
+                            # ✅ libera SOMENTE AQUI
+                            pending_buy_symbol[symbol] = False
                             proposal_lock[symbol] = False
 
                             if daily_pnl <= -DAILY_MAX_LOSS:
@@ -503,11 +501,9 @@ async def ws_loop(symbol):
                     # ================= NOVA VELA =================
                     if "ohlc" in data:
 
-                        c = data["ohlc"]
-
                         df = candles[symbol]
                         df = pd.concat(
-                            [df, pd.DataFrame([c])]
+                            [df, pd.DataFrame([data["ohlc"]])]
                         ).tail(HISTORY_COUNT)
 
                         df["volume"] = 1.0
@@ -540,12 +536,10 @@ async def ws_loop(symbol):
                         )
 
         except Exception as e:
+
             log(f"{symbol} WS erro {e}", "error")
 
-            proposal_lock[symbol] = False
-
-            await asyncio.sleep(3)
-            
+            await asyncio.sleep(3)                                
 # ============================================================
 # 🌍 FLASK
 # ============================================================
