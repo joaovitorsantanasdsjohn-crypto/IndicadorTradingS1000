@@ -312,6 +312,7 @@ def ml_predict(symbol, row):
     X = pd.DataFrame([values], columns=cols)
 
     return model.predict_proba(X)[0][1]
+
 # ============================================================
 # 💰 PROPOSAL → BUY
 # ============================================================
@@ -324,9 +325,16 @@ async def send_proposal(ws, symbol, direction):
         if not TRADE_ENABLED:
             return
 
-        if open_trades[symbol] or proposal_lock[symbol]:
+        # BLOQUEIO ESTRUTURAL FORTE — impede duplicação
+        # Não permite nova ordem se já houver contrato aberto
+        if len(open_trades[symbol]) > 0:
             return
 
+        # Não permite nova ordem se já houver proposal pendente
+        if proposal_lock[symbol]:
+            return
+
+        # Cooldown entre trades
         if time.time() - last_trade_time[symbol] < TRADE_COOLDOWN_SECONDS:
             return
 
@@ -372,8 +380,6 @@ async def handle_proposal(ws, data):
         "buy": data["proposal"]["id"],
         "price": STAKE_AMOUNT
     }))
-
-
 # ============================================================
 # 🌐 LOOP WS
 # ============================================================
