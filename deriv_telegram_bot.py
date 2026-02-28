@@ -316,6 +316,30 @@ def market_exploding(row):
     return False
 
 # ============================================================
+# 🚫 FILTRO ANTI MANIPULAÇÃO INSTITUCIONAL
+# ============================================================
+
+def institutional_trap_filter(row, direction):
+
+    # sweep acima → perigo de queda
+    if row["liquidity_sweep_high"] == 1 and direction == "UP":
+        return False
+
+    # sweep abaixo → perigo de alta falsa
+    if row["liquidity_sweep_low"] == 1 and direction == "DOWN":
+        return False
+
+    # vela com rejeição extrema
+    if row["wick_ratio"] > 0.65:
+        return False
+
+    # corpo muito pequeno = indecisão
+    if row["body_ratio"] < 0.25:
+        return False
+
+    return True
+
+# ============================================================
 # 🤖 ML
 # ============================================================
 
@@ -603,6 +627,10 @@ async def ws_loop(symbol):
                         elif prob<=0.5 and trend_down:
                             direction="DOWN"
                         else:
+                            continue
+
+                        # 🚫 evita entrar em armadilha institucional
+                        if not institutional_trap_filter(row, direction):
                             continue
 
                         await send_proposal(ws,symbol,direction)
