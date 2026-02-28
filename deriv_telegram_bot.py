@@ -218,6 +218,67 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         df["bb_width"].rolling(20).mean()
     )
 
+    # ============================================================
+    # 🕯 ESTRUTURA DE VELA (PRICE ACTION)
+    # ============================================================
+
+    df["range"] = df["high"] - df["low"]
+    df["body"]  = abs(df["close"] - df["open"])
+
+    df["upper_wick"] = (
+        df["high"] - df[["open","close"]].max(axis=1)
+    )
+
+    df["lower_wick"] = (
+        df[["open","close"]].min(axis=1) - df["low"]
+    )
+
+    df["body_ratio"] = (
+        df["body"] /
+        df["range"].replace(0,1e-9)
+    )
+
+    df["wick_ratio"] = (
+        df["upper_wick"] + df["lower_wick"]
+    ) / df["range"].replace(0,1e-9)
+
+
+    # ============================================================
+    # 🏦 MANIPULAÇÃO INSTITUCIONAL (LIQUIDITY SWEEP)
+    # ============================================================
+
+    df["rolling_high_20"] = df["high"].rolling(20).max()
+    df["rolling_low_20"]  = df["low"].rolling(20).min()
+
+    # Stop Hunt acima
+    df["liquidity_sweep_high"] = (
+        (df["high"] > df["rolling_high_20"].shift(1)) &
+        (df["close"] < df["rolling_high_20"].shift(1))
+    ).astype(int)
+
+    # Stop Hunt abaixo
+    df["liquidity_sweep_low"] = (
+        (df["low"] < df["rolling_low_20"].shift(1)) &
+        (df["close"] > df["rolling_low_20"].shift(1))
+    ).astype(int)
+
+
+    # ============================================================
+    # 📈 MICRO ESTRUTURA DE MERCADO
+    # ============================================================
+
+    df["higher_high"] = (
+        df["high"] > df["high"].shift(1)
+    ).astype(int)
+
+    df["lower_low"] = (
+        df["low"] < df["low"].shift(1)
+    ).astype(int)
+
+    df["market_structure_bias"] = (
+        df["higher_high"] - df["lower_low"]
+    )
+
     return df
 
 
