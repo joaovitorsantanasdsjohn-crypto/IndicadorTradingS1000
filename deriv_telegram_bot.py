@@ -288,7 +288,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 def forex_session_ok():
     utc_hour=datetime.utcnow().hour
-    return 7 <= utc_hour <= 17
+    return 5 <= utc_hour <= 20
 
 
 def market_is_good(row):
@@ -589,7 +589,7 @@ async def ws_loop(symbol):
                         if not market_is_good(row):
                             continue
 
-                        if not market_exploding(row):
+                        if not market_exploding(row) and row["adx"] < 22:
                             continue
 
                         prob=ml_predict(symbol,row)
@@ -606,9 +606,9 @@ async def ws_loop(symbol):
                         if row["adx"] >= 30:
                             dynamic_threshold = 0.58   # tendência forte
                         elif row["adx"] >= 24:
-                            dynamic_threshold = 0.63   # tendência saudável
+                            dynamic_threshold = 0.61   # tendência saudável
                         elif row["adx"] >= 18:
-                            dynamic_threshold = 0.68   # mercado neutro
+                            dynamic_threshold = 0.63   # mercado neutro
                         else:
                             dynamic_threshold = 0.72   # lateral perigoso
 
