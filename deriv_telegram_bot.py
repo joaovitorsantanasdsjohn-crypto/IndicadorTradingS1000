@@ -607,7 +607,8 @@ async def ws_loop(symbol):
                         log(f"ML-PROB | {symbol} | PROB={prob:.3f}")
 
                         if not market_exploding(row) and row["adx"] < 22:
-                            continue
+                            log(f"FILTER HOLD | {symbol} | LOW VOLATILITY")
+    continue
 
                         
 
