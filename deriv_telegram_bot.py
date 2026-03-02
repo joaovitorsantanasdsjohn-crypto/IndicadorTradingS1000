@@ -588,29 +588,29 @@ async def ws_loop(symbol):
 
                         if not market_is_good(row):
                             continue
-                            
-                            prob = ml_predict(symbol,row)
 
                         # ==========================
-                        # 📊 ML DEBUG LOG
+                        # 📊 ML PREDICT
                         # ==========================
-                            log(
-                               f"ML | {symbol} | "
-                               f"READY={ml_model_ready[symbol]} | "
-                               f"ADX={row['adx']:.2f}"
-                            )
+                        prob = ml_predict(symbol,row)
 
-                            if prob is None:
-                                log(f"ML-HOLD | {symbol} | MODEL NOT READY")
-                                continue
+                        log(
+                            f"ML | {symbol} | "
+                            f"READY={ml_model_ready[symbol]} | "
+                            f"ADX={row['adx']:.2f}"
+                           )
 
-                            log(f"ML-PROB | {symbol} | PROB={prob:.3f}")
+                       if prob is None:
+                           log(f"ML-HOLD | {symbol} | MODEL NOT READY")
+                           continue
 
-                            if not market_exploding(row) and row["adx"] < 22:
-                                log(f"FILTER HOLD | {symbol} | LOW VOLATILITY")
-                                continue
+                       log(f"ML-PROB | {symbol} | PROB={prob:.3f}")
 
-                            conf = max(prob,1-prob)
+                       if not market_exploding(row) and row["adx"] < 22:
+                           log(f"FILTER HOLD | {symbol} | LOW VOLATILITY")
+                           continue
+
+                        conf = max(prob,1-prob)
 
                         # ===================================================
                         # ✅ CONFIANÇA DINÂMICA BASEADA EM REGIME
