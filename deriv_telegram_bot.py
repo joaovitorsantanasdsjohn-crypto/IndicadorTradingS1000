@@ -647,6 +647,7 @@ async def ws_loop(symbol):
                             continue
 
                         await send_proposal(ws,symbol,direction)
+                        await asyncio.sleep(0.01)
                         continue
 
 
