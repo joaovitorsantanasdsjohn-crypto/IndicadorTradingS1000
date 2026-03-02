@@ -699,13 +699,19 @@ async def ws_loop(symbol):
                         continue
 
         except Exception as e:
-
             log(f"{symbol} WS reconnect {e}")
 
-            pending_buy_symbol[symbol]=False
-            proposal_lock[symbol]=False
+            pending_buy_symbol[symbol] = False
+            proposal_lock[symbol] = False
 
-            await asyncio.sleep(3)
+            # 🔥 fecha websocket antigo se existir
+            try:
+                await ws.close()
+            except:
+                pass
+
+            # 🔥 espera mais tempo para limpar sessão na Deriv
+            await asyncio.sleep(10)
                         
                             
 # ============================================================
