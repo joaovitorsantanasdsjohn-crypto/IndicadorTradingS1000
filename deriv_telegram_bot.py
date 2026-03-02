@@ -588,14 +588,28 @@ async def ws_loop(symbol):
 
                         if not market_is_good(row):
                             continue
+                            
+                            prob = ml_predict(symbol,row)
+
+                        # ===============================
+                        # 📊 ML DEBUG LOG
+                        # ===============================
+                        log(
+                           f"ML | {symbol} | "
+                           f"READY={ml_model_ready[symbol]} | "
+                           f"ADX={row['adx']:.2f}"
+                        )
+
+                        if prob is None:
+                            log(f"ML-HOLD | {symbol} | MODEL NOT READY")
+                            continue
+
+                        log(f"ML-PROB | {symbol} | PROB={prob:.3f}")
 
                         if not market_exploding(row) and row["adx"] < 22:
                             continue
 
-                        prob=ml_predict(symbol,row)
-
-                        if prob is None:
-                            continue
+                        
 
                         conf=max(prob,1-prob)
 
