@@ -591,6 +591,9 @@ async def ws_loop(symbol):
                             
                             prob = ml_predict(symbol,row)
 
+                            if prob is None:
+                                log(f"ML-HOLD | {symbol} | MODEL NOT READY")
+                                continue
                         # ===============================
                         # 📊 ML DEBUG LOG
                         # ===============================
