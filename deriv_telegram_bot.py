@@ -608,7 +608,7 @@ async def ws_loop(symbol):
 
                         if not market_exploding(row) and row["adx"] < 22:
                             log(f"FILTER HOLD | {symbol} | LOW VOLATILITY")
-    continue
+                            continue
 
                         
 
