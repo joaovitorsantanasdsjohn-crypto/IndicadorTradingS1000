@@ -581,7 +581,7 @@ async def ws_loop(symbol):
                         df["volume"]=1
                         candles[symbol]=calcular_indicadores(df)
 
-                        row=df.iloc[-1]
+                        row=df.iloc[-2]
 
                         if not forex_session_ok():
                             continue
