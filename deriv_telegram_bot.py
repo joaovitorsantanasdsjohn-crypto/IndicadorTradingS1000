@@ -601,14 +601,14 @@ async def ws_loop(symbol):
                             )
 
                             if prob is None:
-                            log(f"ML-HOLD | {symbol} | MODEL NOT READY")
-                            continue
+                                log(f"ML-HOLD | {symbol} | MODEL NOT READY")
+                                continue
 
                             log(f"ML-PROB | {symbol} | PROB={prob:.3f}")
 
                             if not market_exploding(row) and row["adx"] < 22:
                                 log(f"FILTER HOLD | {symbol} | LOW VOLATILITY")
-                            continue
+                                continue
 
                             conf = max(prob,1-prob)
 
