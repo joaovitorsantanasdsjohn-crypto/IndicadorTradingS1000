@@ -526,8 +526,8 @@ async def ws_loop(symbol):
 
             async with websockets.connect(
                 WS_URL,
-                ping_interval=25,
-                ping_timeout=25,
+                ping_interval=40,
+                ping_timeout=40,
                 max_queue=None
             ) as ws:
 
@@ -560,7 +560,7 @@ async def ws_loop(symbol):
 
                         if time.time() - last_ml_train[symbol] > 600:
                         
-                        asyncio.create_task(train_ml_background(symbol))
+                    asyncio.create_task(train_ml_background(symbol))
                         
                         continue
 
