@@ -560,7 +560,7 @@ async def ws_loop(symbol):
 
                         if time.time() - last_ml_train[symbol] > 600:
                         
-                     asyncio.create_task(train_ml_background(symbol))
+                    asyncio.create_task(train_ml_background(symbol))
                         
                         continue
 
