@@ -704,13 +704,13 @@ async def ws_loop(symbol):
             pending_buy_symbol[symbol] = False
             proposal_lock[symbol] = False
 
-            # 🔥 fecha websocket antigo se existir
-            try:
-                await ws.close()
-            except:
-                pass
+            # só tenta fechar se ws existir
+            if "ws" in locals():
+                try:
+                    await ws.close()
+                except:
+                    pass
 
-            # 🔥 espera mais tempo para limpar sessão na Deriv
             await asyncio.sleep(10)
                         
                             
