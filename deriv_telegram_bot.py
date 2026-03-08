@@ -38,10 +38,10 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 SYMBOLS = ["frxEURUSD","frxUSDJPY","frxGBPUSD","frxAUDUSD"]
 
 GRANULARITY_SECONDS = 900
-HISTORY_COUNT = 1200
+HISTORY_COUNT = 3000
 
 ML_ENABLED = True and SKLEARN_AVAILABLE
-ML_MIN_TRAINED_SAMPLES = 250
+ML_MIN_TRAINED_SAMPLES = 200
 
 STAKE_AMOUNT = 1.0
 MULTIPLIER = 100
@@ -259,6 +259,11 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     df["rolling_high_20"] = df["high"].rolling(20).max()
     df["rolling_low_20"]  = df["low"].rolling(20).min()
+    
+    df["range_position"] = (
+        (df["close"] - df["rolling_low_20"]) /
+        (df["rolling_high_20"] - df["rolling_low_20"])
+    ).clip(0,1)
 
     # Stop Hunt acima
     df["liquidity_sweep_high"] = (
