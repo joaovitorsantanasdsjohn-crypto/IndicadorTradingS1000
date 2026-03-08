@@ -183,7 +183,8 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_mid"]  = EMAIndicator(df["close"], 21).ema_indicator()
     df["ema_slow"] = EMAIndicator(df["close"], 55).ema_indicator()
     df["ema200"]   = EMAIndicator(df["close"], 200).ema_indicator()
-
+    
+    df["dist_ema200"] = (df["close"] - df["ema200"]) / df["ema200"]
     df["ema200_slope"] = df["ema200"].diff()
 
     df["rsi"] = RSIIndicator(df["close"], 14).rsi()
