@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, ADXIndicator
-from ta.volatility import BollingerBands
+from ta.volatility import BollingerBands, AverageTrueRange
 from ta.volume import MFIIndicator
 
 try:
