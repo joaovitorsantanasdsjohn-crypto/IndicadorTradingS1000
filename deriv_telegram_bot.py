@@ -231,10 +231,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     # ============================================================
     # 🕯 ESTRUTURA DE VELA (PRICE ACTION)
     # ============================================================
-
-    df["range"] = df["high"] - df["low"]
-    df["body"]  = abs(df["close"] - df["open"])
-
+        
     df["upper_wick"] = (
         df["high"] - df[["open","close"]].max(axis=1)
     )
