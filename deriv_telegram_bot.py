@@ -205,6 +205,15 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         bb.bollinger_hband() -
         bb.bollinger_lband()
     ) / df["close"]
+    
+    atr = AverageTrueRange(
+        df["high"],
+        df["low"],
+        df["close"],
+        14
+    )
+
+    df["atr"] = atr.average_true_range()
 
     df["range"] = df["high"] - df["low"]
     df["body"]  = abs(df["close"] - df["open"])
