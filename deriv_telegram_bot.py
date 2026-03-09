@@ -732,6 +732,7 @@ async def ws_loop(symbol):
                             proposal_lock[symbol]=False
 
                             daily_pnl+=profit
+                            save_daily_state()
 
                             if profit<0:
                                 loss_streak[symbol]+=1
