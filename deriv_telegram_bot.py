@@ -101,6 +101,22 @@ def save_daily_state():
     with open(STATE_FILE, "w") as f:
         json.dump(data, f)
 
+def load_daily_state():
+
+    global daily_pnl, trading_paused
+
+    if not os.path.exists(STATE_FILE):
+        return
+
+    with open(STATE_FILE, "r") as f:
+        data = json.load(f)
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    if data["date"] == today:
+        daily_pnl = data["daily_pnl"]
+        trading_paused = data["trading_paused"]
+
 
 # ============================================================
 # 📝 LOG
