@@ -83,8 +83,8 @@ REQ_ID_SEQ=1
 
 daily_pnl=0
 trading_paused=False
-load_daily_state()
 STATE_FILE = "daily_state.json"
+load_daily_state()
 current_day = datetime.now(timezone.utc).date()
 
 #=============================================================
