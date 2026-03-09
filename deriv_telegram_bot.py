@@ -87,9 +87,19 @@ STATE_FILE = "daily_state.json"
 current_day = datetime.now(timezone.utc).date()
 
 #=============================================================
-#
+# 📌FUNÇÕES DE ESTADO
 #=============================================================
 
+def save_daily_state():
+
+    data = {
+        "date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "daily_pnl": daily_pnl,
+        "trading_paused": trading_paused
+    }
+
+    with open(STATE_FILE, "w") as f:
+        json.dump(data, f)
 
 
 # ============================================================
