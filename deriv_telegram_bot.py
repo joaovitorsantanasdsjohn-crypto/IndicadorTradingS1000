@@ -742,8 +742,14 @@ async def ws_loop(symbol):
                             else:
                                 loss_streak[symbol]=0
 
-                            if daily_pnl<=-DAILY_MAX_LOSS:
-                                trading_paused=True
+                            if daily_pnl <= -DAILY_MAX_LOSS:
+
+                                trading_paused = True
+                                save_daily_state()
+
+                                logging.warning(
+                                    f"DAILY MAX LOSS HIT | PNL={daily_pnl}"
+                                )
 
                         continue
 
