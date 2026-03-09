@@ -545,7 +545,7 @@ async def send_proposal(ws,symbol,direction):
 
 async def handle_proposal(ws,data):
     if trading_paused:
-    return
+        return
 
     rid=data.get("req_id")
 
