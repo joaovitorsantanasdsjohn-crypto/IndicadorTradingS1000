@@ -84,6 +84,7 @@ REQ_ID_SEQ=1
 daily_pnl=0
 trading_paused=False
 STATE_FILE = "daily_state.json"
+ML_DATA_FILE = "ml_data.json"
 current_day = datetime.now(timezone.utc).date()
 
 #=============================================================
