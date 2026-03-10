@@ -235,7 +235,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     ).money_flow_index()
 
     adx = ADXIndicator(df["high"], df["low"], df["close"], 14)
-    df["adx"] = adx.adx()
+    df["adx"] = adx.adx().clip(0,60)
 
     bb = BollingerBands(df["close"], 20, 2.2)
     df["bb_width"] = (
