@@ -155,7 +155,9 @@ def check_daily_reset():
         current_day = today
         daily_pnl = 0
         trading_paused = False
+        save_daily_state()
 
+        
         for s in SYMBOLS:
             loss_streak[s] = 0
             loss_pause_until[s] = 0
