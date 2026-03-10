@@ -120,7 +120,6 @@ def load_daily_state():
 
 load_daily_state()
 save_daily_state()
-load_ml_data()
 
 def save_ml_data():
 
@@ -150,6 +149,8 @@ def load_ml_data():
     for s in data:
 
         candles[s] = pd.DataFrame(data[s])
+
+load_ml_data()
 
 
 # ============================================================
