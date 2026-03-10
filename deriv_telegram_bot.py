@@ -129,8 +129,8 @@ def save_ml_data():
 
         df = candles[s]
 
-        if len(df) > 500:
-            df = df.tail(500)
+        if len(df) > 800:
+            df = df.tail(800)
 
         data[s] = df.to_dict()
 
