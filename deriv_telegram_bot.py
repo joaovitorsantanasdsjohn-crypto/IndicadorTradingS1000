@@ -84,8 +84,6 @@ REQ_ID_SEQ=1
 daily_pnl=0
 trading_paused=False
 STATE_FILE = "daily_state.json"
-load_daily_state()
-save_daily_state()
 current_day = datetime.now(timezone.utc).date()
 
 #=============================================================
@@ -118,6 +116,9 @@ def load_daily_state():
     if data["date"] == today:
         daily_pnl = data["daily_pnl"]
         trading_paused = data["trading_paused"]
+
+load_daily_state()
+save_daily_state()
 
 
 # ============================================================
