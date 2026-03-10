@@ -121,6 +121,35 @@ def load_daily_state():
 load_daily_state()
 save_daily_state()
 
+def save_ml_data():
+
+    data = {}
+
+    for s in SYMBOLS:
+
+        df = candles[s]
+
+        if len(df) > 500:
+            df = df.tail(500)
+
+        data[s] = df.to_dict()
+
+    with open(ML_DATA_FILE,"w") as f:
+        json.dump(data,f)
+
+
+def load_ml_data():
+
+    if not os.path.exists(ML_DATA_FILE):
+        return
+
+    with open(ML_DATA_FILE,"r") as f:
+        data=json.load(f)
+
+    for s in data:
+
+        candles[s] = pd.DataFrame(data[s])
+
 
 # ============================================================
 # 📝 LOG
