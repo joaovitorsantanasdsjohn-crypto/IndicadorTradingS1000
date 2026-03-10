@@ -669,6 +669,7 @@ async def ws_loop(symbol):
 
                         df["volume"]=1
                         candles[symbol]=calcular_indicadores(df)
+                        save_ml_data()
 
                         row=df.iloc[-2]
 
