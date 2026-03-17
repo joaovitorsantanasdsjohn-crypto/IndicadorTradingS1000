@@ -722,6 +722,11 @@ async def ws_loop(symbol):
                         if conf < dynamic_threshold:
                             continue
 
+                        ema_diff = abs(row["ema_fast"] - row["ema_slow"])
+
+                        if ema_diff < 0.00005:
+                            continue
+
                         trend_up=row["ema_fast"]>row["ema_slow"]
                         trend_down=row["ema_fast"]<row["ema_slow"]
 
