@@ -439,10 +439,10 @@ def build_ml_dataset(df):
 
     y=[]
 
-    for i in range(len(df)-5):
+    for i in range(len(df)-8):
 
         entry=df.iloc[i]["close"]
-        future=df.iloc[i+1:i+5]
+        future=df.iloc[i+1:i+8]
 
         hit_tp=(future["high"]>=entry*(1+tp)).any()
         hit_sl=(future["low"]<=entry*(1-sl)).any()
@@ -452,8 +452,7 @@ def build_ml_dataset(df):
         elif hit_sl and not hit_tp:
             y.append(0)
         else:
-            y.append(None)
-
+            continue
     df=df.iloc[:len(y)]
     df["target"]=y
     df=df.dropna()
