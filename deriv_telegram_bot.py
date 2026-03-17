@@ -429,69 +429,79 @@ def institutional_trap_filter(row, direction):
 
 def build_ml_dataset(df):
 
-    df=df.dropna().copy()
+    df = df.dropna().copy()
 
-    if len(df)<200:
-        return None,None
+    if len(df) < 200:
+        return None, None
 
-    tp=TAKE_PROFIT/(STAKE_AMOUNT*MULTIPLIER)
-    sl=STOP_LOSS/(STAKE_AMOUNT*MULTIPLIER)
+    tp = TAKE_PROFIT / (STAKE_AMOUNT * MULTIPLIER)
+    sl = STOP_LOSS / (STAKE_AMOUNT * MULTIPLIER)
 
-    y=[]
+    y = []
+    valid_idx = []
 
-    for i in range(len(df)-8):
+    for i in range(len(df) - 8):
 
-        entry=df.iloc[i]["close"]
-        future=df.iloc[i+1:i+8]
+        entry = df.iloc[i]["close"]
+        future = df.iloc[i+1:i+8]
 
-        hit_tp=(future["high"]>=entry*(1+tp)).any()
-        hit_sl=(future["low"]<=entry*(1-sl)).any()
+        hit_tp = (future["high"] >= entry * (1 + tp)).any()
+        hit_sl = (future["low"] <= entry * (1 - sl)).any()
 
         if hit_tp and not hit_sl:
             y.append(1)
+            valid_idx.append(i)
+
         elif hit_sl and not hit_tp:
             y.append(0)
-        else:
-            continue
-    df=df.iloc[:len(y)]
-    df["target"]=y
-    df=df.dropna()
+            valid_idx.append(i)
 
-    X=df.select_dtypes("number").drop(columns=["target"])
-    y=df["target"]
+    # 🔥 alinhamento correto (ESSENCIAL)
+    df = df.iloc[valid_idx].copy()
+    df["target"] = y
 
-    comb=pd.concat([X,y],axis=1)
+    df = df.dropna()
 
-    maj=comb[comb.target==comb.target.mode()[0]]
-    mino=comb[comb.target!=comb.target.mode()[0]]
+    if len(df) < 50:
+        return None, None
 
-    if len(mino)>10:
-        mino=resample(mino,
-                      replace=True,
-                      n_samples=len(maj),
-                      random_state=42)
+    X = df.select_dtypes("number").drop(columns=["target"])
+    y = df["target"]
 
-    comb=pd.concat([maj,mino])
+    comb = pd.concat([X, y], axis=1)
 
-    return comb.drop("target",axis=1),comb["target"]
+    maj = comb[comb.target == comb.target.mode()[0]]
+    mino = comb[comb.target != comb.target.mode()[0]]
+
+    if len(mino) > 10:
+        mino = resample(
+            mino,
+            replace=True,
+            n_samples=len(maj),
+            random_state=42
+        )
+
+    comb = pd.concat([maj, mino])
+
+    return comb.drop("target", axis=1), comb["target"]
 
 
 def train_ml(symbol):
 
-    if time.time()-last_ml_train[symbol]<300:
+    if time.time() - last_ml_train[symbol] < 300:
         return
 
-    df=candles[symbol]
+    df = candles[symbol]
 
-    if len(df)<ML_MIN_TRAINED_SAMPLES:
+    if len(df) < ML_MIN_TRAINED_SAMPLES:
         return
 
-    X,y=build_ml_dataset(df)
+    X, y = build_ml_dataset(df)
 
-    if X is None or len(set(y))<2:
+    if X is None or len(set(y)) < 2:
         return
 
-    model=RandomForestClassifier(
+    model = RandomForestClassifier(
         n_estimators=350,
         max_depth=16,
         min_samples_leaf=6,
@@ -499,34 +509,34 @@ def train_ml(symbol):
         random_state=42
     )
 
-    model.fit(X,y)
+    model.fit(X, y)
 
-    ml_models[symbol]=(model,X.columns.tolist())
-    ml_model_ready[symbol]=True
-    last_ml_train[symbol]=time.time()
+    ml_models[symbol] = (model, X.columns.tolist())
+    ml_model_ready[symbol] = True
+    last_ml_train[symbol] = time.time()
 
 
 async def train_ml_background(symbol):
-    loop=asyncio.get_running_loop()
-    await loop.run_in_executor(None,train_ml,symbol)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, train_ml, symbol)
 
 
-def ml_predict(symbol,row):
+def ml_predict(symbol, row):
 
     if not ml_model_ready[symbol]:
         return None
 
-    model,cols=ml_models[symbol]
+    model, cols = ml_models[symbol]
 
     try:
-        vals=[row[c] for c in cols]
+        vals = [row[c] for c in cols]
     except:
         return None
 
     if any(pd.isna(v) for v in vals):
         return None
 
-    X=pd.DataFrame([vals],columns=cols)
+    X = pd.DataFrame([vals], columns=cols)
 
     return model.predict_proba(X)[0][1]
 
