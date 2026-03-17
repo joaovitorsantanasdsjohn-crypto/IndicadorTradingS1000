@@ -722,8 +722,8 @@ async def ws_loop(symbol):
                         if conf < dynamic_threshold:
                             continue
 
-                        trend_up=row["ema_fast"]>row["ema_slow"]>row["ema200"]
-                        trend_down=row["ema_fast"]<row["ema_slow"]<row["ema200"]
+                        trend_up=row["ema_fast"]>row["ema_slow"]
+                        trend_down=row["ema_fast"]<row["ema_slow"]
 
                         if prob>0.5 and trend_up:
                             direction="UP"
