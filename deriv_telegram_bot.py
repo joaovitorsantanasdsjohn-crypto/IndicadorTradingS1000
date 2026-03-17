@@ -465,7 +465,7 @@ def build_ml_dataset(df):
     maj=comb[comb.target==comb.target.mode()[0]]
     mino=comb[comb.target!=comb.target.mode()[0]]
 
-    if len(mino)>20:
+    if len(mino)>10:
         mino=resample(mino,
                       replace=True,
                       n_samples=len(maj),
