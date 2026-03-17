@@ -725,9 +725,9 @@ async def ws_loop(symbol):
                         trend_up=row["ema_fast"]>row["ema_slow"]
                         trend_down=row["ema_fast"]<row["ema_slow"]
 
-                        if prob>0.5 and trend_up:
+                        if prob>0.55 and trend_up:
                             direction="UP"
-                        elif prob<=0.5 and trend_down:
+                        elif prob<=0.45 and trend_down:
                             direction="DOWN"
                         else:
                             continue
