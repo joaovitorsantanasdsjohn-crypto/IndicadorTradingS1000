@@ -369,15 +369,15 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
 def forex_session_ok():
     utc_hour=datetime.utcnow().hour
-    return 5 <= utc_hour <= 20
+    return 6 <= utc_hour <= 19
 
 
 def market_is_good(row):
 
-    if row["adx"] < 18:
+    if row["adx"] < 20:
         return False
 
-    if row["bb_width"] < 0.0012:
+    if row["bb_width"] < 0.0016:
         return False
 
     if abs(row["ema200_slope"]) < 1e-6:
