@@ -486,6 +486,10 @@ def build_ml_dataset(df):
         return None, None, None
 
     X = df.select_dtypes("number").copy()
+    
+    y_up = pd.Series(y_up).reset_index(drop=True)
+    y_down = pd.Series(y_down).reset_index(drop=True)
+    X = X.reset_index(drop=True)
    
     mask_up = ~y_up.isna()
     X_up = X[mask_up]
