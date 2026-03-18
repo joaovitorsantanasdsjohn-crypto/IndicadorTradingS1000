@@ -459,7 +459,7 @@ def build_ml_dataset(df):
         hit_sl_down = (future["high"] >= entry * (1 + sl)).any()
 
         # mantém só casos válidos (igual sua lógica)
-        if (hit_tp_up != hit_sl_up) or (hit_tp_down != hit_sl_down):
+        if (hit_tp_up != hit_sl_up) and (hit_tp_down != hit_sl_down):
             valid_idx.append(i)
 
             # UP target
