@@ -536,7 +536,12 @@ def train_ml(symbol):
 
     result = build_ml_dataset(df)
 
-    if result is None:
+    X_up, y_up, X_down, y_down = result
+
+    if X_up is None or y_up is None:
+        return
+
+    if X_down is None or y_down is None:
         return
 
     X_up, y_up, X_down, y_down = result
