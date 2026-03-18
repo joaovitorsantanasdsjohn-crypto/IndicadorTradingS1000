@@ -486,6 +486,14 @@ def build_ml_dataset(df):
         return None, None, None
 
     X = df.select_dtypes("number").copy()
+   
+    mask_up = ~y_up.isna()
+    X_up = X[mask_up]
+    y_up = y_up[mask_up]
+
+    mask_down = ~y_down.isna()
+    X_down = X[mask_down]
+    y_down = y_down[mask_down]
 
     # balanceamento (igual seu código)
     def balance(X, y):
