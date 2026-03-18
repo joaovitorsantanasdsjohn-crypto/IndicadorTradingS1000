@@ -432,12 +432,13 @@ def build_ml_dataset(df):
     df = df.dropna().copy()
 
     if len(df) < 200:
-        return None, None
+        return None, None, None
 
     tp = TAKE_PROFIT / (STAKE_AMOUNT * MULTIPLIER)
     sl = STOP_LOSS / (STAKE_AMOUNT * MULTIPLIER)
 
-    y = []
+    y_up = []
+    y_down = []
     valid_idx = []
 
     for i in range(len(df) - 8):
@@ -445,45 +446,72 @@ def build_ml_dataset(df):
         entry = df.iloc[i]["close"]
         future = df.iloc[i+1:i+8]
 
-        hit_tp = (future["high"] >= entry * (1 + tp)).any()
-        hit_sl = (future["low"] <= entry * (1 - sl)).any()
+        # =========================
+        # 🔵 UP
+        # =========================
+        hit_tp_up = (future["high"] >= entry * (1 + tp)).any()
+        hit_sl_up = (future["low"] <= entry * (1 - sl)).any()
 
-        if hit_tp and not hit_sl:
-            y.append(1)
+        # =========================
+        # 🔴 DOWN
+        # =========================
+        hit_tp_down = (future["low"] <= entry * (1 - tp)).any()
+        hit_sl_down = (future["high"] >= entry * (1 + sl)).any()
+
+        # mantém só casos válidos (igual sua lógica)
+        if (hit_tp_up and not hit_sl_up) or (hit_sl_up and not hit_tp_up) \
+        or (hit_tp_down and not hit_sl_down) or (hit_sl_down and not hit_tp_down):
+
             valid_idx.append(i)
 
-        elif hit_sl and not hit_tp:
-            y.append(0)
-            valid_idx.append(i)
+            # UP target
+            if hit_tp_up and not hit_sl_up:
+                y_up.append(1)
+            elif hit_sl_up and not hit_tp_up:
+                y_up.append(0)
+            else:
+                y_up.append(0)
 
-    # 🔥 alinhamento correto (ESSENCIAL)
+            # DOWN target
+            if hit_tp_down and not hit_sl_down:
+                y_down.append(1)
+            elif hit_sl_down and not hit_tp_down:
+                y_down.append(0)
+            else:
+                y_down.append(0)
+
     df = df.iloc[valid_idx].copy()
-    df["target"] = y
 
     df = df.dropna()
 
     if len(df) < 50:
-        return None, None
+        return None, None, None
 
-    X = df.select_dtypes("number").drop(columns=["target"])
-    y = df["target"]
+    X = df.select_dtypes("number")
 
-    comb = pd.concat([X, y], axis=1)
+    # balanceamento (igual seu código)
+    def balance(X, y):
+        comb = pd.concat([X, pd.Series(y, name="target")], axis=1)
 
-    maj = comb[comb.target == comb.target.mode()[0]]
-    mino = comb[comb.target != comb.target.mode()[0]]
+        maj = comb[comb.target == comb.target.mode()[0]]
+        mino = comb[comb.target != comb.target.mode()[0]]
 
-    if len(mino) > 10:
-        mino = resample(
-            mino,
-            replace=True,
-            n_samples=len(maj),
-            random_state=42
-        )
+        if len(mino) > 10:
+            mino = resample(
+                mino,
+                replace=True,
+                n_samples=len(maj),
+                random_state=42
+            )
 
-    comb = pd.concat([maj, mino])
+        comb = pd.concat([maj, mino])
 
-    return comb.drop("target", axis=1), comb["target"]
+        return comb.drop("target", axis=1), comb["target"]
+
+    X_up, y_up = balance(X, y_up)
+    X_down, y_down = balance(X, y_down)
+
+    return X_up, y_up, X_down, y_down
 
 
 def train_ml(symbol):
@@ -496,12 +524,20 @@ def train_ml(symbol):
     if len(df) < ML_MIN_TRAINED_SAMPLES:
         return
 
-    X, y = build_ml_dataset(df)
+    result = build_ml_dataset(df)
 
-    if X is None or len(set(y)) < 2:
+    if result is None:
         return
 
-    model = RandomForestClassifier(
+    X_up, y_up, X_down, y_down = result
+
+    if X_up is None or len(set(y_up)) < 2:
+        return
+
+    if X_down is None or len(set(y_down)) < 2:
+        return
+
+    model_up = RandomForestClassifier(
         n_estimators=350,
         max_depth=16,
         min_samples_leaf=6,
@@ -509,9 +545,18 @@ def train_ml(symbol):
         random_state=42
     )
 
-    model.fit(X, y)
+    model_down = RandomForestClassifier(
+        n_estimators=350,
+        max_depth=16,
+        min_samples_leaf=6,
+        n_jobs=-1,
+        random_state=42
+    )
 
-    ml_models[symbol] = (model, X.columns.tolist())
+    model_up.fit(X_up, y_up)
+    model_down.fit(X_down, y_down)
+
+    ml_models[symbol] = (model_up, model_down, X_up.columns.tolist())
     ml_model_ready[symbol] = True
     last_ml_train[symbol] = time.time()
 
@@ -524,21 +569,24 @@ async def train_ml_background(symbol):
 def ml_predict(symbol, row):
 
     if not ml_model_ready[symbol]:
-        return None
+        return None, None
 
-    model, cols = ml_models[symbol]
+    model_up, model_down, cols = ml_models[symbol]
 
     try:
         vals = [row[c] for c in cols]
     except:
-        return None
+        return None, None
 
     if any(pd.isna(v) for v in vals):
-        return None
+        return None, None
 
     X = pd.DataFrame([vals], columns=cols)
 
-    return model.predict_proba(X)[0][1]
+    prob_up = model_up.predict_proba(X)[0][1]
+    prob_down = model_down.predict_proba(X)[0][1]
+
+    return prob_up, prob_down
 
 
 # ============================================================
