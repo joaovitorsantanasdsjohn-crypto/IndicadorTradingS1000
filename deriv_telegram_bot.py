@@ -518,8 +518,8 @@ def build_ml_dataset(df):
 
         return comb.drop("target", axis=1), comb["target"]
 
-    X_up, y_up = balance(X, y_up)
-    X_down, y_down = balance(X, y_down)
+    X_up, y_up = balance(X_up, y_up)
+    X_down, y_down = balance(X_down, y_down)
 
     return X_up, y_up, X_down, y_down
 
