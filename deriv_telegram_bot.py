@@ -544,8 +544,6 @@ def train_ml(symbol):
     if X_down is None or y_down is None:
         return
 
-    X_up, y_up, X_down, y_down = result
-
     if X_up is None or len(set(y_up)) < 2:
         return
 
