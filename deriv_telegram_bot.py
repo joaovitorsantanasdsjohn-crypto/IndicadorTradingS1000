@@ -485,7 +485,7 @@ def build_ml_dataset(df):
     if len(df) < 50:
         return None, None, None
 
-    X = df.select_dtypes("number")
+    X = df.select_dtypes("number").copy()
 
     # balanceamento (igual seu código)
     def balance(X, y):
