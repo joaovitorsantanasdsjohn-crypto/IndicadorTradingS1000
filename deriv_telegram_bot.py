@@ -661,7 +661,7 @@ async def handle_proposal(ws,data):
 
 async def ws_loop(symbol):
 
-    global daily_pnl,trading_paused
+    global daily_pnl, trading_paused
 
     while True:
 
@@ -703,10 +703,8 @@ async def ws_loop(symbol):
                         save_ml_data()
 
                         if time.time() - last_ml_train[symbol] > 600:
-                        
                             asyncio.create_task(train_ml_background(symbol))
-                         
-                        
+
                         continue
 
 
@@ -737,68 +735,72 @@ async def ws_loop(symbol):
                             continue
 
                         # ==========================
-                        # 📊 ML PREDICT
+                        # 📊 ML PREDICT (NOVO)
                         # ==========================
-                        prob = ml_predict(symbol,row)
+                        prob_up, prob_down = ml_predict(symbol, row)
 
                         log(
                             f"ML | {symbol} | "
                             f"READY={ml_model_ready[symbol]} | "
                             f"ADX={row['adx']:.2f}"
-                           )
+                        )
 
-                        if prob is None:
-                           log(f"ML-HOLD | {symbol} | MODEL NOT READY")
-                           continue
+                        if prob_up is None:
+                            log(f"ML-HOLD | {symbol} | MODEL NOT READY")
+                            continue
 
-                        log(f"ML-PROB | {symbol} | PROB={prob:.3f}")
+                        log(f"ML-UP   | {symbol} | {prob_up:.3f}")
+                        log(f"ML-DOWN | {symbol} | {prob_down:.3f}")
 
                         if not market_exploding(row) and row["adx"] < 22:
-                           log(f"FILTER HOLD | {symbol} | LOW VOLATILITY")
-                           continue
-
-                        conf = max(prob,1-prob)
+                            log(f"FILTER HOLD | {symbol} | LOW VOLATILITY")
+                            continue
 
                         # ===================================================
                         # ✅ CONFIANÇA DINÂMICA BASEADA EM REGIME
                         # ===================================================
 
                         if row["adx"] >= 30:
-                            dynamic_threshold = 0.58   # tendência forte
+                            dynamic_threshold = 0.58
                         elif row["adx"] >= 24:
-                            dynamic_threshold = 0.61   # tendência saudável
+                            dynamic_threshold = 0.61
                         elif row["adx"] >= 18:
-                            dynamic_threshold = 0.63   # mercado neutro
+                            dynamic_threshold = 0.63
                         else:
-                            dynamic_threshold = 0.72   # lateral perigoso
+                            dynamic_threshold = 0.72
 
-                        # volatilidade extrema → exige mais confiança
                         if row["range_expansion"] > 1.6:
                             dynamic_threshold += 0.03
-
-                        if conf < dynamic_threshold:
-                            continue
 
                         ema_diff = abs(row["ema_fast"] - row["ema_slow"])
 
                         if ema_diff < 0.00005:
                             continue
 
-                        trend_up=row["ema_fast"]>row["ema_slow"]
-                        trend_down=row["ema_fast"]<row["ema_slow"]
+                        trend_up = row["ema_fast"] > row["ema_slow"]
+                        trend_down = row["ema_fast"] < row["ema_slow"]
 
-                        if prob>0.52 and trend_up:
-                            direction="UP"
-                        elif prob<=0.48 and trend_down:
-                            direction="DOWN"
+                        direction = None
+
+                        if prob_up > dynamic_threshold and prob_up > prob_down and trend_up:
+                            direction = "UP"
+
+                        elif prob_down > dynamic_threshold and prob_down > prob_up and trend_down:
+                            direction = "DOWN"
+
                         else:
                             continue
 
-                        # 🚫 evita entrar em armadilha institucional
+                        # 🚫 filtro institucional
                         if not institutional_trap_filter(row, direction):
                             continue
 
-                        await send_proposal(ws,symbol,direction)
+                        # 🚫 BLOQUEIO DAILY LOSS (FIX)
+                        if trading_paused or daily_pnl <= -DAILY_MAX_LOSS:
+                            trading_paused = True
+                            continue
+
+                        await send_proposal(ws, symbol, direction)
                         await asyncio.sleep(0.01)
                         continue
 
@@ -863,7 +865,6 @@ async def ws_loop(symbol):
             pending_buy_symbol[symbol] = False
             proposal_lock[symbol] = False
 
-            # só tenta fechar se ws existir
             if "ws" in locals():
                 try:
                     await ws.close()
@@ -871,7 +872,6 @@ async def ws_loop(symbol):
                     pass
 
             await asyncio.sleep(10)
-                        
                             
 # ============================================================
 # 🌍 FLASK
