@@ -483,7 +483,7 @@ def build_ml_dataset(df):
     df = df.dropna()
 
     if len(df) < 50:
-        return None, None, None
+    return None, None, None, None
 
     X = df.select_dtypes("number").copy()
     
