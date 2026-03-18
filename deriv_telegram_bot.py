@@ -418,7 +418,7 @@ def institutional_trap_filter(row, direction):
     if row["body_ratio"] < 0.25:
         return False
     # evita entrar muito longe da EMA200
-    if abs(row["dist_ema200"]) > 0.007:
+    if abs(row["dist_ema200"]) > 0.005:
         return False     
 
     return True
