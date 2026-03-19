@@ -597,8 +597,8 @@ def ml_predict(symbol, row):
 
     X = pd.DataFrame([vals], columns=cols)
 
-    prob_up = model_up.predict_proba(X)[0][1]
-    prob_down = model_down.predict_proba(X)[0][1]
+    prob_up = model_up.predict_proba(X)[0][1] * ML_CALIBRATION_FACTOR
+    prob_down = model_down.predict_proba(X)[0][1] * ML_CALIBRATION_FACTOR
 
     return prob_up, prob_down
 
