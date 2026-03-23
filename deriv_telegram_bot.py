@@ -751,6 +751,10 @@ async def ws_loop(symbol):
 
                         if not market_is_good(row):
                             continue
+                        
+                        if row["adx"] < 20 and not market_exploding(row):
+                            continue
+                            
 
                         # ==========================
                         # 📊 ML PREDICT (NOVO)
@@ -769,9 +773,7 @@ async def ws_loop(symbol):
 
                         log(f"ML-UP   | {symbol} | {prob_up:.3f}")
                         log(f"ML-DOWN | {symbol} | {prob_down:.3f}")
-
-                        if row["adx"] < 20 and not market_exploding(row):
-                            continue
+                        
 
                         # ===================================================
                         # ✅ CONFIANÇA DINÂMICA BASEADA EM REGIME
