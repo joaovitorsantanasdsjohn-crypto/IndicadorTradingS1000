@@ -420,9 +420,11 @@ def institutional_trap_filter(row, direction):
         if row["body_ratio"] < 0.25:
             return False
    
-    # evita entrar muito longe da EMA200
-    if abs(row["dist_ema200"]) > 0.005:
-        return False     
+    # relaxa distância da EMA em mercado explosivo
+    if not market_exploding(row):
+
+        if abs(row["dist_ema200"]) > 0.005:
+            return False
 
     return True
 
