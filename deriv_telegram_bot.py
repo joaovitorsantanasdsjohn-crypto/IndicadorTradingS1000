@@ -792,7 +792,7 @@ async def ws_loop(symbol):
 
                         ema_diff = abs(row["ema_fast"] - row["ema_slow"])
 
-                        if ema_diff < 0.00005:
+                        if ema_diff < 0.00003 and row["adx"] < 22:
                             continue
 
                         trend_up = row["ema_fast"] > row["ema_slow"]
