@@ -751,8 +751,9 @@ async def ws_loop(symbol):
 
                         if not market_is_good(row):
                             continue
-                        
-                        if row["adx"] < 20 and not market_exploding(row):
+
+                        # ajuste fino de lateralidade
+                        if row["adx"] < 22 and not market_exploding(row):
                             continue
                             
 
