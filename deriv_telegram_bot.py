@@ -814,7 +814,8 @@ async def ws_loop(symbol):
 
                         # 🚫 filtro institucional
                         if not institutional_trap_filter(row, direction):
-                            continue
+                            if not market_exploding(row):
+                                continue
 
                         # 🚫 BLOQUEIO DAILY LOSS (FIX)
                         if trading_paused or daily_pnl <= -DAILY_MAX_LOSS:
