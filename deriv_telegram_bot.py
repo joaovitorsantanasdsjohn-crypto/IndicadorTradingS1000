@@ -411,13 +411,15 @@ def institutional_trap_filter(row, direction):
     if row["liquidity_sweep_low"] == 1 and direction == "DOWN":
         return False
 
-    # vela com rejeição extrema
-    if row["wick_ratio"] > 0.65:
-        return False
+    # Se mercado está explodindo, relaxa filtro
+    if not market_exploding(row):
 
-    # corpo muito pequeno = indecisão
-    if row["body_ratio"] < 0.25:
-        return False
+        if row["wick_ratio"] > 0.65:
+            return False
+
+        if row["body_ratio"] < 0.25:
+            return False
+   
     # evita entrar muito longe da EMA200
     if abs(row["dist_ema200"]) > 0.005:
         return False     
