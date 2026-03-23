@@ -49,7 +49,7 @@ MULTIPLIER = 100
 TAKE_PROFIT = 0.4
 STOP_LOSS = 0.2
 
-TRADE_COOLDOWN_SECONDS = 30
+TRADE_COOLDOWN_SECONDS = 180
 DAILY_MAX_LOSS = 1.0
 
 WATCHDOG_TIMEOUT = 900
@@ -787,8 +787,9 @@ async def ws_loop(symbol):
                         else:
                             dynamic_threshold = 0.72
 
-                        if row["range_expansion"] > 1.6:
-                            dynamic_threshold += 0.03
+                        # evita entrar em vela já esticada demais
+                        if row["body_ratio"] > 0.75 and row["range_expansion"] > 1.5:
+                            continue
 
                         ema_diff = abs(row["ema_fast"] - row["ema_slow"])
 
