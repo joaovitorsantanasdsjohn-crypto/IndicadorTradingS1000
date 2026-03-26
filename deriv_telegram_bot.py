@@ -378,7 +378,7 @@ def market_is_good(row):
     if row["adx"] < 18:
         return False
 
-    if row["bb_width"] < 0.0018:
+    if row["bb_width"] < 0.0016:
         return False
 
     if abs(row["ema200_slope"]) < 1e-6:
@@ -423,7 +423,7 @@ def institutional_trap_filter(row, direction):
     # relaxa distância da EMA em mercado explosivo
     if not market_exploding(row):
 
-        if abs(row["dist_ema200"]) > 0.005:
+        if abs(row["dist_ema200"]) > 0.007:
             return False
 
     return True
