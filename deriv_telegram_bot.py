@@ -781,13 +781,13 @@ async def ws_loop(symbol):
                         # ===================================================
 
                         if row["adx"] >= 30:
-                            dynamic_threshold = 0.58
+                            dynamic_threshold = 0.55
                         elif row["adx"] >= 24:
-                            dynamic_threshold = 0.61
+                            dynamic_threshold = 0.57
                         elif row["adx"] >= 18:
-                            dynamic_threshold = 0.63
+                            dynamic_threshold = 0.61
                         else:
-                            dynamic_threshold = 0.72
+                            dynamic_threshold = 0.68
 
                         # evita entrar em vela já esticada demais
                         if row["body_ratio"] > 0.75 and row["range_expansion"] > 1.5:
