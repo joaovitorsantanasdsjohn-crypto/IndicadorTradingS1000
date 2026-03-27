@@ -794,11 +794,11 @@ async def ws_loop(symbol):
                         # ===================================================
 
                         if row["adx"] >= 30:
-                            dynamic_threshold = 0.55
+                            dynamic_threshold = 0.58
                         elif row["adx"] >= 24:
-                            dynamic_threshold = 0.57
+                            dynamic_threshold = 0.60
                         elif row["adx"] >= 18:
-                            dynamic_threshold = 0.61
+                            dynamic_threshold = 0.65
                         else:
                             dynamic_threshold = 0.68
 
