@@ -691,6 +691,17 @@ async def ws_loop(symbol):
                 ping_timeout=40,
                 max_queue=None
             ) as ws:
+                
+                async def watchdog():
+                    while True:
+                        await asyncio.sleep(5)
+
+                        if time.time() - last_activity_time[symbol] > 30:
+                            log(f"{symbol} ⚠️ WS STALL DETECTED")
+                            await ws.close()
+                            break
+
+                asyncio.create_task(watchdog())
 
                 await ws.send(json.dumps({"authorize":DERIV_TOKEN}))
                 await ws.recv()
