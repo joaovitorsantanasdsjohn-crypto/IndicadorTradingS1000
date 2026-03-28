@@ -899,6 +899,11 @@ async def ws_loop(symbol):
 
             pending_buy_symbol[symbol] = False
             proposal_lock[symbol] = False
+            pending_proposals.clear()
+
+            # 🔥 RESET LIMPO
+            candles[symbol] = pd.DataFrame()
+            ml_model_ready[symbol] = False
 
             if "ws" in locals():
                 try:
@@ -906,7 +911,7 @@ async def ws_loop(symbol):
                 except:
                     pass
 
-            await asyncio.sleep(10)
+         await asyncio.sleep(10)
                             
 # ============================================================
 # 🌍 FLASK
