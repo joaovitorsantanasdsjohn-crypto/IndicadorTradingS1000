@@ -746,8 +746,8 @@ async def ws_loop(symbol):
 
                         candles[symbol]=calcular_indicadores(df)
                         if time.time() - last_save_time[symbol] > 30:
-                                 save_ml_data()
-                                 last_save_time[symbol] = time.time()
+                            save_ml_data()
+                            last_save_time[symbol] = time.time()
 
                         if time.time() - last_ml_train[symbol] > 600:
                             asyncio.create_task(train_ml_background(symbol))
