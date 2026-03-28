@@ -771,7 +771,7 @@ async def ws_loop(symbol):
                                 continue
 
                         if epoch == last_candle_epoch[symbol]:
-                              continue
+                            continue
 
                         last_candle_epoch[symbol]=epoch
 
