@@ -155,6 +155,14 @@ def load_ml_data():
 
 load_ml_data()
 
+for s in SYMBOLS:
+    if os.path.exists(f"model_{s}.pkl"):
+        try:
+            ml_models[s] = joblib.load(f"model_{s}.pkl")
+            ml_model_ready[s] = True
+            log(f"{s} ML LOADED FROM FILE")
+        except:
+            pass
 
 # ============================================================
 # 📝 LOG
