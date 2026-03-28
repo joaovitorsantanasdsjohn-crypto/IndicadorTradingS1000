@@ -786,6 +786,9 @@ async def ws_loop(symbol):
                             save_ml_data()
                             last_save_time[symbol] = time.time()
 
+                        if len(df) < 300:
+                            continue
+                        
                         row=df.iloc[-2]
 
                         if not forex_session_ok():
