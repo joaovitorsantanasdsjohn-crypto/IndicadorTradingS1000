@@ -710,7 +710,7 @@ async def ws_loop(symbol):
                     while True:
                         await asyncio.sleep(5)
 
-                        if time.time() - last_activity_time[symbol] > 30:
+                        if time.time() - last_activity_time[symbol] > 10:
                             log(f"{symbol} ⚠️ WS STALL DETECTED")
                             await ws.close()
                             break
@@ -745,7 +745,7 @@ async def ws_loop(symbol):
                         df["volume"]=1
 
                         candles[symbol]=calcular_indicadores(df)
-                        if time.time() - last_save_time[symbol] > 10:
+                        if time.time() - last_save_time[symbol] > 30:
                             save_ml_data()
                             last_save_time[symbol] = time.time()
 
@@ -782,7 +782,7 @@ async def ws_loop(symbol):
 
                         df["volume"]=1
                         candles[symbol]=calcular_indicadores(df)
-                        if time.time() - last_save_time[symbol] > 10:
+                        if time.time() - last_save_time[symbol] > 30:
                             save_ml_data()
                             last_save_time[symbol] = time.time()
 
