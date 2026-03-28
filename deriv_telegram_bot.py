@@ -746,6 +746,16 @@ async def ws_loop(symbol):
 
                         if epoch==last_candle_epoch[symbol]:
                             continue
+                            
+                            # 🔥 DETECTAR GAP
+                            if last_candle_epoch[symbol] != 0:
+                                expected = last_candle_epoch[symbol] + GRANULARITY_SECONDS
+
+                                if epoch != expected:
+                                    log(f"{symbol} ⚠️ GAP DETECTED — RESET")
+                                    candles[symbol] = pd.DataFrame()
+                                    ml_model_ready[symbol] = False
+                                    continue
 
                         last_candle_epoch[symbol]=epoch
 
