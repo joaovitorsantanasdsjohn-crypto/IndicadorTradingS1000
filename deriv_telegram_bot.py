@@ -782,7 +782,9 @@ async def ws_loop(symbol):
 
                         df["volume"]=1
                         candles[symbol]=calcular_indicadores(df)
-                        save_ml_data()
+                        if time.time() - last_save_time[symbol] > 30:
+                            save_ml_data()
+                            last_save_time[symbol] = time.time()
 
                         row=df.iloc[-2]
 
