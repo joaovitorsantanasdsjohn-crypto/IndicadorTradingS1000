@@ -160,7 +160,7 @@ for s in SYMBOLS:
         try:
             ml_models[s] = joblib.load(f"model_{s}.pkl")
             ml_model_ready[s] = True
-            log(f"{s} ML LOADED FROM FILE")
+            print(f"{s} ML LOADED FROM FILE")
         except:
             pass
 
