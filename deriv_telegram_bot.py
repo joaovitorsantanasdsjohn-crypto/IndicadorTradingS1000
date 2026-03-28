@@ -820,6 +820,10 @@ async def ws_loop(symbol):
                         log(f"ML-UP   | {symbol} | {prob_up:.3f}")
                         log(f"ML-DOWN | {symbol} | {prob_down:.3f}")
                         
+                        confidence_gap = abs(prob_up - prob_down)
+
+                        if confidence_gap < 0.08:
+                            continue
 
                         # ===================================================
                         # ✅ CONFIANÇA DINÂMICA BASEADA EM REGIME
