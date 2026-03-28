@@ -6,6 +6,7 @@ import threading
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Tuple
+import joblib
 
 import pandas as pd
 import websockets
