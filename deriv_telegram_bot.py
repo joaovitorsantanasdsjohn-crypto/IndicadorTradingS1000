@@ -540,6 +540,9 @@ def build_ml_dataset(df):
 
 
 def train_ml(symbol):
+    
+    if time.time() - last_activity_time[symbol] > 5:
+        return
 
     if time.time() - last_ml_train[symbol] < 300:
         return
