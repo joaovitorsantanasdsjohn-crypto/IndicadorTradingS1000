@@ -577,6 +577,7 @@ def train_ml(symbol):
     model_down.fit(X_down, y_down)
 
     ml_models[symbol] = (model_up, model_down, X_up.columns.tolist())
+    joblib.dump(ml_models[symbol], f"model_{symbol}.pkl")
     ml_model_ready[symbol] = True
     last_ml_train[symbol] = time.time()
 
