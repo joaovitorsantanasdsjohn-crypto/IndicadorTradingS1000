@@ -446,7 +446,7 @@ def build_ml_dataset(df):
 
     df = df.dropna().copy()
 
-    if len(df) < 200:
+    if len(df) < 300:
         return None, None, None, None
 
     tp = TAKE_PROFIT / (STAKE_AMOUNT * MULTIPLIER)
@@ -745,7 +745,7 @@ async def ws_loop(symbol):
                         df["volume"]=1
 
                         candles[symbol]=calcular_indicadores(df)
-                        if time.time() - last_save_time[symbol] > 30:
+                        if time.time() - last_save_time[symbol] > 10:
                             save_ml_data()
                             last_save_time[symbol] = time.time()
 
@@ -782,7 +782,7 @@ async def ws_loop(symbol):
 
                         df["volume"]=1
                         candles[symbol]=calcular_indicadores(df)
-                        if time.time() - last_save_time[symbol] > 30:
+                        if time.time() - last_save_time[symbol] > 10:
                             save_ml_data()
                             last_save_time[symbol] = time.time()
 
