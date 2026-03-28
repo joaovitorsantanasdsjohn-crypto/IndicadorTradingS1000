@@ -912,7 +912,7 @@ async def ws_loop(symbol):
                 except:
                     pass
 
-         await asyncio.sleep(10)
+        await asyncio.sleep(10)
                             
 # ============================================================
 # 🌍 FLASK
