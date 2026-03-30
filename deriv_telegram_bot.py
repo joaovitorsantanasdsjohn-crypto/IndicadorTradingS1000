@@ -370,6 +370,40 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["market_structure_bias"] = (
         df["higher_high"] - df["lower_low"]
     )
+    # ============================================================
+    # 🧠 FEATURES DE CONTEXTO (PULLBACK / EXAUSTÃO)
+    # ============================================================
+
+    # 📉 Distância das EMAs (detecta preço esticado)
+    df["dist_ema_fast"] = (df["close"] - df["ema_fast"]) / df["ema_fast"]
+    df["dist_ema_slow"] = (df["close"] - df["ema_slow"]) / df["ema_slow"]
+
+    # 🔥 Z-score (sobrecompra / sobrevenda real)
+    rolling_mean = df["close"].rolling(20).mean()
+    rolling_std = df["close"].rolling(20).std()
+    df["zscore_price"] = (df["close"] - rolling_mean) / rolling_std
+
+    # 📊 Range position suavizado (menos ruído)
+    df["range_position_smooth"] = df["range_position"].rolling(3).mean()
+
+    # 🧠 Pullback real baseado em ATR
+    df["pullback_strength"] = (
+        (df["close"] - df["close"].rolling(5).max()) /
+        df["atr"]
+    )
+
+    # ⚡ Velocidade e aceleração do preço
+    df["price_velocity"] = df["close"].diff(3)
+    df["price_acceleration"] = df["price_velocity"].diff()
+
+    # 🔄 Sequência de candles (micro tendência)
+    df["bullish_seq"] = (
+        (df["close"] > df["open"]).astype(int)
+    ).rolling(5).sum()
+
+    df["bearish_seq"] = (
+        (df["close"] < df["open"]).astype(int)
+    ).rolling(5).sum()
 
     return df
 
