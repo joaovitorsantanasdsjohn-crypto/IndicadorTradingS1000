@@ -401,7 +401,7 @@ def market_is_good(row):
     if row["adx"] < 18:
         return False
 
-    if row["bb_width"] < 0.0016:
+    if row["bb_width"] < 0.0012:
         return False
 
     if abs(row["ema200_slope"]) < 1e-6:
