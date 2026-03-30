@@ -763,17 +763,30 @@ async def ws_loop(symbol):
                         if last_candle_epoch[symbol] != 0:
                             expected = last_candle_epoch[symbol] + GRANULARITY_SECONDS
 
-                            if epoch != expected:
-                                log(f"{symbol} ⚠️ GAP DETECTED — RESET")
+                            gap = epoch - last_candle_epoch[symbol]
+
+                            # aceita gap grande (fim de semana / reconexão)
+                            if gap > (GRANULARITY_SECONDS * 3):
+
+                                log(f"{symbol} ⚠️ BIG GAP DETECTED (OK - MARKET REOPEN)")
+
+                                # apenas reseta sem entrar em loop
                                 candles[symbol] = pd.DataFrame()
                                 ml_model_ready[symbol] = False
+
                                 last_candle_epoch[symbol] = epoch
                                 continue
 
-                        if epoch == last_candle_epoch[symbol]:
-                            continue
+                            # GAP pequeno = erro real
+                            elif gap != GRANULARITY_SECONDS:
 
-                        last_candle_epoch[symbol]=epoch
+                                log(f"{symbol} ⚠️ SMALL GAP ERROR — RESET")
+
+                                candles[symbol] = pd.DataFrame()
+                                ml_model_ready[symbol] = False
+
+                                last_candle_epoch[symbol] = epoch
+                                continue
 
                         df=candles[symbol]
                         df=pd.concat(
