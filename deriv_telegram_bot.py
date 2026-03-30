@@ -445,6 +445,54 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
         (df["close"] > df["close"].shift(1)) &
         (df["rsi"] < df["rsi"].shift(1))
     ).astype(int)
+    
+    # ============================================================
+    # 🏦 LIQUIDEZ INSTITUCIONAL (SMART MONEY)
+    # ============================================================
+
+    # 📊 Distância do topo/fundo recente (zona de liquidez)
+    df["dist_to_high"] = (
+        df["rolling_high_20"] - df["close"]
+    ) / df["close"]
+
+    df["dist_to_low"] = (
+        df["close"] - df["rolling_low_20"]
+    ) / df["close"]
+
+    # 🔥 Proximidade de liquidez
+    df["near_liquidity_high"] = (df["dist_to_high"] < 0.0015).astype(int)
+    df["near_liquidity_low"]  = (df["dist_to_low"] < 0.0015).astype(int)
+
+    # ⚡ Sweep com rejeição forte (chave)
+    df["liquidity_rejection_up"] = (
+        (df["liquidity_sweep_high"] == 1) &
+        (df["close"] < df["open"])
+    ).astype(int)
+
+    df["liquidity_rejection_down"] = (
+        (df["liquidity_sweep_low"] == 1) &
+        (df["close"] > df["open"])
+    ).astype(int)
+
+    # 🧠 Pressão institucional (wick dominante)
+    df["upper_wick_dominance"] = (
+        df["upper_wick"] > df["body"] * 1.5
+    ).astype(int)
+
+    df["lower_wick_dominance"] = (
+        df["lower_wick"] > df["body"] * 1.5
+    ).astype(int)
+
+    # 📉 Absorção de movimento (falsa continuação)
+    df["absorption_up"] = (
+        (df["close"] > df["open"]) &
+        (df["upper_wick"] > df["body"] * 1.5)
+    ).astype(int)
+
+    df["absorption_down"] = (
+        (df["close"] < df["open"]) &
+        (df["lower_wick"] > df["body"] * 1.5)
+    ).astype(int)
 
     return df
 
