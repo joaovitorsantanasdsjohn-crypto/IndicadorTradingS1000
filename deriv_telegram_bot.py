@@ -398,10 +398,10 @@ def market_is_open():
 
 def market_is_good(row):
 
-    if row["adx"] < 18:
+    if row["adx"] < 14:
         return False
 
-    if row["bb_width"] < 0.0012:
+    if row["bb_width"] < 0.0009:
         return False
 
     if abs(row["ema200_slope"]) < 1e-6:
