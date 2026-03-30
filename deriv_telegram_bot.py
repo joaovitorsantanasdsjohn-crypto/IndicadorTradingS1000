@@ -381,7 +381,20 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 def forex_session_ok():
     utc_hour=datetime.utcnow().hour
     return 6 <= utc_hour <= 19
+    
+def market_is_open():
+    now = datetime.utcnow()
+    weekday = now.weekday()  # 0=segunda, 6=domingo
 
+    # domingo = fechado
+    if weekday == 6:
+        return False
+
+    # sábado = fechado
+    if weekday == 5:
+        return False
+
+    return True
 
 def market_is_good(row):
 
