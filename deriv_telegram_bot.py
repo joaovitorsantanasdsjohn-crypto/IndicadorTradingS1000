@@ -404,6 +404,47 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     df["bearish_seq"] = (
         (df["close"] < df["open"]).astype(int)
     ).rolling(5).sum()
+    
+    # ============================================================
+    # 🔄 FEATURES DE REVERSÃO (NÍVEL AVANÇADO)
+    # ============================================================
+
+    # 📉 Perda de força da tendência
+    df["trend_strength"] = abs(df["ema_fast"] - df["ema_slow"])
+    df["trend_strength_change"] = df["trend_strength"].diff()
+
+    # 🔥 Exaustão do movimento
+    df["overextended_up"] = (
+        (df["bullish_seq"] >= 4) &
+        (df["zscore_price"] > 1.5)
+    ).astype(int)
+
+    df["overextended_down"] = (
+        (df["bearish_seq"] >= 4) &
+        (df["zscore_price"] < -1.5)
+    ).astype(int)
+
+    # ⚡ Falha de continuação (muito importante)
+    df["failed_break_up"] = (
+        (df["high"] > df["high"].shift(1)) &
+        (df["close"] < df["close"].shift(1))
+    ).astype(int)
+
+    df["failed_break_down"] = (
+        (df["low"] < df["low"].shift(1)) &
+        (df["close"] > df["close"].shift(1))
+    ).astype(int)
+
+    # 🧠 Divergência simples (preço vs RSI)
+    df["rsi_divergence_up"] = (
+        (df["close"] < df["close"].shift(1)) &
+        (df["rsi"] > df["rsi"].shift(1))
+    ).astype(int)
+
+    df["rsi_divergence_down"] = (
+        (df["close"] > df["close"].shift(1)) &
+        (df["rsi"] < df["rsi"].shift(1))
+    ).astype(int)
 
     return df
 
