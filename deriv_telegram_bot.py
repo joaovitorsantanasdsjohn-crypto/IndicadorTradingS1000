@@ -710,6 +710,11 @@ async def ws_loop(symbol):
 
     while True:
 
+        if not market_is_open():
+            log(f"{symbol} 💤 MARKET CLOSED")
+            await asyncio.sleep(300)
+            continue
+
         try:
 
             async with websockets.connect(
