@@ -966,10 +966,9 @@ async def ws_loop(symbol):
             proposal_lock[symbol] = False
             pending_proposals.clear()
 
-            # 🔥 RESET LIMPO
-            candles[symbol] = pd.DataFrame()
-            ml_model_ready[symbol] = False
-
+            # 🔥 Não tem reset mais
+            log(f"{symbol} reconnect - mantendo dados")
+            
             if "ws" in locals():
                 try:
                     await ws.close()
