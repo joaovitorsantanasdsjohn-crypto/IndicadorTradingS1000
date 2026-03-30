@@ -788,9 +788,8 @@ async def ws_loop(symbol):
 
                                 log(f"{symbol} ⚠️ BIG GAP DETECTED (OK - MARKET REOPEN)")
 
-                                # apenas reseta sem entrar em loop
-                                candles[symbol] = pd.DataFrame()
-                                ml_model_ready[symbol] = False
+                                # Não reseta mais
+                                log(f"{symbol} reconnect - mantendo dados")
 
                                 last_candle_epoch[symbol] = epoch
                                 continue
@@ -800,8 +799,7 @@ async def ws_loop(symbol):
 
                                 log(f"{symbol} ⚠️ SMALL GAP ERROR — RESET")
 
-                                candles[symbol] = pd.DataFrame()
-                                ml_model_ready[symbol] = False
+                                log(f"{symbol} reconnect - mantendo dados")
 
                                 last_candle_epoch[symbol] = epoch
                                 continue
