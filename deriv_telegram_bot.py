@@ -795,8 +795,8 @@ async def ws_loop(symbol):
                                 continue
 
                             # GAP pequeno = erro real
-                            elif gap != GRANULARITY_SECONDS:
-
+                            elif gap > GRANULARITY_SECONDS * 2:
+                                
                                 log(f"{symbol} ⚠️ SMALL GAP ERROR — RESET")
 
                                 log(f"{symbol} reconnect - mantendo dados")
