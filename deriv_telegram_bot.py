@@ -829,7 +829,7 @@ async def ws_loop(symbol):
                             continue
 
                         # ajuste fino de lateralidade
-                        if row["adx"] < 22 and not market_exploding(row):
+                        if row["adx"] < 20 and not market_exploding(row):
                             continue
                             
 
