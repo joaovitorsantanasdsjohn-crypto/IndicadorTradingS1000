@@ -560,16 +560,16 @@ def institutional_trap_filter(row, direction):
     # Se mercado está explodindo, relaxa filtro
     if not market_exploding(row):
 
-        if row["wick_ratio"] > 0.65:
+        if row["wick_ratio"] > 0.80:
             return False
 
-        if row["body_ratio"] < 0.25:
+        if row["body_ratio"] < 0.15:
             return False
    
     # relaxa distância da EMA em mercado explosivo
     if not market_exploding(row):
 
-        if abs(row["dist_ema200"]) > 0.007:
+        if abs(row["dist_ema200"]) > 0.012:
             return False
 
     return True
