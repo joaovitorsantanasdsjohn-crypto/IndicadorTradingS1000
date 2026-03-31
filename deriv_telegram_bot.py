@@ -388,8 +388,9 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
 
     # 🧠 Pullback real baseado em ATR
     df["pullback_strength"] = (
-        (df["close"] - df["close"].rolling(5).max()) /
-        df["atr"]
+    (df["close"] - df["close"].rolling(5).max()) /
+    df["atr"].replace(0,1e-9)
+        
     )
 
     # ⚡ Velocidade e aceleração do preço
