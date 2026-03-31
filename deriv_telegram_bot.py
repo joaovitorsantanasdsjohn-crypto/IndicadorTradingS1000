@@ -569,7 +569,7 @@ def institutional_trap_filter(row, direction):
     # relaxa distância da EMA em mercado explosivo
     if not market_exploding(row):
 
-        if abs(row["dist_ema200"]) > 0.012:
+        if abs(row["dist_ema200"]) > 0.009:
             return False
 
     return True
@@ -981,14 +981,14 @@ async def ws_loop(symbol):
                         if row["adx"] >= 30:
                             dynamic_threshold = 0.58
                         elif row["adx"] >= 24:
-                            dynamic_threshold = 0.60
+                            dynamic_threshold = 0.62
                         elif row["adx"] >= 18:
                             dynamic_threshold = 0.65
                         else:
                             dynamic_threshold = 0.68
 
                         # evita entrar em vela já esticada demais
-                        if row["body_ratio"] > 0.75 and row["range_expansion"] > 1.5:
+                        if row["body_ratio"] > 0.70 and row["range_expansion"] > 1.5:
                             continue
 
                         ema_diff = abs(row["ema_fast"] - row["ema_slow"])
