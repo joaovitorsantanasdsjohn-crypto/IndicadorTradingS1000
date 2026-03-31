@@ -393,9 +393,8 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # ⚡ Velocidade e aceleração do preço
-    df["price_velocity"] = df["close"].diff(3)
+    df["price_velocity"] = df["close"].pct_change(3)
     df["price_acceleration"] = df["price_velocity"].diff()
-
     # 🔄 Sequência de candles (micro tendência)
     df["bullish_seq"] = (
         (df["close"] > df["open"]).astype(int)
