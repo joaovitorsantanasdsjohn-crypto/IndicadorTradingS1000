@@ -1001,16 +1001,14 @@ async def ws_loop(symbol):
 
                         if ema_diff < 0.00003 and row["adx"] < 22:
                             continue
-
-                        trend_up = row["ema_fast"] > row["ema_slow"]
-                        trend_down = row["ema_fast"] < row["ema_slow"]
+                        
 
                         direction = None
 
-                        if prob_up > dynamic_threshold and prob_up > prob_down and trend_up:
+                        if prob_up > dynamic_threshold and prob_up > prob_down:
                             direction = "UP"
 
-                        elif prob_down > dynamic_threshold and prob_down > prob_up and trend_down:
+                        elif prob_down > dynamic_threshold and prob_down > prob_up:
                             direction = "DOWN"
 
                         else:
