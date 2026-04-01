@@ -36,7 +36,13 @@ DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 APP_ID = os.getenv("DERIV_APP_ID", "111022")
 WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
-SYMBOLS = ["frxEURUSD","frxUSDJPY","frxGBPUSD","frxAUDUSD","frxUSDCHF"]
+SYMBOLS = [
+    "frxEURUSD",
+    "frxUSDJPY",
+    "frxGBPUSD",
+    "frxAUDUSD",
+    "frxUSDCHF"
+]
 
 GRANULARITY_SECONDS = 900
 HISTORY_COUNT = 3000
