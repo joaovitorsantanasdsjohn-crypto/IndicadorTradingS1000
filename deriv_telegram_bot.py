@@ -915,6 +915,9 @@ async def ws_loop(symbol):
 
                         epoch = data["ohlc"]["epoch"]
 
+                        if epoch <= last_candle_epoch[symbol]:
+                            continue
+
                         # 🔥 DETECTAR GAP (ANTES DE QUALQUER CONTINUE)
                             
                         gap = epoch - last_candle_epoch[symbol]
