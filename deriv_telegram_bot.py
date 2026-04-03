@@ -938,10 +938,12 @@ async def ws_loop(symbol):
                                 log(f"{symbol} ⚠️ SMALL GAP ERROR — RESET")
 
                                 log(f"{symbol} reconnect - mantendo dados")
-                                last_candle_epoch[symbol] = epoch
                                 
+                                last_candle_epoch[symbol] = epoch             
                                 continue
-
+                                
+                                last_candle_epoch[symbol] = epoch
+                        
                         df=candles[symbol]
                         df=pd.concat(
                             [df,pd.DataFrame([data["ohlc"]])]
