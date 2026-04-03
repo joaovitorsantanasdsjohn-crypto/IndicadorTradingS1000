@@ -853,8 +853,8 @@ async def ws_loop(symbol):
 
             async with websockets.connect(
                 WS_URL,
-                ping_interval=40,
-                ping_timeout=40,
+                ping_interval=60,
+                ping_timeout=60,
                 max_queue=None
             ) as ws:
                 
