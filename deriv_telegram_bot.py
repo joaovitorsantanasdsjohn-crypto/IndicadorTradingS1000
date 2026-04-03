@@ -38,7 +38,7 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 SYMBOLS = [ 
     "frxUSDJPY",
-    "frxGBPUSD",
+    "frxGBPJPY",
     "frxAUDUSD"
 ]
 
