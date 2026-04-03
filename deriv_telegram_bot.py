@@ -939,8 +939,8 @@ async def ws_loop(symbol):
 
                                 log(f"{symbol} reconnect - mantendo dados")
                                
-                            last_candle_epoch[symbol] = epoch     
-                            continue
+                                last_candle_epoch[symbol] = epoch     
+                                continue
                             
                         last_candle_epoch[symbol] = epoch
                         
