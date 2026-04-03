@@ -868,6 +868,7 @@ async def ws_loop(symbol):
                             break
 
                 asyncio.create_task(watchdog())
+                asyncio.create_task(keep_alive(ws))
 
                 await ws.send(json.dumps({"authorize":DERIV_TOKEN}))
                 await ws.recv()
