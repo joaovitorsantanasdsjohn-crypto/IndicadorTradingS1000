@@ -920,7 +920,7 @@ async def ws_loop(symbol):
 
                         # 🔥 DETECTAR GAP (ANTES DE QUALQUER CONTINUE)
                             
-                        gap = epoch - last_candle_epoch[symbol]
+                            gap = epoch - last_candle_epoch[symbol]
 
                             # aceita gap grande (fim de semana / reconexão)
                             if gap > (GRANULARITY_SECONDS * 3):
