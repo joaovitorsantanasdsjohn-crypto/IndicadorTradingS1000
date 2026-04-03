@@ -864,7 +864,7 @@ async def ws_loop(symbol):
                     while True:
                         await asyncio.sleep(5)
 
-                        if time.time() - last_activity_time[symbol] > 180:
+                        if time.time() - last_activity_time[symbol] > WATCHDOG_TIMEOUT:
                             log(f"{symbol} ⚠️ WS STALL DETECTED")
                             await ws.close()
                             break
