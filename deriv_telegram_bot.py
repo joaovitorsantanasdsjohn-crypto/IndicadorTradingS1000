@@ -830,6 +830,14 @@ async def handle_proposal(ws,data):
 # 🌐 LOOP WS
 # ============================================================
 
+async def keep_alive(ws):
+    while True:
+        try:
+            await ws.send(json.dumps({"ping": 1}))
+        except:
+            break
+        await asyncio.sleep(30)
+
 async def ws_loop(symbol):
 
     global daily_pnl, trading_paused
