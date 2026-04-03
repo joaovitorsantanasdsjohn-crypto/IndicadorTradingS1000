@@ -1098,14 +1098,14 @@ async def ws_loop(symbol):
             log(f"{symbol} WS reconnect {e}")
             reconnect_attempts += 1
         
-        if reconnect_attempts >= 5:
-            log(f"{symbol} 🔄 RESET FORÇADO")
+            if reconnect_attempts >= 5:
+                log(f"{symbol} 🔄 RESET FORÇADO")
 
-            candles[symbol] = pd.DataFrame()
-            ml_model_ready[symbol] = False
-            last_ml_train[symbol] = 0
+                candles[symbol] = pd.DataFrame()
+                ml_model_ready[symbol] = False
+                last_ml_train[symbol] = 0
 
-            reconnect_attempts = 0
+                reconnect_attempts = 0
             
 
             pending_buy_symbol[symbol] = False
