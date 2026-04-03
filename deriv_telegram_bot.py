@@ -841,6 +841,8 @@ async def keep_alive(ws):
 async def ws_loop(symbol):
 
     global daily_pnl, trading_paused
+    
+    reconnect_attempts = 0
 
     while True:
 
