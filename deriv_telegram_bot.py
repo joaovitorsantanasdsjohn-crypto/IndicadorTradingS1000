@@ -564,7 +564,7 @@ def institutional_trap_filter(row, direction):
     # Se mercado está explodindo, relaxa filtro
     if not market_exploding(row):
 
-        if row["wick_ratio"] > 0.80:
+        if row["wick_ratio"] > 0.70:
             return False
 
         if row["body_ratio"] < 0.15:
