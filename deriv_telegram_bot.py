@@ -1109,9 +1109,9 @@ async def ws_loop(symbol):
                 reconnect_attempts = 0
             
 
-            pending_buy_symbol[symbol] = False
-            proposal_lock[symbol] = False
-            pending_proposals.clear()
+                pending_buy_symbol[symbol] = False
+                proposal_lock[symbol] = False
+                pending_proposals.clear()
 
             # 🔥 Não tem reset mais
             log(f"{symbol} reconnect - mantendo dados")
