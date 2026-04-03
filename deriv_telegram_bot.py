@@ -874,6 +874,7 @@ async def ws_loop(symbol):
 
                 await ws.send(json.dumps({"authorize":DERIV_TOKEN}))
                 await ws.recv()
+                reconnect_attempts = 0
 
                 await sync_open_contracts(ws)
 
