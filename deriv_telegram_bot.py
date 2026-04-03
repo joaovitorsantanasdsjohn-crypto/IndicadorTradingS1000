@@ -915,34 +915,28 @@ async def ws_loop(symbol):
 
                         epoch = data["ohlc"]["epoch"]
 
+                        # ignora duplicado
                         if epoch <= last_candle_epoch[symbol]:
                             continue
 
-                        # 🔥 DETECTAR GAP (ANTES DE QUALQUER CONTINUE)
-                            
-                        gap = epoch - last_candle_epoch[symbol]
+                        # só valida gap se já existe histórico
+                        if last_candle_epoch[symbol] != 0:
 
-                            # aceita gap grande (fim de semana / reconexão)
-                        if gap > (GRANULARITY_SECONDS * 3):
+                            gap = epoch - last_candle_epoch[symbol]
 
-                            log(f"{symbol} ⚠️ BIG GAP DETECTED (OK - MARKET REOPEN)")
+                            # gap grande (normal)
+                            if gap > (GRANULARITY_SECONDS * 3):
+                                log(f"{symbol} ⚠️ BIG GAP DETECTED (OK - MARKET REOPEN)")
+                                last_candle_epoch[symbol] = epoch
+                                continue
 
-                                # Não reseta mais
-                            log(f"{symbol} reconnect - mantendo dados")
+                            # gap pequeno (erro)
+                            elif gap > GRANULARITY_SECONDS * 2:
+                                log(f"{symbol} ⚠️ SMALL GAP ERROR — RESET")
+                                last_candle_epoch[symbol] = epoch
+                                continue
 
-                            last_candle_epoch[symbol] = epoch
-                            continue
-
-                            # GAP pequeno = erro real
-                        elif gap > GRANULARITY_SECONDS * 2:
-                                
-                            log(f"{symbol} ⚠️ SMALL GAP ERROR — RESET")
-
-                            log(f"{symbol} reconnect - mantendo dados")
-                               
-                            last_candle_epoch[symbol] = epoch     
-                            continue
-                            
+                        # fluxo normal
                         last_candle_epoch[symbol] = epoch
                         
                                 
