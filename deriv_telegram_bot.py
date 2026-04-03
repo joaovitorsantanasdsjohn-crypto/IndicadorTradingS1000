@@ -916,10 +916,8 @@ async def ws_loop(symbol):
                         epoch = data["ohlc"]["epoch"]
 
                         # 🔥 DETECTAR GAP (ANTES DE QUALQUER CONTINUE)
-                        if last_candle_epoch[symbol] != 0:
-                            expected = last_candle_epoch[symbol] + GRANULARITY_SECONDS
-
-                            gap = epoch - last_candle_epoch[symbol]
+                            
+                        gap = epoch - last_candle_epoch[symbol]
 
                             # aceita gap grande (fim de semana / reconexão)
                             if gap > (GRANULARITY_SECONDS * 3):
