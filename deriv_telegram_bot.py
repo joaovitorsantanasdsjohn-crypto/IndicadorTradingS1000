@@ -1108,7 +1108,8 @@ async def ws_loop(symbol):
                 except:
                     pass
 
-        await asyncio.sleep(15)
+        delay = min(60, 5 * (reconnect_attempts + 1))
+        await asyncio.sleep(delay)
                             
 # ============================================================
 # 🌍 FLASK
