@@ -920,28 +920,28 @@ async def ws_loop(symbol):
 
                         # 🔥 DETECTAR GAP (ANTES DE QUALQUER CONTINUE)
                             
-                            gap = epoch - last_candle_epoch[symbol]
+                        gap = epoch - last_candle_epoch[symbol]
 
                             # aceita gap grande (fim de semana / reconexão)
-                            if gap > (GRANULARITY_SECONDS * 3):
+                        if gap > (GRANULARITY_SECONDS * 3):
 
-                                log(f"{symbol} ⚠️ BIG GAP DETECTED (OK - MARKET REOPEN)")
+                            log(f"{symbol} ⚠️ BIG GAP DETECTED (OK - MARKET REOPEN)")
 
                                 # Não reseta mais
-                                log(f"{symbol} reconnect - mantendo dados")
+                            log(f"{symbol} reconnect - mantendo dados")
 
-                                last_candle_epoch[symbol] = epoch
-                                continue
+                            last_candle_epoch[symbol] = epoch
+                            continue
 
                             # GAP pequeno = erro real
-                            elif gap > GRANULARITY_SECONDS * 2:
+                        elif gap > GRANULARITY_SECONDS * 2:
                                 
-                                log(f"{symbol} ⚠️ SMALL GAP ERROR — RESET")
+                            log(f"{symbol} ⚠️ SMALL GAP ERROR — RESET")
 
-                                log(f"{symbol} reconnect - mantendo dados")
+                            log(f"{symbol} reconnect - mantendo dados")
                                
-                                last_candle_epoch[symbol] = epoch     
-                                continue
+                            last_candle_epoch[symbol] = epoch     
+                            continue
                             
                         last_candle_epoch[symbol] = epoch
                         
