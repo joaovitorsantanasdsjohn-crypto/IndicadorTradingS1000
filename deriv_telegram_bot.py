@@ -43,7 +43,7 @@ SYMBOLS = [
 ]
 
 GRANULARITY_SECONDS = 900
-HISTORY_COUNT = 3000
+HISTORY_COUNT = 1200
 
 ML_ENABLED = True and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = 200
@@ -637,7 +637,7 @@ def build_ml_dataset(df):
 
     df = df.dropna()
 
-    if len(df) < 50:
+    if len(df) < 30:
         return None, None, None, None
 
     X = df.select_dtypes("number").copy()
