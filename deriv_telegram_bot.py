@@ -586,7 +586,7 @@ def build_ml_dataset(df):
 
     df = df.dropna().copy()
 
-    if len(df) < 200:
+    if len(df) < 300:
         return None, None, None, None
 
     tp = TAKE_PROFIT / (STAKE_AMOUNT * MULTIPLIER)
@@ -637,7 +637,7 @@ def build_ml_dataset(df):
 
     df = df.dropna()
 
-    if len(df) < 30:
+    if len(df) < 50:
         return None, None, None, None
 
     X = df.select_dtypes("number").copy()
