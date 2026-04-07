@@ -906,7 +906,7 @@ async def ws_loop(symbol):
                         # 🔥 treino imediato após carregar histórico
                         if not ml_model_ready[symbol]:
                     
-                    asyncio.create_task(train_ml_background(symbol))
+                            asyncio.create_task(train_ml_background(symbol))
 
                         if time.time() - last_save_time[symbol] > 30:
                             save_ml_data()
@@ -914,7 +914,7 @@ async def ws_loop(symbol):
 
                         if time.time() - last_ml_train[symbol] > 600:
                     
-                    asyncio.create_task(train_ml_background(symbol))
+                            asyncio.create_task(train_ml_background(symbol))
 
                         continue
 
