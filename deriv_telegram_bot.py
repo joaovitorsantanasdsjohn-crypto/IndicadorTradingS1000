@@ -902,6 +902,8 @@ async def ws_loop(symbol):
                         df["volume"]=1
 
                         candles[symbol]=calcular_indicadores(df)
+                        if not ml_model_ready[symbol]:
+                        asyncio.create_task(train_ml_background(symbol))
                         if time.time() - last_save_time[symbol] > 30:
                             save_ml_data()
                             last_save_time[symbol] = time.time()
