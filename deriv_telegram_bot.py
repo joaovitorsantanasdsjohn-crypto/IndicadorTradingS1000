@@ -81,6 +81,7 @@ last_activity_time = {s:time.time() for s in SYMBOLS}
 last_save_time = {s:0 for s in SYMBOLS}
 
 last_candle_epoch = {s:0 for s in SYMBOLS}
+last_signal_candle = {s:0 for s in SYMBOLS}
 
 loss_streak = {s:0 for s in SYMBOLS}
 loss_pause_until = {s:0 for s in SYMBOLS}
