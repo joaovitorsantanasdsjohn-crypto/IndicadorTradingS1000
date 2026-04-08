@@ -776,6 +776,9 @@ async def send_proposal(ws,symbol,direction):
 
         if pending_buy_symbol[symbol]:
             return
+        
+        if len(open_trades[symbol])>0:
+            return
             
         if time.time()<loss_pause_until[symbol]:
             return
