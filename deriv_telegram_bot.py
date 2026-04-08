@@ -964,7 +964,10 @@ async def ws_loop(symbol):
                             continue
                         
                         row=df.iloc[-2]
-
+                        
+                        if epoch == last_signal_candle[symbol]:
+                            continue
+                        
                         if not forex_session_ok():
                             continue
 
