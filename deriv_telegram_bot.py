@@ -1011,11 +1011,11 @@ async def ws_loop(symbol):
                         # ✅ CONFIANÇA DINÂMICA BASEADA EM REGIME
                         # ===================================================
 
-                        if row["adx"] >= 30:
+                        if row["adx"] >= 40:
                             dynamic_threshold = 0.58
-                        elif row["adx"] >= 24:
+                        elif row["adx"] >= 30:
                             dynamic_threshold = 0.62
-                        elif row["adx"] >= 18:
+                        elif row["adx"] >= 20:
                             dynamic_threshold = 0.65
                         else:
                             dynamic_threshold = 0.68
