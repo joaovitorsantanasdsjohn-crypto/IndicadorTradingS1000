@@ -1051,6 +1051,11 @@ async def ws_loop(symbol):
                             trading_paused = True
                             continue
 
+                        
+
+                        if open_trades[symbol] or pending_buy_symbol[symbol]:
+                            continue
+
                         last_signal_candle[symbol] = signal_epoch
                         pending_buy_symbol[symbol] = True
                         await send_proposal(ws, symbol, direction)
