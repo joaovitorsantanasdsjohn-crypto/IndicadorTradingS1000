@@ -774,9 +774,6 @@ async def send_proposal(ws,symbol,direction):
 
         if trading_paused:
             return
-
-        if pending_buy_symbol[symbol]:
-            return
         
         if proposal_lock[symbol]:
             return 
