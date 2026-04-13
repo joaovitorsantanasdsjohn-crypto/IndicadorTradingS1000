@@ -1050,9 +1050,14 @@ async def ws_loop(symbol):
                         if trading_paused or daily_pnl <= -DAILY_MAX_LOSS:
                             trading_paused = True
                             continue
-        
 
+                        # trava anti-duplicação correta
+                        if pending_buy_symbol[symbol]:
+                            continue
+
+                        pending_buy_symbol[symbol] = True
                         last_signal_candle[symbol] = signal_epoch
+
                         await send_proposal(ws, symbol, direction)
                         await asyncio.sleep(0.01)
                         continue
