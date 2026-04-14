@@ -1000,7 +1000,7 @@ async def ws_loop(symbol):
                         
                         confidence_gap = abs(prob_up - prob_down)
 
-                        if confidence_gap < 0.04:
+                        if confidence_gap < 0.08:
                             continue
 
                         # ===================================================
