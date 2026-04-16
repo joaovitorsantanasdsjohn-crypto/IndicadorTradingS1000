@@ -532,10 +532,10 @@ def market_is_good(row):
     if row["adx"] < 20:
         return False
 
-    if row["bb_width"] < 0.0014:
+    if row["bb_width"] < 0.0018:
         return False
 
-    if abs(row["ema200_slope"]) < 5e-7:
+    if abs(row["ema200_slope"]) < 1.5e-6:
         return False
 
     return True
