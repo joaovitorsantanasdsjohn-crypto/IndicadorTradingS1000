@@ -1050,9 +1050,12 @@ async def ws_loop(symbol):
                         # trava anti-duplicação correta
                         if pending_buy_symbol[symbol]:
                             continue
+                        if signal_epoch == last_signal_candle[symbol]:
+                            continue          
 
-                        pending_buy_symbol[symbol] = True
                         last_signal_candle[symbol] = signal_epoch
+                        pending_buy_symbol[symbol] = True
+                        
 
                         await send_proposal(ws, symbol, direction)
                         await asyncio.sleep(0.01)
