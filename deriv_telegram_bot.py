@@ -38,11 +38,9 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 SYMBOLS = [
     "frxEURUSD",
-    "frxUSDJPY",
     "frxGBPUSD",
     "frxAUDUSD",
-    "frxUSDCHF",
-    "frxGBPJPY"
+    "frxUSDCHF"
 ]
 
 GRANULARITY_SECONDS = 900
