@@ -960,9 +960,9 @@ async def ws_loop(symbol):
                         if len(df) < 300:
                             continue
                         
-                        row=df.iloc[-2]
+                        row=df.iloc[-3]
                         
-                        signal_epoch = df.iloc[-2]["epoch"]
+                        signal_epoch = df.iloc[-3]["epoch"]
 
                         if signal_epoch == last_signal_candle[symbol]:
                             continue
