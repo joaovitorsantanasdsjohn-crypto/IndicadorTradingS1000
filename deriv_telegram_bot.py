@@ -261,7 +261,7 @@ def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    if len(df) < 250:
+    if len(df) < 100:
         return df
 
     df["ema_fast"] = EMAIndicator(df["close"], 9).ema_indicator()
@@ -587,7 +587,7 @@ def build_ml_dataset(df):
 
     df = df.dropna().copy()
 
-    if len(df) < 300:
+    if len(df) < 100:
         return None, None, None, None
 
     tp = TAKE_PROFIT / (STAKE_AMOUNT * MULTIPLIER)
@@ -956,7 +956,7 @@ async def ws_loop(symbol):
                             save_ml_data()
                             last_save_time[symbol] = time.time()
 
-                        if len(df) < 300:
+                        if len(df) < 100:
                             continue
                         
                         row=df.iloc[-3]
