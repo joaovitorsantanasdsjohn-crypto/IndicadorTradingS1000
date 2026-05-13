@@ -698,7 +698,7 @@ def train_ml(symbol):
         result[1] is None or
         result[2] is None or
         result[3] is None
-     ):
+    ):
         log(f"ML TRAIN FAIL | {symbol} | INVALID DATASET")
         return
 
