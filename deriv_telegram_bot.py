@@ -692,7 +692,17 @@ def train_ml(symbol):
 
     result = build_ml_dataset(df)
 
-    X_up, y_up, X_down, y_down = result
+    if (
+        result is None or
+        result[0] is None or
+        result[1] is None or
+        result[2] is None or
+        result[3] is None
+     ):
+        log(f"ML TRAIN FAIL | {symbol} | INVALID DATASET")
+        return
+
+     X_up, y_up, X_down, y_down = result
 
     if X_up is None or y_up is None:
         return
