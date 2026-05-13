@@ -702,7 +702,7 @@ def train_ml(symbol):
         log(f"ML TRAIN FAIL | {symbol} | INVALID DATASET")
         return
 
-     X_up, y_up, X_down, y_down = result
+    X_up, y_up, X_down, y_down = result
 
     if X_up is None or y_up is None:
         return
