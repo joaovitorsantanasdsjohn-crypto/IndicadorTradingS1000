@@ -717,17 +717,17 @@ def train_ml(symbol):
         return
 
     model_up = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=6,
-        min_samples_leaf=12,
+        n_estimators=150,
+        max_depth=3,
+        min_samples_leaf=6,
         n_jobs=-1,
         random_state=42
     )
 
     model_down = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=6,
-        min_samples_leaf=12,
+        n_estimators=150,
+        max_depth=3,
+        min_samples_leaf=6,
         n_jobs=-1,
         random_state=42
     )
