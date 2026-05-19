@@ -587,7 +587,7 @@ def build_ml_dataset(df):
 
     df = df.dropna().copy()
 
-    if len(df) < 100:
+    if len(df) < 250:
         return None, None, None, None
 
     tp = TAKE_PROFIT / (STAKE_AMOUNT * MULTIPLIER)
@@ -717,17 +717,17 @@ def train_ml(symbol):
         return
 
     model_up = RandomForestClassifier(
-        n_estimators=150,
-        max_depth=3,
-        min_samples_leaf=6,
+        n_estimators=100,
+        max_depth=2,
+        min_samples_leaf=3,
         n_jobs=-1,
         random_state=42
     )
 
     model_down = RandomForestClassifier(
-        n_estimators=150,
-        max_depth=3,
-        min_samples_leaf=6,
+        n_estimators=100,
+        max_depth=2,
+        min_samples_leaf=3,
         n_jobs=-1,
         random_state=42
     )
@@ -966,7 +966,7 @@ async def ws_loop(symbol):
                             save_ml_data()
                             last_save_time[symbol] = time.time()
 
-                        if len(df) < 100:
+                        if len(df) < 250:
                             continue
                         
                         row=df.iloc[-3]
