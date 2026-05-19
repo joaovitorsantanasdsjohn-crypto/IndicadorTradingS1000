@@ -587,7 +587,7 @@ def build_ml_dataset(df):
 
     df = df.dropna().copy()
 
-    if len(df) < 250:
+    if len(df) < 100:
         return None, None, None, None
 
     tp = TAKE_PROFIT / (STAKE_AMOUNT * MULTIPLIER)
@@ -966,7 +966,7 @@ async def ws_loop(symbol):
                             save_ml_data()
                             last_save_time[symbol] = time.time()
 
-                        if len(df) < 250:
+                        if len(df) < 100:
                             continue
                         
                         row=df.iloc[-3]
