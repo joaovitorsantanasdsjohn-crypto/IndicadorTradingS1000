@@ -573,7 +573,7 @@ def institutional_trap_filter(row, direction):
     # relaxa distância da EMA em mercado explosivo
     if not market_exploding(row):
 
-        if abs(row["dist_ema200"]) > 0.005:
+        if abs(row["dist_ema200"]) > 0.007:
             return False
 
     return True
