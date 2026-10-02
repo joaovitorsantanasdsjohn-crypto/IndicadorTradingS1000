@@ -38,11 +38,11 @@ WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 SYMBOLS = [
     "frxGBPUSD",
-    "frxAUDUSD"
+    "frxEURUSD"
 ]
 
 GRANULARITY_SECONDS = 900
-HISTORY_COUNT = 3000
+HISTORY_COUNT = 1000
 
 ML_ENABLED = True and SKLEARN_AVAILABLE
 ML_MIN_TRAINED_SAMPLES = 300
